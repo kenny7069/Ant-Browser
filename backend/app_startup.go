@@ -51,6 +51,7 @@ func (a *App) startup(ctx context.Context) {
 
 	a.startupInitManagers(cfg, db)
 	a.startupInitLaunchCode(log)
+	a.startupInitRuntimeService()
 	a.startupInitLaunchServer(log)
 	a.startupInitAutomation()
 	a.startupInitBridgeHooks()

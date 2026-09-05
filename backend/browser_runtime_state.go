@@ -23,12 +23,19 @@ func copyBrowserProfileSnapshot(profile *BrowserProfile) *BrowserProfile {
 		return nil
 	}
 	snapshot := *profile
-	snapshot.FingerprintArgs = append([]string{}, profile.FingerprintArgs...)
-	snapshot.LaunchArgs = append([]string{}, profile.LaunchArgs...)
-	snapshot.LastLaunchArgs = append([]string{}, profile.LastLaunchArgs...)
-	snapshot.Tags = append([]string{}, profile.Tags...)
-	snapshot.Keywords = append([]string{}, profile.Keywords...)
+	snapshot.FingerprintArgs = cloneBrowserProfileStrings(profile.FingerprintArgs)
+	snapshot.LaunchArgs = cloneBrowserProfileStrings(profile.LaunchArgs)
+	snapshot.LastLaunchArgs = cloneBrowserProfileStrings(profile.LastLaunchArgs)
+	snapshot.Tags = cloneBrowserProfileStrings(profile.Tags)
+	snapshot.Keywords = cloneBrowserProfileStrings(profile.Keywords)
 	return &snapshot
+}
+
+func cloneBrowserProfileStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
 }
 
 func browserDebugPendingWarning(timeout time.Duration) string {
@@ -196,7 +203,7 @@ func (a *App) waitBrowserDebugReadyAsync(profileId string, debugPort int, timeou
 	a.emitBrowserInstanceUpdated(snapshot)
 }
 
-func shouldKeepBrowserRunningPendingDebugReady(debugPort int, monitor *browserProcessMonitor) bool {
+func shouldKeepBrowserRunningPendingDebugReady(debugPort int, monitor browserProcessMonitorAPI) bool {
 	return debugPort > 0 && monitor != nil && !monitor.HasExited()
 }
 

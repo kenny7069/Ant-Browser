@@ -15,7 +15,14 @@ func (a *App) StartInstance(profileId string) (*browser.Profile, error) {
 // StartInstanceWithParams 实现 launchcode.BrowserStarterWithParams 接口
 func (a *App) StartInstanceWithParams(profileId string, params launchcode.LaunchRequestParams) (*browser.Profile, error) {
 	preferVisibleWindow := shouldPreferVisibleWindowForStartWithParams(params.StartURLs)
-	return a.browserInstanceStartInternal(profileId, params.LaunchArgs, params.StartURLs, params.SkipDefaultStartURLs, preferVisibleWindow, false, params.ProxyId, params.ProxyConfig)
+	return a.browserInstanceStartWithRuntimeOptions(profileId, BrowserRuntimeStartOptions{
+		ExtraLaunchArgs:      params.LaunchArgs,
+		StartURLs:            params.StartURLs,
+		SkipDefaultStartURLs: params.SkipDefaultStartURLs,
+		PreferVisibleWindow:  preferVisibleWindow,
+		ProxyID:              params.ProxyId,
+		ProxyConfig:          params.ProxyConfig,
+	})
 }
 
 // StatusInstance 实现 launchcode.BrowserStatusProvider 接口
@@ -38,16 +45,11 @@ func (a *App) WaitInstanceDebugReady(profileId string, debugPort int, timeout ti
 		return profile, profile != nil && profile.DebugReady, nil
 	}
 
-	snapshot, _ := a.waitForBrowserDebugReady(profileId, debugPort, timeout)
-	if snapshot != nil {
-		return snapshot, snapshot.DebugReady, nil
-	}
-
-	profile, err := a.BrowserInstanceStatus(profileId)
+	service, err := a.browserRuntimeService()
 	if err != nil {
 		return nil, false, err
 	}
-	return profile, profile != nil && profile.DebugReady, nil
+	return service.WaitDebugReady(profileId, debugPort, timeout)
 }
 
 // BrowserProfileGetCode 获取实例的 LaunchCode（Wails 绑定）

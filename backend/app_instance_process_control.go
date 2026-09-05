@@ -9,10 +9,17 @@ import (
 )
 
 func (a *App) stopBrowserProcess(cmd *exec.Cmd) error {
-	return a.stopProcessCmd(cmd)
+	return stopBrowserProcessCommand(cmd)
 }
 
 func (a *App) stopProcessCmd(cmd *exec.Cmd) error {
+	return stopBrowserProcessCommand(cmd)
+}
+
+// stopBrowserProcessCommand is shared by the Wails facade and the local
+// runtime process factory. It never reaps a command; the process owner created
+// by browserProcessMonitor is the sole Cmd.Wait caller.
+func stopBrowserProcessCommand(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}

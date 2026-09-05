@@ -22,20 +22,22 @@ const (
 
 // App 应用结构体
 type App struct {
-	ctx            context.Context
-	config         *config.Config
-	db             *database.DB
-	interceptor    *logger.MethodInterceptor
-	browserMgr     *browser.Manager
-	xrayMgr        *proxy.XrayManager
-	clashMgr       *proxy.ClashManager
-	singboxMgr     *proxy.SingBoxManager
-	launchCodeSvc  *launchcode.LaunchCodeService
-	launchServer   *launchcode.LaunchServer
-	automationMgr  *automation.Manager
-	speedScheduler *browser.ProxySpeedScheduler
-	appRoot        string
-	version        string
+	ctx              context.Context
+	config           *config.Config
+	db               *database.DB
+	interceptor      *logger.MethodInterceptor
+	browserMgr       *browser.Manager
+	xrayMgr          *proxy.XrayManager
+	clashMgr         *proxy.ClashManager
+	singboxMgr       *proxy.SingBoxManager
+	launchCodeSvc    *launchcode.LaunchCodeService
+	launchServer     *launchcode.LaunchServer
+	automationMgr    *automation.Manager
+	speedScheduler   *browser.ProxySpeedScheduler
+	runtimeService   *BrowserRuntimeService
+	runtimeServiceMu sync.Mutex
+	appRoot          string
+	version          string
 
 	forceQuit              bool
 	quitMode               quitMode

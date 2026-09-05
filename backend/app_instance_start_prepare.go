@@ -21,24 +21,6 @@ type browserStartInput struct {
 	TemporaryProxyConfig string
 }
 
-type browserStartPlan struct {
-	profile              *BrowserProfile
-	chromeBinaryPath     string
-	userDataDir          string
-	args                 []string
-	extensionDirs        []string
-	deferredStartTargets []string
-	deferredStartNewTabs bool
-	effectiveProxy       string
-	acquiredProxyBridge  profileProxyBridgeRef
-	releaseProxyBridge   bool
-	assignedDebugPort    int
-	startReadyTimeout    time.Duration
-	startStableWindow    time.Duration
-	maxStartAttempts     int
-	totalReadyTimeout    time.Duration
-}
-
 var clearBrowserSessionRestoreData = browser.ClearSessionRestoreData
 
 func newBrowserStartInput(profileID string, extraLaunchArgs []string, startURLs []string, skipDefaultStartURLs bool, preferVisibleWindow bool, forceDirectProxy bool, proxyID string, proxyConfig string) browserStartInput {
