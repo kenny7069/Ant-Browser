@@ -34,6 +34,13 @@ func secureRuntimeProcessLiveness(identity secureRuntimeProcessIdentity) secureR
 		if err == unix.ESRCH {
 			return secureRuntimeProcessExited
 		}
+		// SysctlKinfoProc reports EIO when the requested PID has disappeared
+		// between the size query and the record read. Confirm that the PID is
+		// really gone before treating that condition as terminal; any other
+		// result remains unknown and therefore fail-closed for sweeping.
+		if err == unix.EIO && unix.Kill(identity.PID, 0) == unix.ESRCH {
+			return secureRuntimeProcessExited
+		}
 		return secureRuntimeProcessUnknown
 	}
 	if current == identity {

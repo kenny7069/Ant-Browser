@@ -1,15 +1,167 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
+
+const secureRuntimeCrashRestartHelperEnv = "ANT_PROXY_SECURE_RUNTIME_CRASH_RESTART_HELPER"
+
+func TestSecureRuntimeCrashRestartHelper(t *testing.T) {
+	if os.Getenv(secureRuntimeCrashRestartHelperEnv) != "1" {
+		return
+	}
+	parent := os.Getenv("ANT_PROXY_SECURE_RUNTIME_PARENT")
+	appRoot := os.Getenv("ANT_PROXY_SECURE_RUNTIME_APP_ROOT")
+	mode := os.Getenv("ANT_PROXY_SECURE_RUNTIME_HELPER_MODE")
+	report := os.Getenv("ANT_PROXY_SECURE_RUNTIME_REPORT")
+	if parent == "" || appRoot == "" || (mode != "crash" && mode != "sweep") {
+		t.Fatalf("invalid crash/restart helper environment")
+	}
+	// This helper deliberately uses the production app-root constructor. The
+	// test only redirects TMPDIR to an isolated directory; it never reads or
+	// prints the persistent HMAC key or any proxy credential.
+	writer, err := newSecureRuntimeWriterForApp("xray", appRoot)
+	if err != nil {
+		t.Fatalf("newSecureRuntimeWriterForApp() error = %v", err)
+	}
+	key := "helper-node-" + mode
+	if _, err := writer.runtimeDir(key); err != nil {
+		t.Fatalf("runtimeDir() error = %v", err)
+	}
+	if _, err := writer.writeAtomic(key, "xray-config.json", []byte("synthetic-runtime-config")); err != nil {
+		t.Fatalf("writeAtomic() error = %v", err)
+	}
+	if report != "" {
+		if err := os.WriteFile(report, []byte(writer.root), secureRuntimeFileMode); err != nil {
+			t.Fatalf("write helper report: %v", err)
+		}
+	}
+	if mode == "crash" {
+		// os.Exit skips testing cleanup and simulates a process crash after the
+		// secure writer has registered a live runtime root.
+		os.Exit(0)
+	}
+}
+
+func TestSecureRuntimeCrashRestartSubprocessSweep(t *testing.T) {
+	if !secureRuntimeOrphanSweepSupported() {
+		t.Skip("platform intentionally keeps orphan sweep fail-closed")
+	}
+	parent := t.TempDir()
+	appRoot := filepath.Join(t.TempDir(), "app")
+	if err := os.Mkdir(appRoot, secureRuntimeDirMode); err != nil {
+		t.Fatalf("mkdir app root: %v", err)
+	}
+	baseEnv := append(os.Environ(),
+		secureRuntimeCrashRestartHelperEnv+"=1",
+		"ANT_PROXY_SECURE_RUNTIME_PARENT="+parent,
+		"ANT_PROXY_SECURE_RUNTIME_APP_ROOT="+appRoot,
+		"TMPDIR="+parent,
+	)
+	startHelper := func(mode string, reportPath string) (*exec.Cmd, error) {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestSecureRuntimeCrashRestartHelper$", "-test.v")
+		cmd.Env = append(append([]string{}, baseEnv...), "ANT_PROXY_SECURE_RUNTIME_HELPER_MODE="+mode)
+		if reportPath != "" {
+			cmd.Env = append(cmd.Env, "ANT_PROXY_SECURE_RUNTIME_REPORT="+reportPath)
+		}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		cmd.Stdout = &stderr
+		if err := cmd.Start(); err != nil {
+			return nil, fmt.Errorf("start %s helper: %w", mode, err)
+		}
+		if err := cmd.Wait(); err != nil {
+			return nil, fmt.Errorf("%s helper failed: %w (%s)", mode, err, stderr.String())
+		}
+		return cmd, nil
+	}
+
+	liveWriter, err := newSecureRuntimeWriterForApp("xray", appRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveRoot, err := liveWriter.runtimeDir("parent-live")
+	if err != nil {
+		t.Fatalf("live runtimeDir() error = %v", err)
+	}
+	if _, err := liveWriter.writeAtomic("parent-live", "xray-config.json", []byte("synthetic-live-runtime-config")); err != nil {
+		t.Fatalf("live writeAtomic() error = %v", err)
+	}
+	if _, err := os.Stat(liveRoot); err != nil {
+		t.Fatalf("live/current root missing before crash: %v", err)
+	}
+
+	crashReport := filepath.Join(parent, "crash-helper-report")
+	_, err = startHelper("crash", crashReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crashData, err := os.ReadFile(crashReport)
+	if err != nil || len(crashData) == 0 {
+		t.Fatalf("crash helper did not publish runtime root: %q, error = %v", crashData, err)
+	}
+	staleRoot := string(crashData)
+	staleBase := filepath.Base(staleRoot)
+	if staleRoot == liveRoot || len(staleBase) <= len("ant-proxy-xray-") || staleBase[:len("ant-proxy-xray-")] != "ant-proxy-xray-" {
+		t.Fatalf("crash helper published unexpected runtime root: %q", staleRoot)
+	}
+	if _, err := os.Stat(filepath.Join(staleRoot, "helper-node-crash", "xray-config.json")); err != nil {
+		t.Fatalf("crash helper managed config missing: %v", err)
+	}
+
+	unknownRoot := filepath.Join(parent, "ant-proxy-xray-unknown")
+	if err := os.Mkdir(unknownRoot, secureRuntimeDirMode); err != nil {
+		t.Fatal(err)
+	}
+	unknownFile := filepath.Join(unknownRoot, "unknown-artifact")
+	if err := os.WriteFile(unknownFile, []byte("retain"), secureRuntimeFileMode); err != nil {
+		t.Fatal(err)
+	}
+	tamperedRoot := filepath.Join(parent, "ant-proxy-xray-tampered")
+	if err := os.Mkdir(tamperedRoot, secureRuntimeDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tamperedRoot, secureRuntimeMarkerName), []byte(`{"version":1,"mac":"tampered"}`), secureRuntimeFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	currentReport := filepath.Join(parent, "current-helper-report")
+	if _, err := startHelper("sweep", currentReport); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(staleRoot); !os.IsNotExist(err) {
+		t.Fatalf("authenticated crashed root was not removed, lstat error = %v", err)
+	}
+	currentData, err := os.ReadFile(currentReport)
+	if err != nil || len(currentData) == 0 {
+		t.Fatalf("sweep helper did not publish current runtime root: %q, error = %v", currentData, err)
+	}
+	if _, err := os.Lstat(string(currentData)); err != nil {
+		t.Fatalf("current runtime root was removed during its startup sweep: %v", err)
+	}
+	if _, err := os.Lstat(liveRoot); err != nil {
+		t.Fatalf("live root was removed by restart sweep: %v", err)
+	}
+	if _, err := os.Lstat(unknownRoot); err != nil {
+		t.Fatalf("unknown root was removed by restart sweep: %v", err)
+	}
+	if data, err := os.ReadFile(unknownFile); err != nil || string(data) != "retain" {
+		t.Fatalf("unknown artifact changed after restart sweep: %q, error = %v", data, err)
+	}
+	if _, err := os.Lstat(tamperedRoot); err != nil {
+		t.Fatalf("tampered root was removed by restart sweep: %v", err)
+	}
+}
 
 type secureRuntimeSweepFixture struct {
 	parent      string
