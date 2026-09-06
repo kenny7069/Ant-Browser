@@ -148,9 +148,10 @@ type BrowserRuntimeProcess struct {
 }
 
 var (
-	ErrInvalidBrowserRuntimeProcess = errors.New("invalid browser runtime process")
-	ErrBrowserRuntimeOwnerNotReady  = errors.New("browser runtime process owner is not ready")
-	ErrBrowserRuntimeReapPending    = errors.New("browser runtime process reaping is pending")
+	ErrInvalidBrowserRuntimeProcess     = errors.New("invalid browser runtime process")
+	ErrBrowserRuntimeOwnerNotReady      = errors.New("browser runtime process owner is not ready")
+	ErrBrowserRuntimeReapPending        = errors.New("browser runtime process reaping is pending")
+	ErrBrowserRuntimeGenerationMismatch = errors.New("browser runtime generation mismatch")
 )
 
 // NewBrowserRuntimeProcess constructs a valid host-facing process result. The
@@ -359,6 +360,16 @@ type BrowserRuntimeService struct {
 	// can drive the real monitor lifecycle without fixed long sleeps.
 	waitRuntimeDebugAttach     func(func(int, time.Duration) bool, int, time.Duration) bool
 	waitRuntimeDebugDisconnect func(func(int, time.Duration) bool, int) bool
+}
+
+// BrowserRuntimeServiceSnapshot is a read-only observation of the shared
+// lifecycle service. Unlike Status, RuntimeSnapshot never performs recovered
+// runtime detection or adoption; callers that need strict ownership (for
+// example FarmRuntimeService) can therefore observe a stopped/crashed
+// generation without accidentally adopting an unrelated local Chrome.
+type BrowserRuntimeServiceSnapshot struct {
+	Profile    *browser.Profile
+	Generation uint64
 }
 
 // NewBrowserRuntimeService supports zero-value construction for focused tests
@@ -1085,12 +1096,65 @@ func (s *BrowserRuntimeService) Generation(profileID string) uint64 {
 	return s.identity(strings.TrimSpace(profileID)).generation
 }
 
+// RuntimeSnapshot returns the current profile state and service generation
+// without launching, detecting, adopting, or stopping a runtime. The profile
+// is copied before it is returned. A zero generation means this service has no
+// active runtime identity for the profile.
+func (s *BrowserRuntimeService) RuntimeSnapshot(profileID string) (*BrowserRuntimeServiceSnapshot, error) {
+	profileID = strings.TrimSpace(profileID)
+	if s == nil {
+		return nil, fmt.Errorf("browser runtime service is nil")
+	}
+	if profileID == "" {
+		return nil, fmt.Errorf("profile id is required")
+	}
+	manager := s.Manager()
+	if manager == nil {
+		return nil, fmt.Errorf("browser manager is not initialized")
+	}
+	release, err := s.acquire(profileID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	manager.Mutex.Lock()
+	profile := manager.Profiles[profileID]
+	if profile == nil {
+		manager.Mutex.Unlock()
+		return nil, fmt.Errorf("profile not found")
+	}
+	snapshot := copyBrowserProfileSnapshot(profile)
+	manager.Mutex.Unlock()
+	return &BrowserRuntimeServiceSnapshot{
+		Profile:    snapshot,
+		Generation: s.Generation(profileID),
+	}, nil
+}
+
 // Stop terminates a service-owned process and transitions its profile only
 // after the explicit process owner reaches Done. Recovered runtimes require a
 // host TryCloseCDP callback because the service has no process handle to kill.
 func (s *BrowserRuntimeService) Stop(profileID string) (*browser.Profile, error) {
 	profileID = strings.TrimSpace(profileID)
 	return s.withProfileResult(profileID, func(host BrowserRuntimeHost) (*browser.Profile, error) {
+		return s.stopLocked(host, profileID)
+	})
+}
+
+// StopIfGeneration is the strict stop boundary for ownership layers. The
+// generation check runs after this service's per-profile gate is acquired, so
+// a Farm stop cannot validate an old generation and then terminate a newer
+// runtime that won the same-profile race in between.
+func (s *BrowserRuntimeService) StopIfGeneration(profileID string, generation uint64) (*browser.Profile, error) {
+	profileID = strings.TrimSpace(profileID)
+	if generation == 0 {
+		return nil, fmt.Errorf("%w: generation is required", ErrBrowserRuntimeGenerationMismatch)
+	}
+	return s.withProfileResult(profileID, func(host BrowserRuntimeHost) (*browser.Profile, error) {
+		if current := s.Generation(profileID); current != generation {
+			profile, err := s.currentProfileSnapshotResult(profileID, nil)
+			return profile, errors.Join(err, fmt.Errorf("%w: expected %d, current %d", ErrBrowserRuntimeGenerationMismatch, generation, current))
+		}
 		return s.stopLocked(host, profileID)
 	})
 }
