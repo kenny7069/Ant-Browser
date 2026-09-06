@@ -408,6 +408,18 @@ type browserProfileIncarnation struct {
 	token   string
 }
 
+// browserRuntimeStartReservation carries the exact Manager entry observed by
+// StartIfGeneration through the hand-off into startLocked. The Manager lock
+// cannot be held across host launch callbacks, so startLocked revalidates this
+// reservation before it prepares or touches the profile. A delete/recreate
+// between the generation check and that hand-off therefore fails closed.
+type browserRuntimeStartReservation struct {
+	profileID  string
+	profile    *browser.Profile
+	token      string
+	generation uint64
+}
+
 type BrowserRuntimeServiceConfig struct {
 	Manager               *browser.Manager
 	Config                *config.Config
@@ -500,6 +512,11 @@ type BrowserRuntimeService struct {
 	// can drive the real monitor lifecycle without fixed long sleeps.
 	waitRuntimeDebugAttach     func(func(int, time.Duration) bool, int, time.Duration) bool
 	waitRuntimeDebugDisconnect func(func(int, time.Duration) bool, int) bool
+
+	// startReservationHook is a package-private interleave seam for the
+	// lifecycle acceptance tests. It is nil in production and runs only after
+	// StartIfGeneration has reserved the observed profile entry.
+	startReservationHook func()
 }
 
 // BrowserRuntimeServiceSnapshot is a read-only observation of the shared
@@ -1486,7 +1503,16 @@ func (s *BrowserRuntimeService) StartIfGeneration(profileID string, generation u
 		current, snapshotErr := s.currentProfileSnapshotResult(profileID, profile)
 		return current, errors.Join(snapshotErr, fmt.Errorf("%w: expected generation %d, current %d", ErrBrowserRuntimeProfileMismatch, generation, actualGeneration))
 	}
-	return s.startLocked(host, BrowserRuntimeStartRequest{ProfileID: profileID})
+	reservation := &browserRuntimeStartReservation{
+		profileID:  profileID,
+		profile:    profile,
+		token:      actualIncarnation,
+		generation: actualGeneration,
+	}
+	if s.startReservationHook != nil {
+		s.startReservationHook()
+	}
+	return s.startLockedWithReservation(host, BrowserRuntimeStartRequest{ProfileID: profileID}, reservation)
 }
 
 // Status returns an immutable profile snapshot owned by the service. When a
@@ -1849,6 +1875,10 @@ func (s *BrowserRuntimeService) stopLocked(host BrowserRuntimeHost, profileID st
 }
 
 func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request BrowserRuntimeStartRequest) (*browser.Profile, error) {
+	return s.startLockedWithReservation(host, request, nil)
+}
+
+func (s *BrowserRuntimeService) startLockedWithReservation(host BrowserRuntimeHost, request BrowserRuntimeStartRequest, reservation *browserRuntimeStartReservation) (*browser.Profile, error) {
 	manager := s.Manager()
 	if manager == nil {
 		return nil, fmt.Errorf("browser manager is not initialized")
@@ -1865,6 +1895,21 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 	if liveProfile == nil {
 		manager.Mutex.Unlock()
 		return nil, fmt.Errorf("实例启动失败：未找到实例配置（ID=%s）。请刷新列表后重试。", profileID)
+	}
+	if reservation != nil {
+		// This is the first lock acquisition after StartIfGeneration's
+		// generation/incarnation check. Requiring the same pointer and opaque
+		// token here closes the delete/recreate gap before any launch planning,
+		// process creation, or recovered-runtime adoption can occur.
+		if reservation.profileID != profileID || liveProfile != reservation.profile {
+			manager.Mutex.Unlock()
+			return s.currentProfileSnapshot(profileID, liveProfile), fmt.Errorf("%w: reserved profile incarnation changed before launch", ErrBrowserRuntimeProfileMismatch)
+		}
+		actualIncarnation := s.profileIncarnationLocked(profileID, liveProfile)
+		if actualIncarnation != reservation.token || s.Generation(profileID) != reservation.generation {
+			manager.Mutex.Unlock()
+			return s.currentProfileSnapshot(profileID, liveProfile), fmt.Errorf("%w: reserved runtime generation changed before launch", ErrBrowserRuntimeProfileMismatch)
+		}
 	}
 	profileIncarnation := liveProfile
 	profile := copyBrowserProfileSnapshot(liveProfile)
@@ -1944,7 +1989,10 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 		if fenceErr := s.startProfileFenceError(profileID, launchRevision, launchIncarnation); fenceErr != nil {
 			return s.currentProfileSnapshot(profileID, profile), fenceErr
 		}
-		identity := s.markRunning(profileID, profile, nil, profile.Pid, profile.DebugPort, true, "")
+		identity, marked := s.markRunningForIncarnation(profileID, profile, launchRevision, launchIncarnation, nil, profile.Pid, profile.DebugPort, true, "")
+		if !marked {
+			return s.currentProfileSnapshot(profileID, profile), fmt.Errorf("%w: profile changed before recovered-runtime adoption", ErrBrowserRuntimeProfileMismatch)
+		}
 		manager.Mutex.Lock()
 		if current := manager.Profiles[profileID]; current != nil && s.identityMatches(profileID, identity) {
 			profile = copyBrowserProfileSnapshot(current)
@@ -1984,6 +2032,13 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 		}
 	}()
 
+	// Recheck immediately before crossing into the host launch callback. This
+	// preserves the existing P1.8 behavior for a replacement that happens
+	// during StartProcess, while ensuring a replacement already visible at the
+	// launch boundary cannot start an unowned child.
+	if fenceErr := s.startProfileFenceError(profileID, launchRevision, launchIncarnation); fenceErr != nil {
+		return s.currentProfileSnapshot(profileID, profile), fenceErr
+	}
 	process, err := host.StartProcess(plan)
 	if err == nil && s.startAdmissionClosed() {
 		shutdownErr := ErrBrowserRuntimeServiceShutdown
@@ -2011,7 +2066,7 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 		}
 		manager.Mutex.Lock()
 		if fenceErr == nil {
-			if current := manager.Profiles[profileID]; current != nil {
+			if current := manager.Profiles[profileID]; current != nil && current == launchIncarnation {
 				current.LastError = err.Error()
 				profile = current
 			}
@@ -2058,7 +2113,13 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 				processOwned = false
 				return s.currentProfileSnapshot(profileID, profile), errors.Join(fenceErr, teardownErr)
 			}
-			identity := s.markRunning(profileID, profile, process.cmd, process.cmd.Process.Pid, stablePort, true, "")
+			identity, marked := s.markRunningForIncarnation(profileID, profile, launchRevision, launchIncarnation, process.cmd, process.cmd.Process.Pid, stablePort, true, "")
+			if !marked {
+				fenceErr := fmt.Errorf("%w: profile changed before runtime adoption", ErrBrowserRuntimeProfileMismatch)
+				teardownErr := s.stopAndCleanupBrowserRuntimeProcess(host, process, plan)
+				processOwned = false
+				return s.currentProfileSnapshot(profileID, profile), errors.Join(fenceErr, teardownErr)
+			}
 			s.trackProcess(profileID, process, identity)
 			if proxyBridge, acquired := takeStartPlanProxyForBinding(plan); acquired {
 				s.bindProxy(profileID, identity, proxyBridge)
@@ -2092,7 +2153,13 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 		}
 		warning := browserDebugPendingWarning(plan.totalReadyTimeout)
 		pendingNotice := browserDebugPendingStartNotice(plan.totalReadyTimeout)
-		identity := s.markRunning(profileID, profile, process.cmd, process.cmd.Process.Pid, plan.assignedDebugPort, false, warning)
+		identity, marked := s.markRunningForIncarnation(profileID, profile, launchRevision, launchIncarnation, process.cmd, process.cmd.Process.Pid, plan.assignedDebugPort, false, warning)
+		if !marked {
+			fenceErr := fmt.Errorf("%w: profile changed before pending-runtime adoption", ErrBrowserRuntimeProfileMismatch)
+			teardownErr := s.stopAndCleanupBrowserRuntimeProcess(host, process, plan)
+			processOwned = false
+			return s.currentProfileSnapshot(profileID, profile), errors.Join(fenceErr, teardownErr)
+		}
 		s.trackProcess(profileID, process, identity)
 		if len(plan.deferredStartTargets) > 0 {
 			s.storeDeferredTargets(profileID, identity, plan.deferredStartTargets, plan.deferredStartNewTabs)
@@ -2108,7 +2175,7 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 		processOwned = false
 		go s.waitDebugReadyAsync(host, profileID, plan.assignedDebugPort, identity, browserAsyncDebugAttachTimeout)
 		manager.Mutex.Lock()
-		if current := manager.Profiles[profileID]; current != nil {
+		if current := manager.Profiles[profileID]; current != nil && current == launchIncarnation {
 			current.LastError = pendingNotice
 			profile = current
 		}
@@ -2129,7 +2196,7 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 	}
 	s.clearDeferredTargets(profileID, s.identity(profileID).generation)
 	manager.Mutex.Lock()
-	if current := manager.Profiles[profileID]; current != nil {
+	if current := manager.Profiles[profileID]; current != nil && current == launchIncarnation {
 		current.LastError = lastStartErr.Error()
 		profile = current
 	}
@@ -2429,6 +2496,39 @@ func (s *BrowserRuntimeService) markRunning(profileID string, profile *browser.P
 	}
 	manager.Mutex.Unlock()
 	return s.nextIdentity(profileID, pid, debugPort, cmd, current)
+}
+
+// markRunningForIncarnation is the launch-side commit fence. The ordinary
+// markRunning helper remains source-compatible for legacy package callers,
+// while a Start path must never mutate a profile that was deleted/recreated
+// or updated after its pre-launch snapshot.
+func (s *BrowserRuntimeService) markRunningForIncarnation(profileID string, profile, expectedRevision, expectedIncarnation *browser.Profile, cmd *exec.Cmd, pid, debugPort int, debugReady bool, warning string) (browserRuntimeIdentity, bool) {
+	manager := s.Manager()
+	if manager == nil || profile == nil || expectedIncarnation == nil {
+		return browserRuntimeIdentity{}, false
+	}
+	manager.Mutex.Lock()
+	current := manager.Profiles[profileID]
+	if current == nil || current != expectedIncarnation || (expectedRevision != nil && !reflect.DeepEqual(*current, *expectedRevision)) {
+		manager.Mutex.Unlock()
+		return browserRuntimeIdentity{}, false
+	}
+	current.Running = true
+	current.DebugPort = debugPort
+	current.DebugReady = debugReady
+	current.Pid = pid
+	current.LastStartAt = time.Now().Format(time.RFC3339)
+	current.RuntimeWarning = warning
+	current.LastError = ""
+	if manager.BrowserProcesses == nil {
+		manager.BrowserProcesses = make(map[string]*exec.Cmd)
+	}
+	if cmd != nil {
+		manager.BrowserProcesses[profileID] = cmd
+	}
+	identity := s.nextIdentity(profileID, pid, debugPort, cmd, current)
+	manager.Mutex.Unlock()
+	return identity, true
 }
 
 // adoptDetectedRuntime commits a recovered runtime while the profile still

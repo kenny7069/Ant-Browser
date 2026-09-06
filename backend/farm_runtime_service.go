@@ -69,7 +69,7 @@ type FarmRuntimeProfile struct {
 	DebugPort      int      `json:"debugPort"`
 	DebugReady     bool     `json:"debugReady"`
 	Pid            int      `json:"pid"`
-	RuntimeWarning string   `json:"runtimeWarning,omitempty"`
+	RuntimeWarning string   `json:"-"`
 	LastStartAt    string   `json:"lastStartAt,omitempty"`
 	LastStopAt     string   `json:"lastStopAt,omitempty"`
 	LaunchArgs     []string `json:"-"`
@@ -114,6 +114,41 @@ func (runtime FarmRuntime) MarshalJSON() ([]byte, error) {
 		LastStartAt:         runtime.LastStartAt,
 		LastStopAt:          runtime.LastStopAt,
 	})
+}
+
+// farmRuntimeWirePayload is the deliberately small set of values that the
+// command response is allowed to put on the wire. Keep this type switch
+// explicit: an exported any field is useful for compatibility with existing
+// handlers, but it must not become an arbitrary JSON serialization boundary.
+func farmRuntimeWirePayload(payload any) (any, error) {
+	switch typed := payload.(type) {
+	case nil:
+		return nil, nil
+	case FarmRuntime:
+		return typed, nil
+	case *FarmRuntime:
+		if typed == nil {
+			return nil, nil
+		}
+		return typed, nil
+	case []FarmRuntime:
+		return typed, nil
+	case []*FarmRuntime:
+		return typed, nil
+	case FarmRuntimeProfile:
+		return typed, nil
+	case *FarmRuntimeProfile:
+		if typed == nil {
+			return nil, nil
+		}
+		return typed, nil
+	case []FarmRuntimeProfile:
+		return typed, nil
+	case []*FarmRuntimeProfile:
+		return typed, nil
+	default:
+		return nil, fmt.Errorf("%w: response payload type is not allowlisted", ErrFarmRuntimeCommand)
+	}
 }
 
 // FarmRuntimeServiceConfig constructs a farm layer around the existing
@@ -230,6 +265,10 @@ func farmRuntimeStableErrorMessage(message string) string {
 // MarshalJSON prevents a direct caller from putting an arbitrary wrapped Go
 // error (which may contain a path, command line, or credential) on the wire.
 func (response FarmRuntimeCommandResponse) MarshalJSON() ([]byte, error) {
+	payload, err := farmRuntimeWirePayload(response.Payload)
+	if err != nil {
+		return nil, err
+	}
 	return json.Marshal(struct {
 		Type          string `json:"type"`
 		NodeUID       string `json:"node_uid"`
@@ -242,7 +281,7 @@ func (response FarmRuntimeCommandResponse) MarshalJSON() ([]byte, error) {
 		NodeUID:       response.NodeUID,
 		CorrelationID: response.CorrelationID,
 		OK:            response.OK,
-		Payload:       response.Payload,
+		Payload:       payload,
 		Error: func() string {
 			if response.Error == "" {
 				return ""
@@ -970,10 +1009,18 @@ func walkFarmRuntimeJSON(decoder *json.Decoder) error {
 				if !ok {
 					return fmt.Errorf("object key is not a string")
 				}
-				if _, exists := seen[key]; exists {
+				// encoding/json matches struct fields case-insensitively. Reject
+				// both exact duplicates and aliases before decoding so a second
+				// spelling cannot overwrite an authenticated field (including in
+				// recursively nested payload objects).
+				canonical := strings.ToLower(key)
+				if key != canonical {
+					return fmt.Errorf("object key is a case alias")
+				}
+				if _, exists := seen[canonical]; exists {
 					return fmt.Errorf("duplicate object key")
 				}
-				seen[key] = struct{}{}
+				seen[canonical] = struct{}{}
 				if err := walkFarmRuntimeJSON(decoder); err != nil {
 					return err
 				}

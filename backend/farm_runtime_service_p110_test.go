@@ -31,6 +31,33 @@ func TestFarmRuntimeP110RestartEnsureRejectsUnprovenSharedRuntime(t *testing.T) 
 	}
 }
 
+func TestFarmRuntimeP110StartIfGenerationReservesProfileIncarnation(t *testing.T) {
+	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	snapshot, err := fixture.runtime.RuntimeSnapshot("profile-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.runtime.startReservationHook = func() {
+		fixture.manager.Mutex.Lock()
+		original := fixture.manager.Profiles["profile-1"]
+		delete(fixture.manager.Profiles, "profile-1")
+		fixture.manager.Profiles["profile-1"] = copyBrowserProfileSnapshot(original)
+		fixture.manager.Mutex.Unlock()
+	}
+	if _, err := fixture.runtime.StartIfGeneration("profile-1", snapshot.Generation, snapshot.ProfileIncarnation); !errors.Is(err, ErrBrowserRuntimeProfileMismatch) {
+		t.Fatalf("reserved StartIfGeneration error = %v, want profile mismatch", err)
+	}
+	if fixture.startCalls.Load() != 0 {
+		t.Fatalf("reserved StartIfGeneration launched replacement: %d calls", fixture.startCalls.Load())
+	}
+	fixture.manager.Mutex.Lock()
+	replacement := copyBrowserProfileSnapshot(fixture.manager.Profiles["profile-1"])
+	fixture.manager.Mutex.Unlock()
+	if replacement.Running || replacement.Pid != 0 || replacement.DebugPort != 0 {
+		t.Fatalf("reserved StartIfGeneration touched replacement: %+v", replacement)
+	}
+}
+
 func TestFarmRuntimeP110ProfileABARejectsStatusAndStop(t *testing.T) {
 	fixture := newFarmRuntimeTestFixture(t, "profile-1")
 	owned, err := fixture.farm.EnsureRuntime(FarmRuntimeEnsureRequest{ProfileID: "profile-1"})
@@ -119,6 +146,16 @@ func TestFarmRuntimeP110WireTelemetryMasksProfileSecrets(t *testing.T) {
 			t.Fatalf("command response leaked %q: %s", canary, encoded)
 		}
 	}
+	unsafeResponse := FarmRuntimeCommandResponse{
+		Type:    "command_response",
+		NodeUID: "node-test",
+		OK:      true,
+		Payload: browser.Profile{UserDataDir: "CANARY_DIRECT_RESPONSE_PATH"},
+	}
+	unsafeEncoded, unsafeErr := json.Marshal(unsafeResponse)
+	if unsafeErr == nil || strings.Contains(string(unsafeEncoded), "CANARY_DIRECT_RESPONSE_PATH") {
+		t.Fatalf("unsafe direct response payload was serialized: err=%v json=%s", unsafeErr, unsafeEncoded)
+	}
 }
 
 func TestFarmRuntimeP110StrictCommandEnvelope(t *testing.T) {
@@ -134,8 +171,11 @@ func TestFarmRuntimeP110StrictCommandEnvelope(t *testing.T) {
 	tests := []string{
 		`{"type":"command","node_uid":"","correlation_id":"corr","command":"inventory","payload":{}}`,
 		`{"type":"command","node_uid":"wrong","correlation_id":"corr","command":"inventory","payload":{}}`,
+		`{"type":"not-command","TYPE":"command","node_uid":"node-test","correlation_id":"corr","command":"inventory","payload":{}}`,
+		`{"type":"command","node_uid":"wrong","NODE_UID":"node-test","correlation_id":"corr","command":"inventory","payload":{}}`,
 		`{"type":"command","node_uid":"node-test","correlation_id":"corr","command":"inventory","payload":{},"extra":1}`,
 		`{"type":"command","node_uid":"node-test","correlation_id":"corr","command":"inventory","payload":{"x":1,"x":2}}`,
+		`{"type":"command","node_uid":"node-test","correlation_id":"corr","command":"stop_runtime","payload":{"profile_id":"profile-1","runtime_uid":"stale","RUNTIME_UID":"replacement","provider_instance_id":"provider-test","fencing_epoch":7,"generation":1}}`,
 		`{"type":"command","node_uid":"node-test","correlation_id":"corr","command":"inventory","payload":{}} {}`,
 	}
 	for _, raw := range tests {
@@ -154,6 +194,14 @@ func TestFarmRuntimeP110StrictCommandEnvelope(t *testing.T) {
 		Payload:       json.RawMessage(`{"profile_id":"profile-1","profile_id":"profile-1"}`),
 	}); !errors.Is(err, ErrFarmRuntimeCommand) {
 		t.Fatalf("duplicate payload error = %v", err)
+	}
+	for _, alias := range []string{
+		`{"TYPE":"command","node_uid":"node-test","correlation_id":"corr","command":"inventory","payload":{}}`,
+		`{"type":"command","node_uid":"node-test","correlation_id":"corr","command":"ensure_runtime","payload":{"profile_id":"profile-1","runtime_uid":"stale","RUNTIME_UID":"replacement"}}`,
+	} {
+		if _, err := fixture.farm.HandleCommandEnvelope(strings.NewReader(alias)); err == nil {
+			t.Fatalf("case-alias envelope was accepted: %s", alias)
+		}
 	}
 }
 
