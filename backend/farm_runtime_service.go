@@ -146,6 +146,13 @@ func farmRuntimeWirePayload(payload any) (any, error) {
 		return typed, nil
 	case []*FarmRuntimeProfile:
 		return typed, nil
+	case FarmAttestationResponse:
+		return typed, nil
+	case *FarmAttestationResponse:
+		if typed == nil {
+			return nil, nil
+		}
+		return typed, nil
 	default:
 		return nil, fmt.Errorf("%w: response payload type is not allowlisted", ErrFarmRuntimeCommand)
 	}
@@ -162,19 +169,23 @@ type FarmRuntimeServiceConfig struct {
 	NodeID                string
 	ProviderInstanceID    string
 	FencingEpoch          uint64
+	// AttestationStateProvider is a local Agent/host callback. A nil callback
+	// makes the attestation command fail closed as not-ready.
+	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 }
 
 // FarmRuntimeServiceFactoryConfig is the public, Wails-free factory boundary.
 // If BrowserRuntimeService is nil, BrowserRuntimeFactory is used to construct
 // the one shared lifecycle service. No Farm-specific lifecycle is duplicated.
 type FarmRuntimeServiceFactoryConfig struct {
-	BrowserRuntimeService *BrowserRuntimeService
-	RuntimeService        *BrowserRuntimeService
-	BrowserRuntimeFactory BrowserRuntimeServiceFactoryConfig
-	NodeUID               string
-	NodeID                string
-	ProviderInstanceID    string
-	FencingEpoch          uint64
+	BrowserRuntimeService    *BrowserRuntimeService
+	RuntimeService           *BrowserRuntimeService
+	BrowserRuntimeFactory    BrowserRuntimeServiceFactoryConfig
+	NodeUID                  string
+	NodeID                   string
+	ProviderInstanceID       string
+	FencingEpoch             uint64
+	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 }
 
 // FarmRuntimeEnsureRequest identifies the profile and, when supplied, the
@@ -255,7 +266,13 @@ func farmRuntimeStableErrorMessage(message string) string {
 		ErrFarmRuntimeNotFound.Error(),
 		ErrFarmRuntimeConfigMismatch.Error(),
 		ErrFarmRuntimeStale.Error(),
-		ErrFarmRuntimeCommand.Error():
+		ErrFarmRuntimeCommand.Error(),
+		ErrFarmAttestationInvalid.Error(),
+		ErrFarmAttestationNotReady.Error(),
+		ErrFarmAttestationTokenMismatch.Error(),
+		ErrFarmAttestationStructuredMismatch.Error(),
+		ErrFarmAttestationIdentityMismatch.Error(),
+		ErrFarmAttestationUnownedRestart.Error():
 		return message
 	default:
 		return ErrFarmRuntimeCommand.Error()
@@ -309,13 +326,16 @@ type farmRuntimeProfileGate struct {
 // Authenticated persistent inventory/reconcile metadata belongs to the later
 // Control WSS/fencing gates.
 type FarmRuntimeService struct {
-	runtimeService   *BrowserRuntimeService
-	nodeUID          string
-	providerInstance string
-	fencingEpoch     uint64
+	runtimeService           *BrowserRuntimeService
+	nodeUID                  string
+	providerInstance         string
+	fencingEpoch             uint64
+	attestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 
 	recordsMu sync.RWMutex
 	records   map[string]farmRuntimeRecord
+
+	attestation *FarmAttestationAgent
 
 	gatesMu sync.Mutex
 	gates   map[string]*farmRuntimeProfileGate
@@ -345,12 +365,14 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 		return nil, fmt.Errorf("%w: fencing epoch must be positive", ErrFarmRuntimeServiceUnavailable)
 	}
 	return &FarmRuntimeService{
-		runtimeService:   runtimeService,
-		nodeUID:          nodeUID,
-		providerInstance: providerInstance,
-		fencingEpoch:     options.FencingEpoch,
-		records:          make(map[string]farmRuntimeRecord),
-		gates:            make(map[string]*farmRuntimeProfileGate),
+		runtimeService:           runtimeService,
+		nodeUID:                  nodeUID,
+		providerInstance:         providerInstance,
+		fencingEpoch:             options.FencingEpoch,
+		records:                  make(map[string]farmRuntimeRecord),
+		gates:                    make(map[string]*farmRuntimeProfileGate),
+		attestation:              NewFarmAttestationAgent(),
+		attestationStateProvider: options.AttestationStateProvider,
 	}, nil
 }
 
@@ -372,11 +394,12 @@ func NewFarmRuntimeServiceForHost(options FarmRuntimeServiceFactoryConfig) (*Far
 		}
 	}
 	return NewFarmRuntimeService(FarmRuntimeServiceConfig{
-		BrowserRuntimeService: runtimeService,
-		NodeUID:               options.NodeUID,
-		NodeID:                options.NodeID,
-		ProviderInstanceID:    options.ProviderInstanceID,
-		FencingEpoch:          options.FencingEpoch,
+		BrowserRuntimeService:    runtimeService,
+		NodeUID:                  options.NodeUID,
+		NodeID:                   options.NodeID,
+		ProviderInstanceID:       options.ProviderInstanceID,
+		FencingEpoch:             options.FencingEpoch,
+		AttestationStateProvider: options.AttestationStateProvider,
 	})
 }
 
@@ -777,6 +800,96 @@ func (s *FarmRuntimeService) RuntimeStatus(request FarmRuntimeStatusRequest) (Fa
 	return runtime, nil
 }
 
+// ApplyAttestation binds a structured attestation to a runtime explicitly
+// owned by this service.  The shared BrowserRuntimeService readiness snapshot
+// is required as an additional launch-state fence; a caller cannot mark an
+// arbitrary or unowned profile as applied by setting Ready in a request.
+func (s *FarmRuntimeService) ApplyAttestation(
+	request FarmAttestationRequest,
+	state FarmAttestationLaunchState,
+) (FarmAttestationResponse, error) {
+	if s == nil {
+		return FarmAttestationResponse{}, ErrFarmRuntimeServiceUnavailable
+	}
+	if err := request.validate(); err != nil {
+		return FarmAttestationResponse{}, err
+	}
+	if err := s.validateControllerIdentity(request.RuntimeIdentity.NodeUID, request.RuntimeIdentity.ProviderInstanceID, request.RuntimeIdentity.FencingEpoch); err != nil {
+		return FarmAttestationResponse{}, err
+	}
+	release, err := s.acquire(request.RuntimeIdentity.ProfileID)
+	if err != nil {
+		return FarmAttestationResponse{}, err
+	}
+	defer release()
+	record, owned := s.currentRecord(request.RuntimeIdentity.ProfileID)
+	if !owned {
+		return FarmAttestationResponse{}, fmt.Errorf("%w: profile %s", ErrFarmRuntimeUnknown, request.RuntimeIdentity.ProfileID)
+	}
+	identity := record.runtime.FarmRuntimeIdentity
+	if identity.NodeUID != request.RuntimeIdentity.NodeUID ||
+		identity.ProfileID != request.RuntimeIdentity.ProfileID ||
+		identity.RuntimeUID != request.RuntimeIdentity.RuntimeUID ||
+		identity.ProviderInstanceID != request.RuntimeIdentity.ProviderInstanceID ||
+		identity.FencingEpoch != request.RuntimeIdentity.FencingEpoch ||
+		identity.Generation != request.RuntimeIdentity.Generation ||
+		identity.ConfigHash != request.RuntimeIdentity.ConfigHash ||
+		identity.ConfigHash != request.ConfigHash {
+		return FarmAttestationResponse{}, ErrFarmAttestationIdentityMismatch
+	}
+	snapshot, err := s.snapshot(request.RuntimeIdentity.ProfileID)
+	if err != nil {
+		return FarmAttestationResponse{}, err
+	}
+	if snapshot == nil || snapshot.Profile == nil || !snapshot.Profile.Running || !snapshot.Profile.DebugReady || snapshot.Generation != identity.Generation || !farmRuntimeIncarnationMatches(record, snapshot) {
+		return FarmAttestationResponse{}, ErrFarmAttestationNotReady
+	}
+	if s.attestation == nil {
+		return FarmAttestationResponse{}, ErrFarmAttestationInvalid
+	}
+	return s.attestation.ApplyAttestation(request, state)
+}
+
+// AttestRuntime is a concise compatibility alias for runtime adapters.
+func (s *FarmRuntimeService) AttestRuntime(request FarmAttestationRequest, state FarmAttestationLaunchState) (FarmAttestationResponse, error) {
+	return s.ApplyAttestation(request, state)
+}
+
+// AttestRuntimeFromLocalState is the transport-facing entry point. The
+// remote command supplies only the Server request; launch state must come from
+// a local Agent/host callback and is therefore not forgeable on the wire.
+func (s *FarmRuntimeService) AttestRuntimeFromLocalState(request FarmAttestationRequest) (FarmAttestationResponse, error) {
+	if s == nil {
+		return FarmAttestationResponse{}, ErrFarmRuntimeServiceUnavailable
+	}
+	if err := request.validate(); err != nil {
+		return FarmAttestationResponse{}, err
+	}
+	if err := s.validateControllerIdentity(request.RuntimeIdentity.NodeUID, request.RuntimeIdentity.ProviderInstanceID, request.RuntimeIdentity.FencingEpoch); err != nil {
+		return FarmAttestationResponse{}, err
+	}
+	if s.attestationStateProvider == nil {
+		return FarmAttestationResponse{}, ErrFarmAttestationNotReady
+	}
+	state, err := s.attestationStateProvider(request.RuntimeIdentity)
+	if err != nil {
+		// Do not propagate a provider's arbitrary local error into a transport
+		// response; it may contain a path, command line, or proxy credential.
+		// Preserve only the small set of stable attestation classifications.
+		switch {
+		case errors.Is(err, ErrFarmAttestationIdentityMismatch):
+			return FarmAttestationResponse{}, ErrFarmAttestationIdentityMismatch
+		case errors.Is(err, ErrFarmAttestationInvalid):
+			return FarmAttestationResponse{}, ErrFarmAttestationInvalid
+		case errors.Is(err, ErrFarmAttestationNotReady):
+			return FarmAttestationResponse{}, ErrFarmAttestationNotReady
+		default:
+			return FarmAttestationResponse{}, ErrFarmAttestationNotReady
+		}
+	}
+	return s.ApplyAttestation(request, state)
+}
+
 // StopRuntime is the explicit-only stop operation. It never calls the global
 // BrowserRuntimeService.Shutdown and therefore cannot affect other Wails
 // sessions or profiles not owned by this FarmRuntimeService.
@@ -1093,7 +1206,7 @@ func (s *FarmRuntimeService) validateCommand(command FarmRuntimeCommand) error {
 		return fmt.Errorf("%w: command is required", ErrFarmRuntimeCommand)
 	}
 	switch strings.TrimSpace(command.Command) {
-	case "ensure_runtime", "runtime_status", "stop_runtime", "inventory":
+	case "ensure_runtime", "runtime_status", "stop_runtime", "inventory", "attest_runtime":
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown command", ErrFarmRuntimeCommand)
@@ -1118,12 +1231,25 @@ func farmRuntimeWireError(err error) string {
 		return ErrFarmRuntimeConfigMismatch.Error()
 	case errors.Is(err, ErrFarmRuntimeServiceUnavailable):
 		return ErrFarmRuntimeServiceUnavailable.Error()
+	case errors.Is(err, ErrFarmAttestationInvalid):
+		return ErrFarmAttestationInvalid.Error()
+	case errors.Is(err, ErrFarmAttestationNotReady):
+		return ErrFarmAttestationNotReady.Error()
+	case errors.Is(err, ErrFarmAttestationTokenMismatch):
+		return ErrFarmAttestationTokenMismatch.Error()
+	case errors.Is(err, ErrFarmAttestationStructuredMismatch):
+		return ErrFarmAttestationStructuredMismatch.Error()
+	case errors.Is(err, ErrFarmAttestationIdentityMismatch):
+		return ErrFarmAttestationIdentityMismatch.Error()
+	case errors.Is(err, ErrFarmAttestationUnownedRestart):
+		return ErrFarmAttestationUnownedRestart.Error()
 	default:
 		return ErrFarmRuntimeCommand.Error()
 	}
 }
 
-// HandleCommand dispatches the four P1.10 commands without knowing how the
+// HandleCommand dispatches the P1.10 lifecycle commands and P1.11 attestation
+// without knowing how the
 // command arrived. Business errors are returned as ok=false so a WSS adapter
 // can preserve command correlation; malformed payloads return a Go error.
 func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRuntimeCommandResponse, error) {
@@ -1184,6 +1310,18 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		}
 		response.OK = true
 		response.Payload = inventory
+	case "attest_runtime":
+		var request FarmAttestationRequest
+		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
+			return FarmRuntimeCommandResponse{}, err
+		}
+		attestation, err := s.AttestRuntimeFromLocalState(request)
+		if err != nil {
+			response.Error = farmRuntimeWireError(err)
+			return response, nil
+		}
+		response.OK = true
+		response.Payload = attestation
 	default:
 		response.Error = ErrFarmRuntimeCommand.Error()
 	}
