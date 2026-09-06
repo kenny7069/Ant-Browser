@@ -68,26 +68,21 @@ func secureRuntimeEnsurePrivateDirectory(path string) error {
 }
 
 func secureRuntimeLoadOrCreateKey(securityDir string) ([]byte, error) {
-	path := filepath.Join(securityDir, secureRuntimeRegistryKeyName)
-	info, err := os.Lstat(path)
-	if err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("%w: secure proxy key is not a regular file", ErrSecureRuntimeAuth)
-		}
-		if err := secureRuntimeCheckOwnerAndMode(path, info.Mode(), false); err != nil {
-			return nil, err
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read secure proxy key: %w", err)
-		}
-		if len(data) != 32 {
-			return nil, fmt.Errorf("%w: invalid secure proxy key length", ErrSecureRuntimeAuth)
-		}
-		return append([]byte(nil), data...), nil
+	lockPath := filepath.Join(securityDir, secureRuntimeRegistryLockName)
+	lock, err := secureRuntimeAcquireSweepLock(lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("lock secure proxy key: %w", err)
 	}
-	if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("inspect secure proxy key: %w", err)
+	defer lock.Close()
+	return secureRuntimeLoadOrCreateKeyLocked(securityDir)
+}
+
+func secureRuntimeLoadOrCreateKeyLocked(securityDir string) ([]byte, error) {
+	path := filepath.Join(securityDir, secureRuntimeRegistryKeyName)
+	if data, err := secureRuntimeReadExistingKey(path); err == nil {
+		return data, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 	key, err := secureRuntimeRandomBytes(32)
 	if err != nil {
@@ -96,7 +91,10 @@ func secureRuntimeLoadOrCreateKey(securityDir string) ([]byte, error) {
 	file, err := secureRuntimeCreateExclusiveFile(path)
 	if err != nil {
 		if os.IsExist(err) {
-			return secureRuntimeLoadOrCreateKey(securityDir)
+			// A caller that did not use the registry lock may have won the
+			// create. Read the completed file once; never regenerate or accept
+			// an invalid existing key.
+			return secureRuntimeReadExistingKey(path)
 		}
 		return nil, fmt.Errorf("create secure proxy key: %w", err)
 	}
@@ -114,6 +112,27 @@ func secureRuntimeLoadOrCreateKey(securityDir string) ([]byte, error) {
 		return nil, fmt.Errorf("close secure proxy key: %w", err)
 	}
 	return key, nil
+}
+
+func secureRuntimeReadExistingKey(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: secure proxy key is not a regular file", ErrSecureRuntimeAuth)
+	}
+	if err := secureRuntimeCheckOwnerAndMode(path, info.Mode(), false); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read secure proxy key: %w", err)
+	}
+	if len(data) != 32 {
+		return nil, fmt.Errorf("%w: invalid secure proxy key length", ErrSecureRuntimeAuth)
+	}
+	return append([]byte(nil), data...), nil
 }
 
 func secureRuntimeRandomBytes(size int) ([]byte, error) {
@@ -336,6 +355,18 @@ func (w *secureRuntimeWriter) initializeAuthenticatedRoot() error {
 	if w == nil || !w.sweepEnabled {
 		return nil
 	}
+	lock, err := secureRuntimeAcquireSweepLock(w.lockPath)
+	if err != nil {
+		return fmt.Errorf("lock secure proxy runtime registry: %w", err)
+	}
+	defer lock.Close()
+	return w.initializeAuthenticatedRootLocked()
+}
+
+func (w *secureRuntimeWriter) initializeAuthenticatedRootLocked() error {
+	if w == nil || !w.sweepEnabled {
+		return nil
+	}
 	tokenBytes, err := secureRuntimeRandomBytes(32)
 	if err != nil {
 		return fmt.Errorf("create secure proxy runtime ownership token: %w", err)
@@ -374,7 +405,39 @@ func (w *secureRuntimeWriter) initializeAuthenticatedRoot() error {
 	if err := secureRuntimeWriteRegistry(w.registryPath, registry, w.key); err != nil {
 		return fmt.Errorf("register secure proxy runtime root: %w", err)
 	}
-	w.rootToken = marker.Token
+	w.setRootToken(marker.Token)
+	return nil
+}
+
+func (w *secureRuntimeWriter) verifyAuthenticatedRootLocked() error {
+	if w == nil || !w.sweepEnabled {
+		return nil
+	}
+	markerPath := filepath.Join(w.root, secureRuntimeMarkerName)
+	data, err := secureRuntimeReadMetadata(markerPath)
+	if err != nil {
+		return fmt.Errorf("%w: read secure proxy runtime marker: %v", ErrSecureRuntimeAuth, err)
+	}
+	var marker secureRuntimeMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return fmt.Errorf("%w: decode secure proxy runtime marker", ErrSecureRuntimeAuth)
+	}
+	currentToken := w.currentRootToken()
+	if marker.Root != filepath.Base(w.root) || marker.Stack != w.stack || !isSecureRuntimeToken(marker.Token) || (currentToken != "" && marker.Token != currentToken) {
+		return fmt.Errorf("%w: secure proxy runtime marker generation mismatch", ErrSecureRuntimeAuth)
+	}
+	if err := secureRuntimeVerifyMarker(marker, w.key); err != nil {
+		return err
+	}
+	registry, err := secureRuntimeReadRegistry(w.registryPath, w.appID, w.key)
+	if err != nil {
+		return err
+	}
+	entry, ok := registry.Roots[marker.Root]
+	if !ok || entry.Stack != marker.Stack || entry.Token != marker.Token || entry.MarkerMAC != marker.MAC {
+		return fmt.Errorf("%w: secure proxy runtime registry generation mismatch", ErrSecureRuntimeAuth)
+	}
+	w.setRootToken(marker.Token)
 	return nil
 }
 
@@ -396,7 +459,7 @@ func (w *secureRuntimeWriter) updateRootMetadata(mutator func(*secureRuntimeMark
 	if err := json.Unmarshal(data, &marker); err != nil {
 		return fmt.Errorf("%w: decode secure proxy runtime marker", ErrSecureRuntimeAuth)
 	}
-	if marker.Root != filepath.Base(w.root) || marker.Stack != w.stack || marker.Token != w.rootToken {
+	if marker.Root != filepath.Base(w.root) || marker.Stack != w.stack || marker.Token != w.currentRootToken() {
 		return ErrSecureRuntimeAuth
 	}
 	if err := secureRuntimeVerifyMarker(marker, w.key); err != nil {
@@ -600,7 +663,7 @@ func (w *secureRuntimeWriter) removeRootIfEmpty() error {
 	if err := json.Unmarshal(data, &marker); err != nil {
 		return fmt.Errorf("%w: decode secure proxy runtime marker", ErrSecureRuntimeAuth)
 	}
-	if marker.Root != filepath.Base(w.root) || marker.Stack != w.stack || marker.Token != w.rootToken || marker.Pending != 0 || len(marker.Children) != 0 || len(marker.Entries) != 0 {
+	if marker.Root != filepath.Base(w.root) || marker.Stack != w.stack || marker.Token != w.currentRootToken() || marker.Pending != 0 || len(marker.Children) != 0 || len(marker.Entries) != 0 {
 		return nil
 	}
 	if err := secureRuntimeVerifyMarker(marker, w.key); err != nil {

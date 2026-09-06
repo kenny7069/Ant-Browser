@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -161,6 +162,234 @@ func TestSecureRuntimeCrashRestartSubprocessSweep(t *testing.T) {
 	if _, err := os.Lstat(tamperedRoot); err != nil {
 		t.Fatalf("tampered root was removed by restart sweep: %v", err)
 	}
+}
+
+func TestSecureRuntimeProductionWriterReusesAuthenticatedRootAfterCleanup(t *testing.T) {
+	appRoot := t.TempDir()
+	writer, err := newSecureRuntimeWriterForApp("xray", appRoot)
+	if err != nil {
+		t.Fatalf("newSecureRuntimeWriterForApp() error = %v", err)
+	}
+	root := writer.root
+	firstGeneration := writer.rootToken
+	t.Cleanup(func() {
+		_ = writer.cleanup("reuse-first")
+		_ = writer.cleanup("reuse-second")
+		_ = os.Remove(writer.root)
+	})
+	if _, err := writer.writeAtomic("reuse-first", "xray-config.json", []byte("first")); err != nil {
+		t.Fatalf("first writeAtomic() error = %v", err)
+	}
+	firstHandle, err := writer.handle("reuse-first")
+	if err != nil {
+		t.Fatalf("first handle() error = %v", err)
+	}
+	if err := firstHandle.cleanup(); err != nil {
+		t.Fatalf("first cleanup() error = %v", err)
+	}
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatalf("first cleanup left runtime root, lstat error = %v", err)
+	}
+	if _, err := firstHandle.markProcessLaunchPendingToken(); !errors.Is(err, ErrSecureRuntimePath) {
+		t.Fatalf("stale handle transition = %v, want ErrSecureRuntimePath", err)
+	}
+	if _, err := writer.writeAtomic("reuse-second", "xray-config.json", []byte("second")); err != nil {
+		t.Fatalf("second writeAtomic() after root cleanup error = %v", err)
+	}
+	if writer.root != root {
+		t.Fatalf("writer root changed unexpectedly: got %q, want %q", writer.root, root)
+	}
+	if writer.rootToken == firstGeneration || writer.rootToken == "" {
+		t.Fatalf("writer root generation was not replaced: old=%q new=%q", firstGeneration, writer.rootToken)
+	}
+	markerData, err := secureRuntimeReadMetadata(filepath.Join(writer.root, secureRuntimeMarkerName))
+	if err != nil {
+		t.Fatalf("read replacement marker = %v", err)
+	}
+	var marker secureRuntimeMarker
+	if err := json.Unmarshal(markerData, &marker); err != nil {
+		t.Fatalf("decode replacement marker = %v", err)
+	}
+	if marker.Token != writer.rootToken || marker.Pending != 0 || len(marker.Children) != 0 {
+		t.Fatalf("replacement marker = token %q pending %d children %d", marker.Token, marker.Pending, len(marker.Children))
+	}
+}
+
+func TestSecureRuntimeProductionWriterRejectsUnauthenticatedRootReplacement(t *testing.T) {
+	appRoot := t.TempDir()
+	writer, err := newSecureRuntimeWriterForApp("singbox", appRoot)
+	if err != nil {
+		t.Fatalf("newSecureRuntimeWriterForApp() error = %v", err)
+	}
+	root := writer.root
+	t.Cleanup(func() {
+		_ = writer.cleanup("replacement-negative")
+		_ = os.Remove(root)
+	})
+	if _, err := writer.writeAtomic("replacement-negative", "singbox-config.json", []byte("first")); err != nil {
+		t.Fatalf("first writeAtomic() error = %v", err)
+	}
+	if err := writer.cleanup("replacement-negative"); err != nil {
+		t.Fatalf("first cleanup() error = %v", err)
+	}
+	if err := os.Mkdir(root, secureRuntimeDirMode); err != nil {
+		t.Fatalf("replace root with unauthenticated directory = %v", err)
+	}
+	if _, err := writer.writeAtomic("replacement-negative", "singbox-config.json", []byte("second")); !errors.Is(err, ErrSecureRuntimeAuth) {
+		t.Fatalf("write into unauthenticated root = %v, want ErrSecureRuntimeAuth", err)
+	}
+	if err := os.Remove(root); err != nil {
+		t.Fatalf("remove unauthenticated root = %v", err)
+	}
+	if err := os.Symlink(t.TempDir(), root); err == nil {
+		if _, err := writer.writeAtomic("replacement-negative", "singbox-config.json", []byte("third")); !errors.Is(err, ErrSecureRuntimePath) {
+			t.Fatalf("write through replacement symlink = %v, want ErrSecureRuntimePath", err)
+		}
+		if err := os.Remove(root); err != nil {
+			t.Fatalf("remove replacement symlink = %v", err)
+		}
+	}
+}
+
+func TestSecureRuntimeProductionWriterReuseConcurrentHandles(t *testing.T) {
+	appRoot := t.TempDir()
+	writer, err := newSecureRuntimeWriterForApp("mihomo", appRoot)
+	if err != nil {
+		t.Fatalf("newSecureRuntimeWriterForApp() error = %v", err)
+	}
+	if _, err := writer.writeAtomic("reuse-seed", "mihomo-config.yaml", []byte("seed")); err != nil {
+		t.Fatalf("seed writeAtomic() error = %v", err)
+	}
+	if err := writer.cleanup("reuse-seed"); err != nil {
+		t.Fatalf("seed cleanup() error = %v", err)
+	}
+	const workers = 16
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		key := fmt.Sprintf("reuse-concurrent-%02d", i)
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			_, err := writer.writeAtomic(key, "mihomo-config.yaml", []byte("concurrent"))
+			errs <- err
+		}(key)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent reuse writeAtomic() error = %v", err)
+		}
+	}
+	cleanupErrs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		key := fmt.Sprintf("reuse-concurrent-%02d", i)
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			cleanupErrs <- writer.cleanup(key)
+		}(key)
+	}
+	wg.Wait()
+	close(cleanupErrs)
+	for err := range cleanupErrs {
+		if err != nil {
+			t.Fatalf("concurrent cleanup() error = %v", err)
+		}
+	}
+}
+
+func TestSecureRuntimeKeyCreationConcurrentFirstCreate(t *testing.T) {
+	appRoot := t.TempDir()
+	const constructors = 32
+	type result struct {
+		writer *secureRuntimeWriter
+		err    error
+	}
+	results := make(chan result, constructors)
+	var wg sync.WaitGroup
+	for i := 0; i < constructors; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			writer, err := newSecureRuntimeWriterForApp("xray", appRoot)
+			results <- result{writer: writer, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	writers := make([]*secureRuntimeWriter, 0, constructors)
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent production constructor error = %v", result.err)
+		}
+		writers = append(writers, result.writer)
+	}
+	securityDir, _, err := secureRuntimePersistentSecurityDir(appRoot)
+	if err != nil {
+		t.Fatalf("secureRuntimePersistentSecurityDir() error = %v", err)
+	}
+	keyData, err := os.ReadFile(filepath.Join(securityDir, secureRuntimeRegistryKeyName))
+	if err != nil || len(keyData) != 32 {
+		t.Fatalf("persisted key length = %d, error = %v", len(keyData), err)
+	}
+	for _, writer := range writers {
+		if !bytes.Equal(writer.key, keyData) {
+			t.Fatalf("constructor received a different key")
+		}
+		if err := writer.removeRootIfEmpty(); err != nil {
+			t.Fatalf("remove test runtime root = %v", err)
+		}
+	}
+}
+
+func TestSecureRuntimeKeyCreationRejectsInvalidExistingArtifacts(t *testing.T) {
+	t.Run("invalid", func(t *testing.T) {
+		securityDir := testSecureRuntimeSecurityDir(t)
+		path := filepath.Join(securityDir, secureRuntimeRegistryKeyName)
+		if err := os.WriteFile(path, []byte("short"), secureRuntimeFileMode); err != nil {
+			t.Fatalf("write invalid key = %v", err)
+		}
+		if _, err := secureRuntimeLoadOrCreateKey(securityDir); !errors.Is(err, ErrSecureRuntimeAuth) {
+			t.Fatalf("invalid key load = %v, want ErrSecureRuntimeAuth", err)
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		securityDir := testSecureRuntimeSecurityDir(t)
+		path := filepath.Join(securityDir, secureRuntimeRegistryKeyName)
+		if err := os.Symlink(t.TempDir(), path); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		if _, err := secureRuntimeLoadOrCreateKey(securityDir); !errors.Is(err, ErrSecureRuntimeAuth) {
+			t.Fatalf("symlink key load = %v, want ErrSecureRuntimeAuth", err)
+		}
+	})
+	t.Run("unowned", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows owner check requires a Windows runner")
+		}
+		securityDir := testSecureRuntimeSecurityDir(t)
+		path := filepath.Join(securityDir, secureRuntimeRegistryKeyName)
+		if err := os.WriteFile(path, make([]byte, 32), secureRuntimeFileMode); err != nil {
+			t.Fatalf("write unowned fixture = %v", err)
+		}
+		if err := os.Chown(path, os.Getuid()+1, -1); err != nil {
+			t.Skipf("cannot chown fixture: %v", err)
+		}
+		if _, err := secureRuntimeLoadOrCreateKey(securityDir); !errors.Is(err, ErrSecureRuntimeAuth) {
+			t.Fatalf("unowned key load = %v, want ErrSecureRuntimeAuth", err)
+		}
+	})
+}
+
+func testSecureRuntimeSecurityDir(t *testing.T) string {
+	t.Helper()
+	securityDir := filepath.Join(t.TempDir(), secureRuntimeRegistryDirName)
+	if err := secureRuntimeEnsurePrivateDirectory(securityDir); err != nil {
+		t.Fatalf("secureRuntimeEnsurePrivateDirectory() error = %v", err)
+	}
+	return securityDir
 }
 
 type secureRuntimeSweepFixture struct {

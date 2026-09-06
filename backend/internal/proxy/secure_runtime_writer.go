@@ -51,6 +51,7 @@ type secureRuntimeWriter struct {
 	appID           string
 	key             []byte
 	rootToken       string
+	rootTokenMu     sync.RWMutex
 	registryPath    string
 	lockPath        string
 	processIdentity secureRuntimeProcessIdentity
@@ -60,6 +61,25 @@ type secureRuntimeWriter struct {
 
 	mu      sync.Mutex
 	entries map[string]*secureRuntimeHandle
+}
+
+func (w *secureRuntimeWriter) currentRootToken() string {
+	if w == nil {
+		return ""
+	}
+	w.rootTokenMu.RLock()
+	token := w.rootToken
+	w.rootTokenMu.RUnlock()
+	return token
+}
+
+func (w *secureRuntimeWriter) setRootToken(token string) {
+	if w == nil {
+		return
+	}
+	w.rootTokenMu.Lock()
+	w.rootToken = token
+	w.rootTokenMu.Unlock()
 }
 
 type secureRuntimeWriterOptions struct {
@@ -271,7 +291,8 @@ func newSecureRuntimeWriterWithOptions(stack string, options secureRuntimeWriter
 		entries:         make(map[string]*secureRuntimeHandle),
 	}
 	if writer.sweepEnabled {
-		if err := writer.initializeAuthenticatedRoot(); err != nil {
+		// The constructor already owns the registry lock acquired above.
+		if err := writer.initializeAuthenticatedRootLocked(); err != nil {
 			return nil, err
 		}
 	}
@@ -358,13 +379,9 @@ func (w *secureRuntimeWriter) ensureHandle(key string) (*secureRuntimeHandle, er
 	if err := validateSecureRuntimeKey(key); err != nil {
 		return nil, err
 	}
-	if err := w.verifyRoot(); err != nil {
-		return nil, err
-	}
-
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.verifyRoot(); err != nil {
+	if err := w.ensureRootLocked(); err != nil {
 		return nil, err
 	}
 	if existing := w.entries[key]; existing != nil {
@@ -400,19 +417,95 @@ func (w *secureRuntimeWriter) ensureHandle(key string) (*secureRuntimeHandle, er
 	return handle, nil
 }
 
-func (w *secureRuntimeWriter) verifyRoot() error {
-	info, err := os.Lstat(w.root)
-	if os.IsNotExist(err) {
-		if createErr := secureRuntimeCreateDirectory(w.root); createErr != nil && !os.IsExist(createErr) {
-			return fmt.Errorf("recreate secure proxy runtime root: %w", createErr)
-		}
-		info, err = os.Lstat(w.root)
+func (w *secureRuntimeWriter) ensureRootLocked() error {
+	if w == nil || strings.TrimSpace(w.root) == "" {
+		return ErrSecureRuntimePath
 	}
+	info, err := os.Lstat(w.root)
+	if err == nil {
+		if err := w.verifyRootInfo(info); err != nil {
+			return err
+		}
+		if !w.sweepEnabled {
+			return nil
+		}
+		lock, err := secureRuntimeAcquireSweepLock(w.lockPath)
+		if err != nil {
+			return fmt.Errorf("lock secure proxy runtime registry: %w", err)
+		}
+		defer lock.Close()
+		return w.verifyAuthenticatedRootLocked()
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect secure proxy runtime root: %w", err)
+	}
+	if len(w.entries) != 0 {
+		// A missing root while any handle is still registered is an external
+		// deletion or a stale watcher; never recreate a path that live handles
+		// could still mutate.
+		return fmt.Errorf("%w: runtime root disappeared while handles are registered", ErrSecureRuntimePath)
+	}
+	if !w.sweepEnabled {
+		if err := secureRuntimeCreateDirectory(w.root); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("recreate secure proxy runtime root: %w", err)
+		}
+		return w.verifyRoot()
+	}
+
+	lock, err := secureRuntimeAcquireSweepLock(w.lockPath)
+	if err != nil {
+		return fmt.Errorf("lock secure proxy runtime registry: %w", err)
+	}
+	defer lock.Close()
+	if info, err := os.Lstat(w.root); err == nil {
+		if err := w.verifyRootInfo(info); err != nil {
+			return err
+		}
+		return w.verifyAuthenticatedRootLocked()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect secure proxy runtime root: %w", err)
+	}
+	if err := secureRuntimeCreateDirectory(w.root); err != nil {
+		if !os.IsExist(err) {
+			return fmt.Errorf("recreate secure proxy runtime root: %w", err)
+		}
+		info, statErr := os.Lstat(w.root)
+		if statErr != nil {
+			return fmt.Errorf("inspect secure proxy runtime root after create: %w", statErr)
+		}
+		if err := w.verifyRootInfo(info); err != nil {
+			return err
+		}
+		return w.verifyAuthenticatedRootLocked()
+	}
+	if err := w.initializeAuthenticatedRootLocked(); err != nil {
+		return fmt.Errorf("reinitialize secure proxy runtime root: %w", err)
+	}
+	return nil
+}
+
+func (w *secureRuntimeWriter) verifyRoot() error {
+	if w == nil || strings.TrimSpace(w.root) == "" {
+		return ErrSecureRuntimePath
+	}
+	info, err := os.Lstat(w.root)
 	if err != nil {
 		return fmt.Errorf("inspect secure proxy runtime root: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+	return w.verifyRootInfo(info)
+}
+
+func (w *secureRuntimeWriter) verifyRootInfo(info os.FileInfo) error {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("%w: runtime root is not a directory", ErrSecureRuntimePath)
+	}
+	if err := secureRuntimeRejectReparsePoint(w.root); err != nil {
+		return err
+	}
+	if w.ownerCheck != nil {
+		if err := w.ownerCheck(w.root, info.Mode(), true); err != nil {
+			return err
+		}
 	}
 	return nil
 }
