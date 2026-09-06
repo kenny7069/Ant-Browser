@@ -12,12 +12,30 @@ import (
 
 const secureRuntimeNoFollowFlag = 0
 
-func secureRuntimeOwnerSecurityAttributes() (*windows.SecurityAttributes, error) {
+// FILE_ALL_ACCESS is the access mask produced when Windows resolves the FA
+// SDDL right. ACLFromEntries may preserve GENERIC_ALL instead, so inspection
+// accepts either equivalent full-control representation while still requiring
+// exactly one ACE for the current user.
+const secureRuntimeWindowsFileAllAccess windows.ACCESS_MASK = 0x001f01ff
+
+func secureRuntimeOwnerSecurityAttributes(directory bool) (*windows.SecurityAttributes, error) {
 	// The protected DACL contains one ACE for the current token user only. The
 	// descriptor is supplied at CreateFile/CreateDirectory time as well as
 	// applied after creation, so Windows file modes are never used as a proxy
 	// for access control.
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;OW)")
+	tokenUser, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return nil, fmt.Errorf("get current Windows token user: %w", err)
+	}
+	sid := tokenUser.User.Sid.String()
+	if sid == "" {
+		return nil, fmt.Errorf("format current Windows token SID")
+	}
+	sddl := fmt.Sprintf("D:P(A;;FA;;;%s)", sid)
+	if directory {
+		sddl = fmt.Sprintf("D:P(A;OICI;FA;;;%s)", sid)
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return nil, fmt.Errorf("build owner-only security descriptor: %w", err)
 	}
@@ -28,11 +46,15 @@ func secureRuntimeOwnerSecurityAttributes() (*windows.SecurityAttributes, error)
 }
 
 func secureRuntimeCreateDirectory(path string) error {
-	attributes, err := secureRuntimeOwnerSecurityAttributes()
+	attributes, err := secureRuntimeOwnerSecurityAttributes(true)
 	if err != nil {
 		return err
 	}
 	if err := windows.CreateDirectory(windows.StringToUTF16Ptr(path), attributes); err != nil {
+		return err
+	}
+	if err := secureRuntimeRejectReparsePoint(path); err != nil {
+		_ = os.Remove(path)
 		return err
 	}
 	if err := secureRuntimeApplyPermissions(path, true); err != nil {
@@ -43,7 +65,7 @@ func secureRuntimeCreateDirectory(path string) error {
 }
 
 func secureRuntimeCreateExclusiveFile(path string) (*os.File, error) {
-	attributes, err := secureRuntimeOwnerSecurityAttributes()
+	attributes, err := secureRuntimeOwnerSecurityAttributes(false)
 	if err != nil {
 		return nil, err
 	}
@@ -73,6 +95,9 @@ func secureRuntimeCreateExclusiveFile(path string) (*os.File, error) {
 }
 
 func secureRuntimeApplyPermissions(path string, directory bool) error {
+	if err := secureRuntimeRejectReparsePoint(path); err != nil {
+		return err
+	}
 	// Build the ACE from the current token SID rather than relying on an
 	// inherited ACL or on os.FileMode, which has no owner-only meaning on
 	// Windows.
@@ -116,13 +141,71 @@ func secureRuntimeRename(oldPath string, newPath string) error {
 	return windows.Rename(oldPath, newPath)
 }
 
-// Windows ACL inspection is intentionally not treated as a sweep proof in
-// this gate. Creation still installs a protected owner-only DACL, while the
-// orphan sweep remains fail-closed until a Windows runner can verify that
-// descriptor and reparse-point handling end to end.
+func secureRuntimeRejectReparsePoint(path string) error {
+	attrs, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil {
+		return fmt.Errorf("inspect secure proxy Windows path attributes: %w", err)
+	}
+	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return fmt.Errorf("%w: secure proxy Windows path is a reparse point", ErrSecureRuntimePath)
+	}
+	return nil
+}
+
 func secureRuntimeCheckOwnerAndMode(path string, infoMode os.FileMode, directory bool) error {
 	if infoMode&os.ModeSymlink != 0 || (directory && !infoMode.IsDir()) || (!directory && !infoMode.IsRegular()) {
 		return fmt.Errorf("%w: invalid secure proxy path", ErrSecureRuntimeAuth)
 	}
+	if err := secureRuntimeRejectReparsePoint(path); err != nil {
+		return err
+	}
+	tokenUser, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return fmt.Errorf("inspect secure proxy Windows token user: %w", err)
+	}
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return fmt.Errorf("inspect secure proxy Windows DACL: %w", err)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil || !windows.EqualSid(owner, tokenUser.User.Sid) {
+		if err != nil {
+			return fmt.Errorf("inspect secure proxy Windows owner: %w", err)
+		}
+		return fmt.Errorf("%w: secure proxy Windows path is not owned by current user", ErrSecureRuntimeAuth)
+	}
+	control, _, err := sd.Control()
+	if err != nil {
+		return fmt.Errorf("inspect secure proxy Windows DACL control: %w", err)
+	}
+	if control&windows.SE_DACL_PROTECTED == 0 {
+		return fmt.Errorf("%w: secure proxy Windows DACL is inheritable", ErrSecureRuntimeAuth)
+	}
+	acl, _, err := sd.DACL()
+	if err != nil || acl == nil || acl.AceCount != 1 {
+		if err != nil {
+			return fmt.Errorf("inspect secure proxy Windows DACL entries: %w", err)
+		}
+		return fmt.Errorf("%w: secure proxy Windows DACL must contain one owner entry", ErrSecureRuntimeAuth)
+	}
+	var ace *windows.ACCESS_ALLOWED_ACE
+	if err := windows.GetAce(acl, 0, &ace); err != nil || ace == nil {
+		if err != nil {
+			return fmt.Errorf("inspect secure proxy Windows owner ACE: %w", err)
+		}
+		return fmt.Errorf("%w: missing secure proxy Windows owner ACE", ErrSecureRuntimeAuth)
+	}
+	wantFlags := uint8(windows.NO_INHERITANCE)
+	if directory {
+		wantFlags = uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
+	}
+	aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != wantFlags || !secureRuntimeWindowsOwnerFullControlMask(ace.Mask) || !windows.EqualSid(aceSID, tokenUser.User.Sid) {
+		return fmt.Errorf("%w: secure proxy Windows DACL is not owner-only", ErrSecureRuntimeAuth)
+	}
 	return nil
+}
+
+func secureRuntimeWindowsOwnerFullControlMask(mask windows.ACCESS_MASK) bool {
+	return mask == windows.GENERIC_ALL || mask == secureRuntimeWindowsFileAllAccess
 }

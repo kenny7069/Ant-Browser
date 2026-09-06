@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -158,6 +161,198 @@ func TestSecureRuntimeWriterCleanupIsOwnershipAndProcessBound(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("runtime dir still exists, stat error = %v", err)
+	}
+}
+
+func TestSecureRuntimePendingLaunchCleanupFailsClosed(t *testing.T) {
+	writer, err := newSecureRuntimeWriter("xray")
+	if err != nil {
+		t.Fatalf("newSecureRuntimeWriter() error = %v", err)
+	}
+	t.Cleanup(func() { _ = writer.cleanup("pending-happy") })
+	if _, err := writer.writeAtomic("pending-happy", "xray-config.json", []byte("pending")); err != nil {
+		t.Fatalf("writeAtomic() error = %v", err)
+	}
+	handle, err := writer.handle("pending-happy")
+	if err != nil {
+		t.Fatalf("handle() error = %v", err)
+	}
+	launchToken, err := handle.markProcessLaunchPendingToken()
+	if err != nil || launchToken == 0 {
+		t.Fatalf("markProcessLaunchPendingToken() = %d, %v", launchToken, err)
+	}
+	if err := handle.cleanup(); !errors.Is(err, ErrSecureRuntimeActive) {
+		t.Fatalf("cleanup while launch pending = %v, want ErrSecureRuntimeActive", err)
+	}
+	handle.markProcessLaunchFailed(launchToken)
+	if err := handle.cleanup(); err != nil {
+		t.Fatalf("cleanup after launch failure = %v", err)
+	}
+}
+
+func TestSecureRuntimeLaunchGenerationRejectsContradictoryTransitions(t *testing.T) {
+	writer, err := newSecureRuntimeWriter("singbox")
+	if err != nil {
+		t.Fatalf("newSecureRuntimeWriter() error = %v", err)
+	}
+	key := "generation-contradiction"
+	t.Cleanup(func() { _ = writer.cleanup(key) })
+	if _, err := writer.writeAtomic(key, "singbox-config.json", []byte("generation")); err != nil {
+		t.Fatalf("writeAtomic() error = %v", err)
+	}
+	handle, err := writer.handle(key)
+	if err != nil {
+		t.Fatalf("handle() error = %v", err)
+	}
+	first, err := handle.markProcessLaunchPendingToken()
+	if err != nil {
+		t.Fatalf("first markProcessLaunchPendingToken() error = %v", err)
+	}
+	if got, err := handle.markProcessLaunchPendingToken(); !errors.Is(err, ErrSecureRuntimeActive) || got != 0 {
+		t.Fatalf("duplicate pending = %d, %v; want active refusal", got, err)
+	}
+	active := handle.markProcessStartedForLaunch(first, os.Getpid())
+	if active != first {
+		t.Fatalf("markProcessStartedForLaunch() = %d, want %d", active, first)
+	}
+	handle.markProcessLaunchFailed(first)
+	handle.markProcessTerminated(first + 1)
+	if err := handle.cleanup(); !errors.Is(err, ErrSecureRuntimeActive) {
+		t.Fatalf("cleanup after stale active transitions = %v, want ErrSecureRuntimeActive", err)
+	}
+	handle.markProcessTerminated(active)
+	if err := handle.cleanup(); err != nil {
+		t.Fatalf("cleanup after matching termination = %v", err)
+	}
+}
+
+func TestSecureRuntimeOldLaunchGenerationCannotClearNewResources(t *testing.T) {
+	writer, err := newSecureRuntimeWriter("mihomo")
+	if err != nil {
+		t.Fatalf("newSecureRuntimeWriter() error = %v", err)
+	}
+	key := "generation-stale"
+	t.Cleanup(func() { _ = writer.cleanup(key) })
+	if _, err := writer.writeAtomic(key, "mihomo-config.yaml", []byte("generation")); err != nil {
+		t.Fatalf("writeAtomic() error = %v", err)
+	}
+	handle, err := writer.handle(key)
+	if err != nil {
+		t.Fatalf("handle() error = %v", err)
+	}
+	oldToken, err := handle.markProcessLaunchPendingToken()
+	if err != nil {
+		t.Fatalf("old pending error = %v", err)
+	}
+	handle.markProcessLaunchFailed(oldToken)
+	newToken, err := handle.markProcessLaunchPendingToken()
+	if err != nil || newToken == oldToken || newToken == 0 {
+		t.Fatalf("new pending = %d, %v; want a distinct token", newToken, err)
+	}
+	handle.markProcessLaunchFailed(oldToken)
+	if err := handle.cleanup(); !errors.Is(err, ErrSecureRuntimeActive) {
+		t.Fatalf("stale failure cleared new pending = %v, want ErrSecureRuntimeActive", err)
+	}
+	if got := handle.markProcessStartedForLaunch(oldToken, os.Getpid()); got != 0 {
+		t.Fatalf("stale start token = %d, want refusal", got)
+	}
+	active := handle.markProcessStartedForLaunch(newToken, os.Getpid())
+	if active != newToken {
+		t.Fatalf("new start token = %d, want %d", active, newToken)
+	}
+	handle.markProcessTerminated(oldToken)
+	if err := handle.cleanup(); !errors.Is(err, ErrSecureRuntimeActive) {
+		t.Fatalf("stale termination cleared new active = %v, want ErrSecureRuntimeActive", err)
+	}
+	handle.markProcessTerminated(newToken)
+	if err := handle.cleanup(); err != nil {
+		t.Fatalf("cleanup after new termination = %v", err)
+	}
+}
+
+func TestSecureRuntimePendingLaunchCleanupRaceFailsClosed(t *testing.T) {
+	writer, err := newSecureRuntimeWriter("xray")
+	if err != nil {
+		t.Fatalf("newSecureRuntimeWriter() error = %v", err)
+	}
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		key := fmt.Sprintf("pending-race-%03d", i)
+		if _, err := writer.writeAtomic(key, "xray-config.json", []byte("race")); err != nil {
+			t.Fatalf("writeAtomic(%q) error = %v", key, err)
+		}
+		handle, err := writer.handle(key)
+		if err != nil {
+			t.Fatalf("handle(%q) error = %v", key, err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var launchToken uint64
+		var pendingErr, cleanupErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			launchToken, pendingErr = handle.markProcessLaunchPendingToken()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			cleanupErr = handle.cleanup()
+		}()
+		close(start)
+		wg.Wait()
+		switch {
+		case pendingErr == nil:
+			if launchToken == 0 {
+				t.Fatalf("iteration %d returned zero launch token", i)
+			}
+			if !errors.Is(cleanupErr, ErrSecureRuntimeActive) {
+				t.Fatalf("iteration %d cleanup during pending = %v, want ErrSecureRuntimeActive", i, cleanupErr)
+			}
+			handle.markProcessLaunchFailed(launchToken)
+			if err := handle.cleanup(); err != nil {
+				t.Fatalf("iteration %d cleanup after launch failure = %v", i, err)
+			}
+		case errors.Is(pendingErr, ErrSecureRuntimePath):
+			if cleanupErr != nil {
+				t.Fatalf("iteration %d cleanup-before-pending = %v, want nil", i, cleanupErr)
+			}
+		default:
+			t.Fatalf("iteration %d pending transition = token %d, err %v", i, launchToken, pendingErr)
+		}
+	}
+}
+
+func TestSecureRuntimeEnsurePrivateDirectoryConcurrentCreateAndSymlinkFailClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private")
+	const workers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- secureRuntimeEnsurePrivateDirectory(path)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent secureRuntimeEnsurePrivateDirectory() error = %v", err)
+		}
+	}
+	if runtime.GOOS != "windows" {
+		assertUnixMode(t, path, 0o700)
+	}
+
+	symlinkPath := filepath.Join(t.TempDir(), "private-link")
+	if err := os.Symlink(t.TempDir(), symlinkPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := secureRuntimeEnsurePrivateDirectory(symlinkPath); !errors.Is(err, ErrSecureRuntimePath) {
+		t.Fatalf("secureRuntimeEnsurePrivateDirectory(symlink) = %v, want ErrSecureRuntimePath", err)
 	}
 }
 

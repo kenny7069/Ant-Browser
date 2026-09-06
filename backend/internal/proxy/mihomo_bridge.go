@@ -129,18 +129,19 @@ func (m *ClashManager) ensureNodeBridge(proxyConfig string, proxies []config.Bro
 		return "", "", err
 	}
 	cmd.Stderr = stderrFile
-	if err := runtimeHandle.markProcessLaunchPending(); err != nil {
+	launchToken, err := runtimeHandle.markProcessLaunchPendingToken()
+	if err != nil {
 		_ = stderrFile.Close()
 		return "", "", fmt.Errorf("register mihomo launch: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		runtimeHandle.markProcessLaunchFailed()
+		runtimeHandle.markProcessLaunchFailed(launchToken)
 		_ = stderrFile.Close()
 		return "", "", fmt.Errorf("mihomo 启动失败: %w", err)
 	}
-	runtimeToken := runtimeHandle.markProcessStarted(cmd.Process.Pid)
+	runtimeToken := runtimeHandle.markProcessStartedForLaunch(launchToken, cmd.Process.Pid)
 	if runtimeToken == 0 {
-		runtimeHandle.markProcessLaunchFailed()
+		runtimeHandle.markProcessLaunchFailed(launchToken)
 		_ = cmd.Process.Kill()
 		_ = stderrFile.Close()
 		return "", "", fmt.Errorf("register mihomo process identity")

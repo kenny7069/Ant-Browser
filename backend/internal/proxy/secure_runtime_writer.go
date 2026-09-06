@@ -128,6 +128,7 @@ type secureRuntimeHandle struct {
 	activeToken   uint64
 	nextToken     uint64
 	launchPending bool
+	pendingToken  uint64
 	cleaned       bool
 }
 
@@ -689,44 +690,63 @@ func (w *secureRuntimeWriter) unregisterManagedKey(key string) error {
 }
 
 func (h *secureRuntimeHandle) markProcessLaunchPending() error {
+	_, err := h.markProcessLaunchPendingToken()
+	return err
+}
+
+func (h *secureRuntimeHandle) markProcessLaunchPendingToken() (uint64, error) {
 	if h == nil {
-		return ErrSecureRuntimePath
+		return 0, ErrSecureRuntimePath
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.cleaned {
-		h.mu.Unlock()
-		return ErrSecureRuntimePath
+		return 0, ErrSecureRuntimePath
 	}
-	h.mu.Unlock()
+	if h.active || h.launchPending {
+		return 0, ErrSecureRuntimeActive
+	}
+	h.nextToken++
+	if h.nextToken == 0 {
+		h.nextToken++
+	}
+	token := h.nextToken
+	h.launchPending = true
+	h.pendingToken = token
 	if err := h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
 		marker.Pending++
 	}); err != nil {
-		return err
+		h.launchPending = false
+		h.pendingToken = 0
+		return 0, err
 	}
-	h.mu.Lock()
-	if !h.cleaned {
-		h.launchPending = true
-	}
-	h.mu.Unlock()
-	return nil
+	return token, nil
 }
 
-func (h *secureRuntimeHandle) markProcessLaunchFailed() {
+func (h *secureRuntimeHandle) markProcessLaunchFailed(tokens ...uint64) {
 	if h == nil {
 		return
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.cleaned || !h.launchPending {
-		h.mu.Unlock()
 		return
 	}
-	h.launchPending = false
-	h.mu.Unlock()
-	_ = h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
+	token := h.pendingToken
+	if len(tokens) > 0 && tokens[0] != token {
+		return
+	}
+	if err := h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
 		if marker.Pending > 0 {
 			marker.Pending--
 		}
-	})
+	}); err != nil {
+		// If authenticated metadata could not be updated, retain pending=true so
+		// cleanup remains fail-closed and a caller can retry the terminal transition.
+		return
+	}
+	h.launchPending = false
+	h.pendingToken = 0
 }
 
 func (h *secureRuntimeHandle) markProcessStarted(pids ...int) uint64 {
@@ -738,44 +758,78 @@ func (h *secureRuntimeHandle) markProcessStarted(pids ...int) uint64 {
 		pid = pids[0]
 	}
 	h.mu.Lock()
-	if h.cleaned {
+	if h.cleaned || h.active {
 		h.mu.Unlock()
 		return 0
+	}
+	if h.launchPending {
+		token := h.pendingToken
+		h.mu.Unlock()
+		return h.markProcessStartedForLaunch(token, pid)
 	}
 	h.nextToken++
 	if h.nextToken == 0 {
 		h.nextToken++
 	}
 	token := h.nextToken
-	h.mu.Unlock()
 	identity, err := secureRuntimeProcessIdentityForPID(pid)
 	if err != nil {
+		h.mu.Unlock()
 		return 0
 	}
 	if h.writer.sweepEnabled {
 		err = h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
-			if marker.Pending > 0 {
-				marker.Pending--
-			}
 			if marker.Children == nil {
 				marker.Children = make(map[string]secureRuntimeProcessIdentity)
 			}
 			marker.Children[secureRuntimeTokenKey(token)] = identity
 		})
 		if err != nil {
+			h.mu.Unlock()
 			return 0
 		}
 	}
-	h.mu.Lock()
 	if h.cleaned {
 		h.mu.Unlock()
 		return 0
 	}
-	h.launchPending = false
 	h.activeToken = token
 	h.active = true
 	h.mu.Unlock()
 	return token
+}
+
+func (h *secureRuntimeHandle) markProcessStartedForLaunch(launchToken uint64, pid int) uint64 {
+	if h == nil || launchToken == 0 {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cleaned || !h.launchPending || h.pendingToken != launchToken {
+		return 0
+	}
+	identity, err := secureRuntimeProcessIdentityForPID(pid)
+	if err != nil {
+		return 0
+	}
+	if h.writer.sweepEnabled {
+		if err := h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
+			if marker.Pending > 0 {
+				marker.Pending--
+			}
+			if marker.Children == nil {
+				marker.Children = make(map[string]secureRuntimeProcessIdentity)
+			}
+			marker.Children[secureRuntimeTokenKey(launchToken)] = identity
+		}); err != nil {
+			return 0
+		}
+	}
+	h.launchPending = false
+	h.pendingToken = 0
+	h.activeToken = launchToken
+	h.active = true
+	return launchToken
 }
 
 func (h *secureRuntimeHandle) markProcessTerminated(tokens ...uint64) {
@@ -783,16 +837,14 @@ func (h *secureRuntimeHandle) markProcessTerminated(tokens ...uint64) {
 		return
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.cleaned {
-		h.mu.Unlock()
 		return
 	}
 	if len(tokens) > 0 && tokens[0] != 0 && tokens[0] != h.activeToken {
-		h.mu.Unlock()
 		return
 	}
 	token := h.activeToken
-	h.mu.Unlock()
 	if h.writer.sweepEnabled && token != 0 {
 		if err := h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
 			delete(marker.Children, secureRuntimeTokenKey(token))
@@ -802,12 +854,10 @@ func (h *secureRuntimeHandle) markProcessTerminated(tokens ...uint64) {
 			return
 		}
 	}
-	h.mu.Lock()
 	if !h.cleaned && h.activeToken == token {
 		h.active = false
 		h.activeToken = 0
 	}
-	h.mu.Unlock()
 }
 
 func secureRuntimeTokenKey(token uint64) string {
@@ -833,7 +883,7 @@ func (h *secureRuntimeHandle) cleanup() error {
 	if h.cleaned {
 		return nil
 	}
-	if h.active {
+	if h.active || h.launchPending {
 		return ErrSecureRuntimeActive
 	}
 	rootInfo, rootErr := os.Lstat(h.writer.root)

@@ -59,6 +59,10 @@ func secureRuntimeRename(oldPath string, newPath string) error {
 	return os.Rename(oldPath, newPath)
 }
 
+func secureRuntimeRejectReparsePoint(path string) error {
+	return nil
+}
+
 func secureRuntimeCheckOwnerAndMode(path string, infoMode os.FileMode, directory bool) error {
 	want := os.FileMode(secureRuntimeFileMode)
 	if directory {

@@ -44,19 +44,22 @@ func secureRuntimePersistentSecurityDir(appRoot string) (string, string, error) 
 func secureRuntimeEnsurePrivateDirectory(path string) error {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
-		if err := os.Mkdir(path, secureRuntimeDirMode); err != nil {
+		if err := secureRuntimeCreateDirectory(path); err != nil && !os.IsExist(err) {
 			return fmt.Errorf("create secure proxy state directory: %w", err)
 		}
-		if err := secureRuntimeApplyPermissions(path, true); err != nil {
-			return err
+		info, err = os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("inspect secure proxy state directory after create: %w", err)
 		}
-		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("inspect secure proxy state directory: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("%w: secure proxy state path is not a directory", ErrSecureRuntimePath)
+	}
+	if err := secureRuntimeRejectReparsePoint(path); err != nil {
+		return err
 	}
 	if err := secureRuntimeCheckOwnerAndMode(path, info.Mode(), true); err != nil {
 		return err
