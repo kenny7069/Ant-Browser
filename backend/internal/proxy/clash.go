@@ -39,7 +39,7 @@ func (m *ClashManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) {
 		return nil, fmt.Errorf("mihomo 管理器未初始化")
 	}
 	m.runtimeConfigWriterOnce.Do(func() {
-		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriter("mihomo")
+		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriterForApp("mihomo", m.AppRoot)
 	})
 	return m.runtimeConfigWriter, m.runtimeConfigWriterErr
 }

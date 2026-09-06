@@ -14,18 +14,28 @@ import (
 )
 
 const (
-	secureRuntimeDirMode  = 0o700
-	secureRuntimeFileMode = 0o600
-	secureRuntimeMaxKey   = 128
-	secureRuntimeMaxName  = 128
+	secureRuntimeDirMode          = 0o700
+	secureRuntimeFileMode         = 0o600
+	secureRuntimeMaxKey           = 128
+	secureRuntimeMaxName          = 128
+	secureRuntimeMarkerName       = ".ant-proxy-runtime"
+	secureRuntimeRegistryDirName  = ".ant-proxy-secure"
+	secureRuntimeRegistryKeyName  = "key"
+	secureRuntimeRegistryName     = "registry.json"
+	secureRuntimeRegistryLockName = "registry.lock"
+	secureRuntimeMarkerVersion    = 1
+	secureRuntimeRegistryVersion  = 1
+	secureRuntimeMaxMetadataBytes = 1 << 20
 )
 
 var (
 	// ErrSecureRuntimeActive prevents cleanup from removing files while a core
 	// process may still have the runtime config open.
-	ErrSecureRuntimeActive = errors.New("secure proxy runtime is still active")
-	ErrSecureRuntimePath   = errors.New("invalid secure proxy runtime path")
-	ErrSecureRuntimeStack  = errors.New("invalid secure proxy connector stack")
+	ErrSecureRuntimeActive           = errors.New("secure proxy runtime is still active")
+	ErrSecureRuntimePath             = errors.New("invalid secure proxy runtime path")
+	ErrSecureRuntimeStack            = errors.New("invalid secure proxy connector stack")
+	ErrSecureRuntimeAuth             = errors.New("secure proxy runtime authenticity check failed")
+	ErrSecureRuntimeSweepUnsupported = errors.New("secure proxy runtime orphan sweep is unsupported on this platform")
 )
 
 var sensitiveLogValuePattern = regexp.MustCompile(`(?i)(password|passwd|pass|token|secret|credential|auth(?:[_-]?str)?|access[_-]?token|api[_-]?key)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s&,;]+)`)
@@ -36,11 +46,73 @@ var proxyURIValuePattern = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]{1,31})://[^
 // one connector stack. It deliberately does not accept an application data
 // directory: proxy credentials must never be written into a user profile.
 type secureRuntimeWriter struct {
-	stack string
-	root  string
+	stack           string
+	root            string
+	appID           string
+	key             []byte
+	rootToken       string
+	registryPath    string
+	lockPath        string
+	processIdentity secureRuntimeProcessIdentity
+	processLiveness func(secureRuntimeProcessIdentity) secureRuntimeProcessState
+	ownerCheck      func(string, os.FileMode, bool) error
+	sweepEnabled    bool
 
 	mu      sync.Mutex
 	entries map[string]*secureRuntimeHandle
+}
+
+type secureRuntimeWriterOptions struct {
+	tempParent        string
+	securityDir       string
+	appID             string
+	key               []byte
+	registryPath      string
+	lockPath          string
+	processIdentity   secureRuntimeProcessIdentity
+	processIdentityFn func() (secureRuntimeProcessIdentity, error)
+	processLiveness   func(secureRuntimeProcessIdentity) secureRuntimeProcessState
+	ownerCheck        func(string, os.FileMode, bool) error
+	sweepEnabled      *bool
+}
+
+type secureRuntimeProcessIdentity struct {
+	PID   int    `json:"pid"`
+	Start string `json:"start"`
+}
+
+type secureRuntimeProcessState uint8
+
+const (
+	secureRuntimeProcessUnknown secureRuntimeProcessState = iota
+	secureRuntimeProcessAlive
+	secureRuntimeProcessExited
+	secureRuntimeProcessIdentityMismatch
+)
+
+type secureRuntimeMarker struct {
+	Version  int                                     `json:"version"`
+	Root     string                                  `json:"root"`
+	Stack    string                                  `json:"stack"`
+	Token    string                                  `json:"token"`
+	Owner    secureRuntimeProcessIdentity            `json:"owner"`
+	Children map[string]secureRuntimeProcessIdentity `json:"children"`
+	Pending  int                                     `json:"pending"`
+	Entries  map[string][]string                     `json:"entries"`
+	MAC      string                                  `json:"mac"`
+}
+
+type secureRuntimeRegistry struct {
+	Version int                                   `json:"version"`
+	AppID   string                                `json:"app_id"`
+	Roots   map[string]secureRuntimeRegistryEntry `json:"roots"`
+	MAC     string                                `json:"mac"`
+}
+
+type secureRuntimeRegistryEntry struct {
+	Stack     string `json:"stack"`
+	Token     string `json:"token"`
+	MarkerMAC string `json:"marker_mac"`
 }
 
 // secureRuntimeHandle is the only cleanup capability returned by the writer.
@@ -50,25 +122,122 @@ type secureRuntimeHandle struct {
 	key    string
 	dir    string
 
-	mu          sync.Mutex
-	files       map[string]struct{}
-	active      bool
-	activeToken uint64
-	nextToken   uint64
-	cleaned     bool
+	mu            sync.Mutex
+	files         map[string]struct{}
+	active        bool
+	activeToken   uint64
+	nextToken     uint64
+	launchPending bool
+	cleaned       bool
 }
 
 func newSecureRuntimeWriter(stack string) (*secureRuntimeWriter, error) {
+	// Kept for package-local tests and legacy callers. Production managers use
+	// newSecureRuntimeWriterForApp so orphan cleanup has a persistent
+	// authenticity root instead of trusting a marker inside /tmp.
+	identity, err := secureRuntimeCurrentProcessIdentity()
+	if err != nil {
+		return nil, err
+	}
+	key, err := secureRuntimeRandomBytes(32)
+	if err != nil {
+		return nil, fmt.Errorf("create secure proxy runtime key: %w", err)
+	}
+	return newSecureRuntimeWriterWithOptions(stack, secureRuntimeWriterOptions{
+		tempParent:      os.TempDir(),
+		appID:           "ephemeral-test",
+		key:             key,
+		processIdentity: identity,
+		processLiveness: secureRuntimeProcessLiveness,
+		ownerCheck:      secureRuntimeCheckOwnerAndMode,
+	})
+}
+
+func newSecureRuntimeWriterForApp(stack string, appRoot string) (*secureRuntimeWriter, error) {
+	identity, err := secureRuntimeCurrentProcessIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("identify secure proxy owner process: %w", err)
+	}
+	securityDir, appID, err := secureRuntimePersistentSecurityDir(appRoot)
+	if err != nil {
+		return nil, err
+	}
+	key, err := secureRuntimeLoadOrCreateKey(securityDir)
+	if err != nil {
+		return nil, err
+	}
+	return newSecureRuntimeWriterWithOptions(stack, secureRuntimeWriterOptions{
+		tempParent:      os.TempDir(),
+		securityDir:     securityDir,
+		appID:           appID,
+		key:             key,
+		registryPath:    filepath.Join(securityDir, secureRuntimeRegistryName),
+		lockPath:        filepath.Join(securityDir, secureRuntimeRegistryLockName),
+		processIdentity: identity,
+		processLiveness: secureRuntimeProcessLiveness,
+		ownerCheck:      secureRuntimeCheckOwnerAndMode,
+		sweepEnabled:    boolPtr(true),
+	})
+}
+
+func newSecureRuntimeWriterWithOptions(stack string, options secureRuntimeWriterOptions) (*secureRuntimeWriter, error) {
 	stack = strings.ToLower(strings.TrimSpace(stack))
 	if !isSecureRuntimeStack(stack) {
 		return nil, fmt.Errorf("%w: %q", ErrSecureRuntimeStack, stack)
 	}
 
-	tempParent := filepath.Clean(os.TempDir())
+	tempParent := filepath.Clean(strings.TrimSpace(options.tempParent))
+	if tempParent == "." || tempParent == "" {
+		tempParent = filepath.Clean(os.TempDir())
+	}
 	if tempParent == "." || !filepath.IsAbs(tempParent) {
 		return nil, fmt.Errorf("%w: invalid system temporary directory", ErrSecureRuntimePath)
 	}
+	if len(options.key) == 0 {
+		return nil, fmt.Errorf("%w: missing authenticity key", ErrSecureRuntimeAuth)
+	}
+	identity := options.processIdentity
+	if identity.PID == 0 && options.processIdentityFn != nil {
+		var err error
+		identity, err = options.processIdentityFn()
+		if err != nil {
+			return nil, fmt.Errorf("identify secure proxy owner process: %w", err)
+		}
+	}
+	if !identity.valid() {
+		return nil, fmt.Errorf("%w: invalid owner process identity", ErrSecureRuntimeAuth)
+	}
+	liveness := options.processLiveness
+	if liveness == nil {
+		liveness = secureRuntimeProcessLiveness
+	}
+	ownerCheck := options.ownerCheck
+	if ownerCheck == nil {
+		ownerCheck = secureRuntimeCheckOwnerAndMode
+	}
+	sweepEnabled := options.sweepEnabled != nil && *options.sweepEnabled
 	var root string
+	var err error
+	lockPath := strings.TrimSpace(options.lockPath)
+	if lockPath == "" {
+		lockPath = filepath.Join(tempParent, ".ant-proxy-sweep-"+stack+".lock")
+	}
+	var lock *secureRuntimeSweepLock
+	if sweepEnabled {
+		lock, err = secureRuntimeAcquireSweepLock(lockPath)
+		if err != nil {
+			return nil, fmt.Errorf("lock secure proxy runtime registry: %w", err)
+		}
+		defer lock.Close()
+	}
+	if sweepEnabled {
+		if err := secureRuntimeEnsureRegistry(options.registryPath, options.appID, options.key); err != nil {
+			return nil, err
+		}
+		if err := secureRuntimeSweepLocked(tempParent, stack, options.appID, options.registryPath, options.key, liveness, ownerCheck); err != nil && !errors.Is(err, ErrSecureRuntimeSweepUnsupported) {
+			return nil, err
+		}
+	}
 	for attempt := 0; attempt < 8; attempt++ {
 		suffix, suffixErr := secureRuntimeRandomSuffix()
 		if suffixErr != nil {
@@ -87,12 +256,35 @@ func newSecureRuntimeWriter(stack string) (*secureRuntimeWriter, error) {
 	if root == "" {
 		return nil, fmt.Errorf("create secure proxy runtime root: too many name collisions")
 	}
-	return &secureRuntimeWriter{
-		stack:   stack,
-		root:    root,
-		entries: make(map[string]*secureRuntimeHandle),
-	}, nil
+	writer := &secureRuntimeWriter{
+		stack:           stack,
+		root:            root,
+		appID:           appIDOrDefault(options.appID),
+		key:             append([]byte(nil), options.key...),
+		registryPath:    strings.TrimSpace(options.registryPath),
+		lockPath:        lockPath,
+		processIdentity: identity,
+		processLiveness: liveness,
+		ownerCheck:      ownerCheck,
+		sweepEnabled:    sweepEnabled,
+		entries:         make(map[string]*secureRuntimeHandle),
+	}
+	if writer.sweepEnabled {
+		if err := writer.initializeAuthenticatedRoot(); err != nil {
+			return nil, err
+		}
+	}
+	return writer, nil
 }
+
+func appIDOrDefault(appID string) string {
+	if strings.TrimSpace(appID) == "" {
+		return "ephemeral-test"
+	}
+	return strings.TrimSpace(appID)
+}
+
+func boolPtr(value bool) *bool { return &value }
 
 func isSecureRuntimeStack(stack string) bool {
 	switch strings.ToLower(strings.TrimSpace(stack)) {
@@ -334,6 +526,9 @@ func (w *secureRuntimeWriter) writeAtomic(key string, name string, data []byte) 
 	} else if !os.IsNotExist(statErr) {
 		return "", fmt.Errorf("inspect secure proxy config target: %w", statErr)
 	}
+	if err := w.recordManagedFile(key, name); err != nil {
+		return "", err
+	}
 
 	suffix, err := secureRuntimeRandomSuffix()
 	if err != nil {
@@ -406,6 +601,9 @@ func (w *secureRuntimeWriter) ensureLog(key string, name string) (string, error)
 	} else if !os.IsNotExist(statErr) {
 		return "", fmt.Errorf("inspect secure proxy runtime log target: %w", statErr)
 	}
+	if err := w.recordManagedFile(key, name); err != nil {
+		return "", err
+	}
 	file, err := secureRuntimeCreateExclusiveFile(path)
 	if err != nil {
 		return "", err
@@ -451,6 +649,9 @@ func (w *secureRuntimeWriter) openLog(key string, name string) (*os.File, string
 	} else if !os.IsNotExist(statErr) {
 		return nil, "", fmt.Errorf("inspect secure proxy runtime log target: %w", statErr)
 	}
+	if err := w.recordManagedFile(key, name); err != nil {
+		return nil, "", err
+	}
 	file, err := secureRuntimeCreateExclusiveFile(path)
 	if err != nil {
 		return nil, "", err
@@ -459,21 +660,122 @@ func (w *secureRuntimeWriter) openLog(key string, name string) (*os.File, string
 	return file, path, nil
 }
 
-func (h *secureRuntimeHandle) markProcessStarted() uint64 {
+func (w *secureRuntimeWriter) recordManagedFile(key string, name string) error {
+	if w == nil || !w.sweepEnabled {
+		return nil
+	}
+	return w.updateRootMetadata(func(marker *secureRuntimeMarker) {
+		if marker.Entries == nil {
+			marker.Entries = make(map[string][]string)
+		}
+		names := marker.Entries[key]
+		for _, existing := range names {
+			if existing == name {
+				return
+			}
+		}
+		marker.Entries[key] = append(names, name)
+		sort.Strings(marker.Entries[key])
+	})
+}
+
+func (w *secureRuntimeWriter) unregisterManagedKey(key string) error {
+	if w == nil || !w.sweepEnabled {
+		return nil
+	}
+	return w.updateRootMetadata(func(marker *secureRuntimeMarker) {
+		delete(marker.Entries, key)
+	})
+}
+
+func (h *secureRuntimeHandle) markProcessLaunchPending() error {
+	if h == nil {
+		return ErrSecureRuntimePath
+	}
+	h.mu.Lock()
+	if h.cleaned {
+		h.mu.Unlock()
+		return ErrSecureRuntimePath
+	}
+	h.mu.Unlock()
+	if err := h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
+		marker.Pending++
+	}); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	if !h.cleaned {
+		h.launchPending = true
+	}
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *secureRuntimeHandle) markProcessLaunchFailed() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	if h.cleaned || !h.launchPending {
+		h.mu.Unlock()
+		return
+	}
+	h.launchPending = false
+	h.mu.Unlock()
+	_ = h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
+		if marker.Pending > 0 {
+			marker.Pending--
+		}
+	})
+}
+
+func (h *secureRuntimeHandle) markProcessStarted(pids ...int) uint64 {
 	if h == nil {
 		return 0
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if !h.cleaned {
-		h.nextToken++
-		if h.nextToken == 0 {
-			h.nextToken++
-		}
-		h.activeToken = h.nextToken
-		h.active = true
+	pid := os.Getpid()
+	if len(pids) > 0 && pids[0] > 0 {
+		pid = pids[0]
 	}
-	return h.activeToken
+	h.mu.Lock()
+	if h.cleaned {
+		h.mu.Unlock()
+		return 0
+	}
+	h.nextToken++
+	if h.nextToken == 0 {
+		h.nextToken++
+	}
+	token := h.nextToken
+	h.mu.Unlock()
+	identity, err := secureRuntimeProcessIdentityForPID(pid)
+	if err != nil {
+		return 0
+	}
+	if h.writer.sweepEnabled {
+		err = h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
+			if marker.Pending > 0 {
+				marker.Pending--
+			}
+			if marker.Children == nil {
+				marker.Children = make(map[string]secureRuntimeProcessIdentity)
+			}
+			marker.Children[secureRuntimeTokenKey(token)] = identity
+		})
+		if err != nil {
+			return 0
+		}
+	}
+	h.mu.Lock()
+	if h.cleaned {
+		h.mu.Unlock()
+		return 0
+	}
+	h.launchPending = false
+	h.activeToken = token
+	h.active = true
+	h.mu.Unlock()
+	return token
 }
 
 func (h *secureRuntimeHandle) markProcessTerminated(tokens ...uint64) {
@@ -485,11 +787,31 @@ func (h *secureRuntimeHandle) markProcessTerminated(tokens ...uint64) {
 		h.mu.Unlock()
 		return
 	}
-	if len(tokens) == 0 || tokens[0] == 0 || tokens[0] == h.activeToken {
+	if len(tokens) > 0 && tokens[0] != 0 && tokens[0] != h.activeToken {
+		h.mu.Unlock()
+		return
+	}
+	token := h.activeToken
+	h.mu.Unlock()
+	if h.writer.sweepEnabled && token != 0 {
+		if err := h.writer.updateRootMetadata(func(marker *secureRuntimeMarker) {
+			delete(marker.Children, secureRuntimeTokenKey(token))
+		}); err != nil {
+			// Keep the active bit set so cleanup cannot remove the runtime while
+			// the authenticated terminal update is unavailable.
+			return
+		}
+	}
+	h.mu.Lock()
+	if !h.cleaned && h.activeToken == token {
 		h.active = false
 		h.activeToken = 0
 	}
 	h.mu.Unlock()
+}
+
+func secureRuntimeTokenKey(token uint64) string {
+	return fmt.Sprintf("%016x", token)
 }
 
 func (h *secureRuntimeHandle) isCleaned() bool {
@@ -573,14 +895,17 @@ func (h *secureRuntimeHandle) cleanup() error {
 	if len(entries) > 0 {
 		return fmt.Errorf("%w: runtime directory contains unowned entries", ErrSecureRuntimePath)
 	}
+	if err := h.writer.unregisterManagedKey(h.key); err != nil {
+		return fmt.Errorf("unregister secure proxy runtime entry: %w", err)
+	}
 	if err := os.Remove(h.dir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove secure proxy runtime directory: %w", err)
 	}
+	if err := h.writer.removeRootIfEmpty(); err != nil {
+		return err
+	}
 	h.cleaned = true
 	delete(h.writer.entries, h.key)
-	if rootEntries, readErr := os.ReadDir(h.writer.root); readErr == nil && len(rootEntries) == 0 {
-		_ = os.Remove(h.writer.root)
-	}
 	return nil
 }
 

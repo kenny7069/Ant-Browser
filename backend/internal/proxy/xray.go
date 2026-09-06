@@ -46,7 +46,7 @@ func (m *XrayManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) {
 		return nil, fmt.Errorf("xray 管理器未初始化")
 	}
 	m.runtimeConfigWriterOnce.Do(func() {
-		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriter("xray")
+		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriterForApp("xray", m.AppRoot)
 	})
 	return m.runtimeConfigWriter, m.runtimeConfigWriterErr
 }

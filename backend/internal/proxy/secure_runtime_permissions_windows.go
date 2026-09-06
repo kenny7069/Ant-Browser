@@ -115,3 +115,14 @@ func secureRuntimeApplyPermissions(path string, directory bool) error {
 func secureRuntimeRename(oldPath string, newPath string) error {
 	return windows.Rename(oldPath, newPath)
 }
+
+// Windows ACL inspection is intentionally not treated as a sweep proof in
+// this gate. Creation still installs a protected owner-only DACL, while the
+// orphan sweep remains fail-closed until a Windows runner can verify that
+// descriptor and reparse-point handling end to end.
+func secureRuntimeCheckOwnerAndMode(path string, infoMode os.FileMode, directory bool) error {
+	if infoMode&os.ModeSymlink != 0 || (directory && !infoMode.IsDir()) || (!directory && !infoMode.IsRegular()) {
+		return fmt.Errorf("%w: invalid secure proxy path", ErrSecureRuntimeAuth)
+	}
+	return nil
+}

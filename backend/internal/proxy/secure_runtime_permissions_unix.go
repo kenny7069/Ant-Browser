@@ -58,3 +58,21 @@ func secureRuntimeApplyPermissions(path string, directory bool) error {
 func secureRuntimeRename(oldPath string, newPath string) error {
 	return os.Rename(oldPath, newPath)
 }
+
+func secureRuntimeCheckOwnerAndMode(path string, infoMode os.FileMode, directory bool) error {
+	want := os.FileMode(secureRuntimeFileMode)
+	if directory {
+		want = secureRuntimeDirMode
+	}
+	if infoMode.Perm() != want.Perm() {
+		return fmt.Errorf("%w: secure proxy path permissions are %04o, want %04o", ErrSecureRuntimeAuth, infoMode.Perm(), want.Perm())
+	}
+	var stat unix.Stat_t
+	if err := unix.Lstat(path, &stat); err != nil {
+		return fmt.Errorf("inspect secure proxy path owner: %w", err)
+	}
+	if uint32(os.Getuid()) != stat.Uid {
+		return fmt.Errorf("%w: secure proxy path is not owned by current user", ErrSecureRuntimeAuth)
+	}
+	return nil
+}

@@ -205,14 +205,25 @@ func (m *XrayManager) launchBridgeAttempt(log *logger.Logger, key string, binary
 	cmd.Dir = filepath.Dir(cfgPath)
 
 	cmd.Stderr = stderrFile
+	if err := runtimeHandle.markProcessLaunchPending(); err != nil {
+		_ = stderrFile.Close()
+		return "", nil, fmt.Errorf("register xray launch: %w", err)
+	}
 
 	if err := cmd.Start(); err != nil {
+		runtimeHandle.markProcessLaunchFailed()
 		_ = stderrFile.Close()
 		log.Error("xray 启动失败", logger.F("error", safeProxyError(err)), logger.F("attempt", attempt))
 		return "", nil, &xrayLaunchError{err: err, retryable: false}
 	}
 
-	runtimeToken := runtimeHandle.markProcessStarted()
+	runtimeToken := runtimeHandle.markProcessStarted(cmd.Process.Pid)
+	if runtimeToken == 0 {
+		runtimeHandle.markProcessLaunchFailed()
+		_ = cmd.Process.Kill()
+		_ = stderrFile.Close()
+		return "", nil, fmt.Errorf("register xray process identity")
+	}
 	bridge := &XrayBridge{
 		NodeKey:      key,
 		Port:         port,

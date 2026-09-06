@@ -68,7 +68,7 @@ func (m *SingBoxManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) 
 		return nil, fmt.Errorf("sing-box 管理器未初始化")
 	}
 	m.runtimeConfigWriterOnce.Do(func() {
-		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriter("singbox")
+		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriterForApp("singbox", m.AppRoot)
 	})
 	return m.runtimeConfigWriter, m.runtimeConfigWriterErr
 }
