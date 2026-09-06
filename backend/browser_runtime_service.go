@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // BrowserRuntimeStartOptions contains one-shot launch overrides. It has no
@@ -152,6 +154,7 @@ var (
 	ErrBrowserRuntimeOwnerNotReady      = errors.New("browser runtime process owner is not ready")
 	ErrBrowserRuntimeReapPending        = errors.New("browser runtime process reaping is pending")
 	ErrBrowserRuntimeGenerationMismatch = errors.New("browser runtime generation mismatch")
+	ErrBrowserRuntimeProfileMismatch    = errors.New("browser runtime profile incarnation mismatch")
 )
 
 // NewBrowserRuntimeProcess constructs a valid host-facing process result. The
@@ -287,6 +290,18 @@ type browserRuntimeIdentity struct {
 	pid        int
 	debugPort  int
 	cmd        *exec.Cmd
+	profile    *browser.Profile
+}
+
+// browserProfileIncarnation binds a profile ID to the concrete Manager map
+// entry that was observed by this service. Manager updates mutate an entry in
+// place, while delete/recreate allocates a new pointer; the latter must never
+// be confused with the previous profile (ABA). The token is intentionally
+// opaque and is never derived from profile configuration or exposed Manager
+// state.
+type browserProfileIncarnation struct {
+	profile *browser.Profile
+	token   string
 }
 
 type BrowserRuntimeServiceConfig struct {
@@ -341,9 +356,10 @@ type BrowserRuntimeService struct {
 	gatesMu sync.Mutex
 	gates   map[string]*browserRuntimeProfileGate
 
-	identityMu sync.Mutex
-	nextGen    map[string]uint64
-	active     map[string]browserRuntimeIdentity
+	identityMu   sync.Mutex
+	nextGen      map[string]uint64
+	active       map[string]browserRuntimeIdentity
+	incarnations map[string]browserProfileIncarnation
 
 	deferredMu sync.Mutex
 	deferred   map[string]browserRuntimeDeferredTargets
@@ -368,8 +384,9 @@ type BrowserRuntimeService struct {
 // example FarmRuntimeService) can therefore observe a stopped/crashed
 // generation without accidentally adopting an unrelated local Chrome.
 type BrowserRuntimeServiceSnapshot struct {
-	Profile    *browser.Profile
-	Generation uint64
+	Profile            *browser.Profile
+	Generation         uint64
+	ProfileIncarnation string
 }
 
 // NewBrowserRuntimeService supports zero-value construction for focused tests
@@ -393,6 +410,7 @@ func NewBrowserRuntimeService(config ...BrowserRuntimeServiceConfig) *BrowserRun
 		gates:                 make(map[string]*browserRuntimeProfileGate),
 		nextGen:               make(map[string]uint64),
 		active:                make(map[string]browserRuntimeIdentity),
+		incarnations:          make(map[string]browserProfileIncarnation),
 		deferred:              make(map[string]browserRuntimeDeferredTargets),
 		proxyRefs:             make(map[string]browserRuntimeProxyRef),
 		pending:               make(map[*BrowserRuntimeProcess]browserRuntimePendingReap),
@@ -986,6 +1004,45 @@ func (s *BrowserRuntimeService) StartWithOptions(profileID string, options Brows
 	})
 }
 
+// StartIfGeneration starts only if the profile incarnation and shared
+// runtime generation are unchanged since the caller's observation. The
+// compare and start occur under the same per-profile gate, closing the race
+// where an unrelated Start could win between a Farm preflight snapshot and a
+// normal Start call.
+func (s *BrowserRuntimeService) StartIfGeneration(profileID string, generation uint64, profileIncarnation string) (*browser.Profile, error) {
+	profileID = strings.TrimSpace(profileID)
+	if profileID == "" || strings.TrimSpace(profileIncarnation) == "" {
+		return nil, fmt.Errorf("%w: profile identity is required", ErrBrowserRuntimeProfileMismatch)
+	}
+	host, err := s.hostSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	release, err := s.acquire(profileID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	manager := s.Manager()
+	if manager == nil {
+		return nil, fmt.Errorf("browser manager is not initialized")
+	}
+	manager.Mutex.Lock()
+	profile := manager.Profiles[profileID]
+	if profile == nil {
+		manager.Mutex.Unlock()
+		return nil, fmt.Errorf("profile not found")
+	}
+	actualIncarnation := s.profileIncarnationLocked(profileID, profile)
+	manager.Mutex.Unlock()
+	actualGeneration := s.Generation(profileID)
+	if actualGeneration != generation || actualIncarnation != profileIncarnation {
+		current, snapshotErr := s.currentProfileSnapshotResult(profileID, profile)
+		return current, errors.Join(snapshotErr, fmt.Errorf("%w: expected generation %d, current %d", ErrBrowserRuntimeProfileMismatch, generation, actualGeneration))
+	}
+	return s.startLocked(host, BrowserRuntimeStartRequest{ProfileID: profileID})
+}
+
 // Status returns an immutable profile snapshot owned by the service. When a
 // profile is not marked running, it performs the same explicit-profile
 // recovery that the application facade historically performed: detect a
@@ -1124,11 +1181,35 @@ func (s *BrowserRuntimeService) RuntimeSnapshot(profileID string) (*BrowserRunti
 		return nil, fmt.Errorf("profile not found")
 	}
 	snapshot := copyBrowserProfileSnapshot(profile)
+	incarnation := s.profileIncarnationLocked(profileID, profile)
 	manager.Mutex.Unlock()
 	return &BrowserRuntimeServiceSnapshot{
-		Profile:    snapshot,
-		Generation: s.Generation(profileID),
+		Profile:            snapshot,
+		Generation:         s.Generation(profileID),
+		ProfileIncarnation: incarnation,
 	}, nil
+}
+
+// profileIncarnationLocked returns an opaque token for the current Manager
+// profile pointer. The caller holds Manager.Mutex so the pointer and token are
+// observed as one snapshot. A random token prevents callers from fabricating
+// an incarnation from public profile fields.
+func (s *BrowserRuntimeService) profileIncarnationLocked(profileID string, profile *browser.Profile) string {
+	if s == nil || profile == nil {
+		return ""
+	}
+	s.identityMu.Lock()
+	defer s.identityMu.Unlock()
+	if s.incarnations == nil {
+		s.incarnations = make(map[string]browserProfileIncarnation)
+	}
+	current := s.incarnations[profileID]
+	if current.profile == profile && current.token != "" {
+		return current.token
+	}
+	current = browserProfileIncarnation{profile: profile, token: uuid.NewString()}
+	s.incarnations[profileID] = current
+	return current.token
 }
 
 // Stop terminates a service-owned process and transitions its profile only
@@ -1172,6 +1253,11 @@ func (s *BrowserRuntimeService) stopLocked(host BrowserRuntimeHost, profileID st
 	}
 	running := profile.Running
 	debugPort := profile.DebugPort
+	identity := s.identity(profileID)
+	if identity.profile != nil && identity.profile != profile {
+		manager.Mutex.Unlock()
+		return copyBrowserProfileSnapshot(profile), fmt.Errorf("%w", ErrBrowserRuntimeProfileMismatch)
+	}
 	manager.Mutex.Unlock()
 	process := s.processFor(profileID)
 	if process == nil && !running {
@@ -1196,7 +1282,6 @@ func (s *BrowserRuntimeService) stopLocked(host BrowserRuntimeHost, profileID st
 		}
 	}
 
-	identity := s.identity(profileID)
 	var expected *browserRuntimeIdentity
 	if identity.generation != 0 {
 		expected = &identity
@@ -1656,7 +1741,7 @@ func (s *BrowserRuntimeService) identity(profileID string) browserRuntimeIdentit
 	return s.active[profileID]
 }
 
-func (s *BrowserRuntimeService) nextIdentity(profileID string, pid, debugPort int, cmd *exec.Cmd) browserRuntimeIdentity {
+func (s *BrowserRuntimeService) nextIdentity(profileID string, pid, debugPort int, cmd *exec.Cmd, profile ...*browser.Profile) browserRuntimeIdentity {
 	s.identityMu.Lock()
 	defer s.identityMu.Unlock()
 	if s.nextGen == nil {
@@ -1666,21 +1751,32 @@ func (s *BrowserRuntimeService) nextIdentity(profileID string, pid, debugPort in
 		s.active = make(map[string]browserRuntimeIdentity)
 	}
 	s.nextGen[profileID]++
-	identity := browserRuntimeIdentity{generation: s.nextGen[profileID], pid: pid, debugPort: debugPort, cmd: cmd}
+	var profilePointer *browser.Profile
+	if len(profile) > 0 {
+		profilePointer = profile[0]
+	}
+	identity := browserRuntimeIdentity{generation: s.nextGen[profileID], pid: pid, debugPort: debugPort, cmd: cmd, profile: profilePointer}
 	s.active[profileID] = identity
 	return identity
 }
 
 func (s *BrowserRuntimeService) ensureIdentity(profileID string, pid, debugPort int, cmd *exec.Cmd) browserRuntimeIdentity {
 	current := s.identity(profileID)
-	if current.generation != 0 && current.pid == pid && current.debugPort == debugPort && current.cmd == cmd {
+	manager := s.Manager()
+	var profile *browser.Profile
+	if manager != nil {
+		manager.Mutex.Lock()
+		profile = manager.Profiles[profileID]
+		manager.Mutex.Unlock()
+	}
+	if current.generation != 0 && current.pid == pid && current.debugPort == debugPort && current.cmd == cmd && current.profile == profile {
 		return current
 	}
-	return s.nextIdentity(profileID, pid, debugPort, cmd)
+	return s.nextIdentity(profileID, pid, debugPort, cmd, profile)
 }
 
 func sameBrowserRuntimeIdentity(left, right browserRuntimeIdentity) bool {
-	return left.generation != 0 && left.generation == right.generation && left.pid == right.pid && left.debugPort == right.debugPort && left.cmd == right.cmd
+	return left.generation != 0 && left.generation == right.generation && left.pid == right.pid && left.debugPort == right.debugPort && left.cmd == right.cmd && left.profile == right.profile
 }
 
 func (s *BrowserRuntimeService) identityMatches(profileID string, expected browserRuntimeIdentity) bool {
@@ -1711,7 +1807,7 @@ func (s *BrowserRuntimeService) markRunning(profileID string, profile *browser.P
 		manager.BrowserProcesses[profileID] = cmd
 	}
 	manager.Mutex.Unlock()
-	return s.nextIdentity(profileID, pid, debugPort, cmd)
+	return s.nextIdentity(profileID, pid, debugPort, cmd, current)
 }
 
 // adoptDetectedRuntime commits a recovered runtime while the profile still
@@ -1740,7 +1836,7 @@ func (s *BrowserRuntimeService) adoptDetectedRuntime(profileID string, expectedR
 	if manager.BrowserProcesses == nil {
 		manager.BrowserProcesses = make(map[string]*exec.Cmd)
 	}
-	identity := s.nextIdentity(profileID, current.Pid, current.DebugPort, nil)
+	identity := s.nextIdentity(profileID, current.Pid, current.DebugPort, nil, current)
 	manager.Mutex.Unlock()
 	return identity, true
 }
@@ -1759,6 +1855,13 @@ func (s *BrowserRuntimeService) stopState(host BrowserRuntimeHost, profileID str
 	if profile == nil {
 		manager.Mutex.Unlock()
 		return nil, false
+	}
+	// Even an unqualified internal stop must not mutate a profile that was
+	// replaced under the same ID while an older runtime operation was in
+	// flight. The profile pointer is the in-memory incarnation fence.
+	if currentIdentity.profile != nil && profile != currentIdentity.profile {
+		manager.Mutex.Unlock()
+		return profile, false
 	}
 	if expected != nil && !s.identityMatches(profileID, *expected) {
 		manager.Mutex.Unlock()

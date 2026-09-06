@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,11 @@ var (
 	ErrFarmRuntimeCommand        = errors.New("invalid farm runtime command")
 )
 
+const (
+	maxFarmRuntimeEnvelopeBytes = 64 * 1024
+	maxFarmRuntimeCorrelationID = 128
+)
+
 // FarmRuntimeIdentity is the strict, node-safe identity of one runtime
 // instance. DebugPort is deliberately not part of this identity: ports are
 // node-local locators and are telemetry only. ConfigHash is an optional,
@@ -51,19 +57,63 @@ type FarmRuntimeIdentity struct {
 	Generation         uint64 `json:"generation"`
 }
 
-// FarmRuntime is an immutable response snapshot. Profile is copied by the
-// shared BrowserRuntimeService and is never a Manager-owned pointer.
+// FarmRuntimeProfile is the allowlisted profile telemetry exposed by the Farm
+// boundary. LaunchArgs is retained as an in-process compatibility field for
+// existing callers, but is deliberately excluded from JSON/wire output. No
+// user-data path, proxy, launch code, fingerprint, or raw error is exported.
+type FarmRuntimeProfile struct {
+	ProfileId      string   `json:"profileId"`
+	ProfileName    string   `json:"profileName"`
+	CoreId         string   `json:"coreId,omitempty"`
+	Running        bool     `json:"running"`
+	DebugPort      int      `json:"debugPort"`
+	DebugReady     bool     `json:"debugReady"`
+	Pid            int      `json:"pid"`
+	RuntimeWarning string   `json:"runtimeWarning,omitempty"`
+	LastStartAt    string   `json:"lastStartAt,omitempty"`
+	LastStopAt     string   `json:"lastStopAt,omitempty"`
+	LaunchArgs     []string `json:"-"`
+}
+
+// FarmRuntime is an immutable response snapshot. Profile is an allowlisted
+// detached telemetry value and never a Manager-owned pointer.
 type FarmRuntime struct {
 	FarmRuntimeIdentity
-	State          string          `json:"state"`
-	Profile        *BrowserProfile `json:"profile,omitempty"`
-	PID            int             `json:"pid"`
-	DebugPort      int             `json:"debug_port"`
-	DebugReady     bool            `json:"debug_ready"`
-	RuntimeWarning string          `json:"runtime_warning,omitempty"`
-	LastError      string          `json:"last_error,omitempty"`
-	LastStartAt    string          `json:"last_start_at,omitempty"`
-	LastStopAt     string          `json:"last_stop_at,omitempty"`
+	State          string              `json:"state"`
+	Profile        *FarmRuntimeProfile `json:"profile,omitempty"`
+	PID            int                 `json:"pid"`
+	DebugPort      int                 `json:"debug_port"`
+	DebugReady     bool                `json:"debug_ready"`
+	RuntimeWarning string              `json:"runtime_warning,omitempty"`
+	LastError      string              `json:"last_error,omitempty"`
+	LastStartAt    string              `json:"last_start_at,omitempty"`
+	LastStopAt     string              `json:"last_stop_at,omitempty"`
+}
+
+// MarshalJSON is an additional wire fence for records assembled by older
+// callers or tests. The Farm response never serializes raw lifecycle errors
+// or warnings even if an internal value was populated before the telemetry
+// allowlist was introduced.
+func (runtime FarmRuntime) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		FarmRuntimeIdentity
+		State       string              `json:"state"`
+		Profile     *FarmRuntimeProfile `json:"profile,omitempty"`
+		PID         int                 `json:"pid"`
+		DebugPort   int                 `json:"debug_port"`
+		DebugReady  bool                `json:"debug_ready"`
+		LastStartAt string              `json:"last_start_at,omitempty"`
+		LastStopAt  string              `json:"last_stop_at,omitempty"`
+	}{
+		FarmRuntimeIdentity: runtime.FarmRuntimeIdentity,
+		State:               runtime.State,
+		Profile:             runtime.Profile,
+		PID:                 runtime.PID,
+		DebugPort:           runtime.DebugPort,
+		DebugReady:          runtime.DebugReady,
+		LastStartAt:         runtime.LastStartAt,
+		LastStopAt:          runtime.LastStopAt,
+	})
 }
 
 // FarmRuntimeServiceConfig constructs a farm layer around the existing
@@ -161,8 +211,50 @@ type FarmRuntimeCommandResponse struct {
 	Error         string `json:"error,omitempty"`
 }
 
+func farmRuntimeStableErrorMessage(message string) string {
+	switch message {
+	case ErrFarmRuntimeServiceUnavailable.Error(),
+		ErrFarmRuntimeIdentityRequired.Error(),
+		ErrFarmRuntimeIdentityMismatch.Error(),
+		ErrFarmRuntimeUnknown.Error(),
+		ErrFarmRuntimeNotFound.Error(),
+		ErrFarmRuntimeConfigMismatch.Error(),
+		ErrFarmRuntimeStale.Error(),
+		ErrFarmRuntimeCommand.Error():
+		return message
+	default:
+		return ErrFarmRuntimeCommand.Error()
+	}
+}
+
+// MarshalJSON prevents a direct caller from putting an arbitrary wrapped Go
+// error (which may contain a path, command line, or credential) on the wire.
+func (response FarmRuntimeCommandResponse) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type          string `json:"type"`
+		NodeUID       string `json:"node_uid"`
+		CorrelationID string `json:"correlation_id"`
+		OK            bool   `json:"ok"`
+		Payload       any    `json:"payload,omitempty"`
+		Error         string `json:"error,omitempty"`
+	}{
+		Type:          "command_response",
+		NodeUID:       response.NodeUID,
+		CorrelationID: response.CorrelationID,
+		OK:            response.OK,
+		Payload:       response.Payload,
+		Error: func() string {
+			if response.Error == "" {
+				return ""
+			}
+			return farmRuntimeStableErrorMessage(response.Error)
+		}(),
+	})
+}
+
 type farmRuntimeRecord struct {
-	runtime FarmRuntime
+	runtime            FarmRuntime
+	profileIncarnation string
 }
 
 type farmRuntimeProfileGate struct {
@@ -373,6 +465,33 @@ func validateOpaqueConfigHash(requested, stored string) error {
 	return nil
 }
 
+func farmRuntimeProfileTelemetry(profile *BrowserProfile) *FarmRuntimeProfile {
+	if profile == nil {
+		return nil
+	}
+	return &FarmRuntimeProfile{
+		ProfileId:   profile.ProfileId,
+		ProfileName: profile.ProfileName,
+		CoreId:      profile.CoreId,
+		Running:     profile.Running,
+		DebugPort:   profile.DebugPort,
+		DebugReady:  profile.DebugReady,
+		Pid:         profile.Pid,
+		// RuntimeWarning is produced by the lifecycle service and may contain a
+		// host-derived error. Do not forward it across the Farm boundary.
+		LastStartAt: profile.LastStartAt,
+		LastStopAt:  profile.LastStopAt,
+		// Keep this only for in-process compatibility; FarmRuntimeProfile's
+		// JSON representation excludes it.
+		LaunchArgs: cloneBrowserProfileStrings(profile.LaunchArgs),
+	}
+}
+
+func farmRuntimeIncarnationMatches(record farmRuntimeRecord, snapshot *BrowserRuntimeServiceSnapshot) bool {
+	return record.profileIncarnation != "" && snapshot != nil &&
+		snapshot.ProfileIncarnation != "" && record.profileIncarnation == snapshot.ProfileIncarnation
+}
+
 func (s *FarmRuntimeService) validateAgainstRecord(profileID, runtimeUID, provider string, epoch uint64, configHash string, generation uint64, record farmRuntimeRecord) error {
 	if err := s.validateControllerIdentity("", provider, epoch); err != nil {
 		return err
@@ -401,16 +520,21 @@ func farmRuntimeFromSnapshot(record farmRuntimeRecord, snapshot *BrowserRuntimeS
 		}
 		return runtime
 	}
-	profile := copyBrowserProfileSnapshot(snapshot.Profile)
-	runtime.Profile = profile
+	profile := snapshot.Profile
+	telemetry := farmRuntimeProfileTelemetry(profile)
+	runtime.Profile = telemetry
 	runtime.PID = profile.Pid
 	runtime.DebugPort = profile.DebugPort
 	runtime.DebugReady = profile.DebugReady
-	runtime.RuntimeWarning = profile.RuntimeWarning
-	runtime.LastError = profile.LastError
+	// Raw lifecycle errors/warnings may include paths, command arguments, or
+	// credentials. They are intentionally not part of Farm telemetry.
+	runtime.RuntimeWarning = ""
+	runtime.LastError = ""
 	runtime.LastStartAt = profile.LastStartAt
 	runtime.LastStopAt = profile.LastStopAt
 	switch {
+	case snapshot.Generation == runtime.Generation && profile.Running && !profile.DebugReady:
+		runtime.State = FarmRuntimeStateStarting
 	case snapshot.Generation == runtime.Generation && profile.Running:
 		runtime.State = FarmRuntimeStateIdle
 	case runtime.State == FarmRuntimeStateStopped && !profile.Running:
@@ -434,6 +558,11 @@ func (s *FarmRuntimeService) refreshRecord(profileID string, record farmRuntimeR
 	}
 	if snapshot.Profile == nil {
 		return FarmRuntime{}, fmt.Errorf("%w: %s", ErrFarmRuntimeNotFound, profileID)
+	}
+	if !farmRuntimeIncarnationMatches(record, snapshot) {
+		record.runtime.State = FarmRuntimeStateStale
+		s.setRecord(profileID, record)
+		return FarmRuntime{}, fmt.Errorf("%w: profile incarnation", ErrFarmRuntimeStale)
 	}
 	updated := farmRuntimeFromSnapshot(record, snapshot)
 	record.runtime = updated
@@ -467,6 +596,28 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	if request.RuntimeUID != "" && !owned {
 		return FarmRuntime{}, fmt.Errorf("%w: runtime uid %s", ErrFarmRuntimeUnknown, request.RuntimeUID)
 	}
+	var expectedIncarnation string
+	if !owned {
+		// A newly-created Farm service has no proof that an already-running
+		// shared runtime belongs to this Agent. Start would intentionally reuse
+		// that runtime, so calling it here would mint a second Farm UID for an
+		// unproven process. Leave the runtime untouched until authenticated
+		// reconcile supplies ownership evidence.
+		observed, observeErr := s.snapshot(profileID)
+		if observeErr != nil {
+			return FarmRuntime{}, observeErr
+		}
+		if observed == nil || observed.Profile == nil {
+			return FarmRuntime{}, fmt.Errorf("%w: profile %s", ErrFarmRuntimeNotFound, profileID)
+		}
+		expectedIncarnation = observed.ProfileIncarnation
+		if observed.Profile.Running || observed.Generation != 0 {
+			return FarmRuntime{}, fmt.Errorf("%w: unproven shared runtime", ErrFarmRuntimeStale)
+		}
+		if expectedIncarnation == "" {
+			return FarmRuntime{}, fmt.Errorf("%w: profile incarnation is unavailable", ErrFarmRuntimeStale)
+		}
+	}
 	if owned {
 		if err := s.validateAgainstRecord(profileID, request.RuntimeUID, request.ProviderInstanceID, request.FencingEpoch, request.ConfigHash, request.Generation, record); err != nil {
 			return FarmRuntime{}, err
@@ -475,6 +626,15 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		if observeErr != nil {
 			return FarmRuntime{}, observeErr
 		}
+		if observed == nil || observed.Profile == nil {
+			return FarmRuntime{}, fmt.Errorf("%w: profile %s", ErrFarmRuntimeNotFound, profileID)
+		}
+		if !farmRuntimeIncarnationMatches(record, observed) {
+			record.runtime.State = FarmRuntimeStateStale
+			s.setRecord(profileID, record)
+			return FarmRuntime{}, fmt.Errorf("%w: profile incarnation", ErrFarmRuntimeStale)
+		}
+		expectedIncarnation = record.profileIncarnation
 		if observed.Profile.Running && observed.Generation == 0 {
 			// A running profile without a generation was not proven by this
 			// service. Do not turn it into a Farm runtime implicitly.
@@ -490,7 +650,7 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 			return FarmRuntime{}, fmt.Errorf("%w: generation", ErrFarmRuntimeStale)
 		}
 		existingActiveGeneration = observed.Generation
-		if record.runtime.State == FarmRuntimeStateIdle && observed.Generation == record.runtime.Generation && observed.Profile.Running {
+		if (record.runtime.State == FarmRuntimeStateIdle || record.runtime.State == FarmRuntimeStateStarting) && observed.Generation == record.runtime.Generation && observed.Profile.Running {
 			return farmRuntimeFromSnapshot(record, observed), nil
 		}
 		if request.RuntimeUID != "" {
@@ -498,7 +658,10 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		}
 	}
 
-	profile, startErr := s.runtimeService.Start(profileID)
+	profile, startErr := s.runtimeService.StartIfGeneration(profileID, existingActiveGeneration, expectedIncarnation)
+	if errors.Is(startErr, ErrBrowserRuntimeProfileMismatch) {
+		return FarmRuntime{}, fmt.Errorf("%w: profile changed before start", ErrFarmRuntimeStale)
+	}
 	if startErr != nil && (profile == nil || !profile.Running) {
 		return FarmRuntime{}, startErr
 	}
@@ -506,7 +669,10 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	if observeErr != nil {
 		return FarmRuntime{}, errors.Join(startErr, observeErr)
 	}
-	if observed.Generation == 0 || observed.Profile == nil || !observed.Profile.Running {
+	if observed == nil || observed.Profile == nil || !farmRuntimeIncarnationMatches(farmRuntimeRecord{profileIncarnation: expectedIncarnation}, observed) {
+		return FarmRuntime{}, errors.Join(startErr, fmt.Errorf("%w: profile incarnation changed during ensure", ErrFarmRuntimeStale))
+	}
+	if observed.Generation == 0 || !observed.Profile.Running {
 		return FarmRuntime{}, errors.Join(startErr, fmt.Errorf("%w: shared service returned no active generation", ErrFarmRuntimeServiceUnavailable))
 	}
 	if owned && existingActiveGeneration != 0 && observed.Generation == record.runtime.Generation {
@@ -530,7 +696,7 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		State: FarmRuntimeStateIdle,
 	}
 	runtime = farmRuntimeFromSnapshot(farmRuntimeRecord{runtime: runtime}, observed)
-	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime})
+	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation})
 	if startErr != nil {
 		return runtime, startErr
 	}
@@ -580,7 +746,7 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 		return FarmRuntime{}, ErrFarmRuntimeServiceUnavailable
 	}
 	profileID := strings.TrimSpace(request.ProfileID)
-	if profileID == "" || strings.TrimSpace(request.RuntimeUID) == "" || strings.TrimSpace(request.ProviderInstanceID) == "" || request.FencingEpoch == 0 || request.Generation == 0 {
+	if strings.TrimSpace(request.NodeUID) == "" || profileID == "" || strings.TrimSpace(request.RuntimeUID) == "" || strings.TrimSpace(request.ProviderInstanceID) == "" || request.FencingEpoch == 0 || request.Generation == 0 {
 		return FarmRuntime{}, ErrFarmRuntimeIdentityRequired
 	}
 	if err := s.validateControllerIdentity(request.NodeUID, request.ProviderInstanceID, request.FencingEpoch); err != nil {
@@ -598,12 +764,20 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 	if err := s.validateAgainstRecord(profileID, request.RuntimeUID, request.ProviderInstanceID, request.FencingEpoch, request.ConfigHash, request.Generation, record); err != nil {
 		return FarmRuntime{}, err
 	}
-	if record.runtime.State == FarmRuntimeStateStopped {
-		return record.runtime, nil
-	}
 	observed, err := s.snapshot(profileID)
 	if err != nil {
 		return FarmRuntime{}, err
+	}
+	if observed == nil || observed.Profile == nil {
+		return FarmRuntime{}, fmt.Errorf("%w: profile %s", ErrFarmRuntimeNotFound, profileID)
+	}
+	if !farmRuntimeIncarnationMatches(record, observed) {
+		record.runtime.State = FarmRuntimeStateStale
+		s.setRecord(profileID, record)
+		return FarmRuntime{}, fmt.Errorf("%w: profile incarnation", ErrFarmRuntimeStale)
+	}
+	if record.runtime.State == FarmRuntimeStateStopped {
+		return record.runtime, nil
 	}
 	if observed.Generation != record.runtime.Generation {
 		record.runtime.State = FarmRuntimeStateStale
@@ -626,6 +800,11 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 	finalSnapshot, err := s.snapshot(profileID)
 	if err != nil {
 		return FarmRuntime{}, err
+	}
+	if finalSnapshot == nil || finalSnapshot.Profile == nil || !farmRuntimeIncarnationMatches(record, finalSnapshot) {
+		record.runtime.State = FarmRuntimeStateStale
+		s.setRecord(profileID, record)
+		return FarmRuntime{}, fmt.Errorf("%w: profile incarnation changed during stop", ErrFarmRuntimeStale)
 	}
 	record.runtime = farmRuntimeFromSnapshot(record, finalSnapshot)
 	record.runtime.State = FarmRuntimeStateStopped
@@ -694,22 +873,17 @@ func (s *FarmRuntimeService) RuntimeInventory() ([]FarmRuntime, error) {
 }
 
 func decodeFarmCommandPayload(payload any, target any) error {
-	var raw []byte
-	switch value := payload.(type) {
-	case nil:
-		raw = []byte(`{}`)
-	case json.RawMessage:
-		raw = append([]byte(nil), value...)
-	case []byte:
-		raw = append([]byte(nil), value...)
-	default:
-		encoded, err := json.Marshal(value)
-		if err != nil {
-			return fmt.Errorf("%w: payload is not JSON-safe", ErrFarmRuntimeCommand)
-		}
-		raw = encoded
+	raw, err := farmRuntimeJSONBytes(payload, true)
+	if err != nil {
+		return err
 	}
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	if err := validateFarmRuntimeJSON(raw); err != nil {
+		return fmt.Errorf("%w: payload JSON", ErrFarmRuntimeCommand)
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("%w: payload must be an object", ErrFarmRuntimeCommand)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("%w: payload: %v", ErrFarmRuntimeCommand, err)
@@ -724,6 +898,184 @@ func decodeFarmCommandPayload(payload any, target any) error {
 	return nil
 }
 
+func farmRuntimeJSONBytes(value any, nilAsObject bool) ([]byte, error) {
+	if value == nil {
+		if nilAsObject {
+			return []byte(`{}`), nil
+		}
+		return nil, fmt.Errorf("%w: empty command body", ErrFarmRuntimeCommand)
+	}
+	var raw []byte
+	switch typed := value.(type) {
+	case io.Reader:
+		// The limit is installed before any read. This keeps a malicious or
+		// stalled transport from handing an unbounded body to io.ReadAll.
+		limited := io.LimitReader(typed, maxFarmRuntimeEnvelopeBytes+1)
+		var err error
+		raw, err = io.ReadAll(limited)
+		if err != nil {
+			return nil, fmt.Errorf("%w: body read failed", ErrFarmRuntimeCommand)
+		}
+	case json.RawMessage:
+		raw = append([]byte(nil), typed...)
+	case []byte:
+		raw = append([]byte(nil), typed...)
+	case string:
+		raw = []byte(typed)
+	default:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("%w: body is not JSON-safe", ErrFarmRuntimeCommand)
+		}
+		raw = encoded
+	}
+	if len(raw) > maxFarmRuntimeEnvelopeBytes {
+		return nil, fmt.Errorf("%w: body exceeds limit", ErrFarmRuntimeCommand)
+	}
+	return raw, nil
+}
+
+// validateFarmRuntimeJSON walks every object and array before decoding into a
+// typed request. encoding/json otherwise silently keeps the last duplicate
+// key, which makes an authenticated command ambiguous (including nested
+// payload objects).
+func validateFarmRuntimeJSON(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := walkFarmRuntimeJSON(decoder); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("trailing JSON value")
+	}
+	return nil
+}
+
+func walkFarmRuntimeJSON(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := token.(json.Delim); ok {
+		switch delim {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return fmt.Errorf("object key is not a string")
+				}
+				if _, exists := seen[key]; exists {
+					return fmt.Errorf("duplicate object key")
+				}
+				seen[key] = struct{}{}
+				if err := walkFarmRuntimeJSON(decoder); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim('}') {
+				return fmt.Errorf("invalid object")
+			}
+		case '[':
+			for decoder.More() {
+				if err := walkFarmRuntimeJSON(decoder); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim(']') {
+				return fmt.Errorf("invalid array")
+			}
+		default:
+			return fmt.Errorf("unexpected JSON delimiter")
+		}
+	}
+	return nil
+}
+
+func decodeFarmRuntimeEnvelope(raw []byte) (FarmRuntimeCommand, error) {
+	if err := validateFarmRuntimeJSON(raw); err != nil {
+		return FarmRuntimeCommand{}, fmt.Errorf("%w: invalid JSON", ErrFarmRuntimeCommand)
+	}
+	var wire struct {
+		Type          string          `json:"type"`
+		NodeUID       string          `json:"node_uid"`
+		CorrelationID string          `json:"correlation_id"`
+		Command       string          `json:"command"`
+		Payload       json.RawMessage `json:"payload"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return FarmRuntimeCommand{}, fmt.Errorf("%w: invalid envelope", ErrFarmRuntimeCommand)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return FarmRuntimeCommand{}, fmt.Errorf("%w: trailing envelope value", ErrFarmRuntimeCommand)
+	}
+	return FarmRuntimeCommand{
+		Type:          wire.Type,
+		NodeUID:       wire.NodeUID,
+		CorrelationID: wire.CorrelationID,
+		Command:       wire.Command,
+		Payload:       wire.Payload,
+	}, nil
+}
+
+func (s *FarmRuntimeService) validateCommand(command FarmRuntimeCommand) error {
+	if command.Type != "command" {
+		return fmt.Errorf("%w: type", ErrFarmRuntimeCommand)
+	}
+	if strings.TrimSpace(command.NodeUID) == "" {
+		return fmt.Errorf("%w: node uid is required", ErrFarmRuntimeIdentityRequired)
+	}
+	if err := s.validateNode(command.NodeUID); err != nil {
+		return err
+	}
+	correlationID := strings.TrimSpace(command.CorrelationID)
+	if correlationID == "" || len(correlationID) > maxFarmRuntimeCorrelationID {
+		return fmt.Errorf("%w: correlation id", ErrFarmRuntimeCommand)
+	}
+	if strings.TrimSpace(command.Command) == "" {
+		return fmt.Errorf("%w: command is required", ErrFarmRuntimeCommand)
+	}
+	switch strings.TrimSpace(command.Command) {
+	case "ensure_runtime", "runtime_status", "stop_runtime", "inventory":
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown command", ErrFarmRuntimeCommand)
+	}
+}
+
+func farmRuntimeWireError(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ErrFarmRuntimeIdentityRequired):
+		return ErrFarmRuntimeIdentityRequired.Error()
+	case errors.Is(err, ErrFarmRuntimeIdentityMismatch):
+		return ErrFarmRuntimeIdentityMismatch.Error()
+	case errors.Is(err, ErrFarmRuntimeUnknown):
+		return ErrFarmRuntimeUnknown.Error()
+	case errors.Is(err, ErrFarmRuntimeNotFound):
+		return ErrFarmRuntimeNotFound.Error()
+	case errors.Is(err, ErrFarmRuntimeStale):
+		return ErrFarmRuntimeStale.Error()
+	case errors.Is(err, ErrFarmRuntimeConfigMismatch):
+		return ErrFarmRuntimeConfigMismatch.Error()
+	case errors.Is(err, ErrFarmRuntimeServiceUnavailable):
+		return ErrFarmRuntimeServiceUnavailable.Error()
+	default:
+		return ErrFarmRuntimeCommand.Error()
+	}
+}
+
 // HandleCommand dispatches the four P1.10 commands without knowing how the
 // command arrived. Business errors are returned as ok=false so a WSS adapter
 // can preserve command correlation; malformed payloads return a Go error.
@@ -731,17 +1083,11 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 	if s == nil {
 		return FarmRuntimeCommandResponse{}, ErrFarmRuntimeServiceUnavailable
 	}
-	if command.Type != "" && command.Type != "command" {
-		return FarmRuntimeCommandResponse{}, fmt.Errorf("%w: type", ErrFarmRuntimeCommand)
-	}
-	if err := s.validateNode(command.NodeUID); err != nil {
+	if err := s.validateCommand(command); err != nil {
 		return FarmRuntimeCommandResponse{}, err
 	}
 	name := strings.TrimSpace(command.Command)
-	if name == "" {
-		return FarmRuntimeCommandResponse{}, fmt.Errorf("%w: command is required", ErrFarmRuntimeCommand)
-	}
-	response := FarmRuntimeCommandResponse{Type: "command_response", NodeUID: s.nodeUID, CorrelationID: command.CorrelationID}
+	response := FarmRuntimeCommandResponse{Type: "command_response", NodeUID: s.nodeUID, CorrelationID: strings.TrimSpace(command.CorrelationID)}
 	switch name {
 	case "ensure_runtime":
 		var request FarmRuntimeEnsureRequest
@@ -750,7 +1096,7 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		}
 		runtime, err := s.EnsureRuntime(request)
 		if err != nil {
-			response.Error = err.Error()
+			response.Error = farmRuntimeWireError(err)
 			return response, nil
 		}
 		response.OK = true
@@ -762,7 +1108,7 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		}
 		runtime, err := s.RuntimeStatus(request)
 		if err != nil {
-			response.Error = err.Error()
+			response.Error = farmRuntimeWireError(err)
 			return response, nil
 		}
 		response.OK = true
@@ -774,7 +1120,7 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		}
 		runtime, err := s.StopRuntime(request)
 		if err != nil {
-			response.Error = err.Error()
+			response.Error = farmRuntimeWireError(err)
 			return response, nil
 		}
 		response.OK = true
@@ -786,13 +1132,13 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		}
 		inventory, err := s.InventoryWithError()
 		if err != nil {
-			response.Error = err.Error()
+			response.Error = farmRuntimeWireError(err)
 			return response, nil
 		}
 		response.OK = true
 		response.Payload = inventory
 	default:
-		response.Error = fmt.Sprintf("%s: unknown command %q", ErrFarmRuntimeCommand, name)
+		response.Error = ErrFarmRuntimeCommand.Error()
 	}
 	return response, nil
 }
@@ -800,8 +1146,37 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 // HandleCommandEnvelope is the explicit envelope-named entry point for a
 // future Control WSS adapter. It intentionally has no transport dependency;
 // the request and response fields remain the wire-compatible command shape.
-func (s *FarmRuntimeService) HandleCommandEnvelope(envelope FarmRuntimeCommandEnvelope) (FarmRuntimeCommandResponse, error) {
-	return s.HandleCommand(envelope)
+func (s *FarmRuntimeService) HandleCommandEnvelope(envelope any) (FarmRuntimeCommandResponse, error) {
+	var command FarmRuntimeCommand
+	switch typed := envelope.(type) {
+	case FarmRuntimeCommandEnvelope:
+		command = typed
+	case *FarmRuntimeCommandEnvelope:
+		if typed == nil {
+			err := fmt.Errorf("%w: nil envelope", ErrFarmRuntimeCommand)
+			return FarmRuntimeCommandResponse{Type: "command_response", NodeUID: s.NodeUID(), Error: farmRuntimeWireError(err)}, err
+		}
+		command = *typed
+	default:
+		raw, err := farmRuntimeJSONBytes(envelope, false)
+		if err != nil {
+			return FarmRuntimeCommandResponse{Type: "command_response", NodeUID: s.NodeUID(), Error: farmRuntimeWireError(err)}, err
+		}
+		command, err = decodeFarmRuntimeEnvelope(raw)
+		if err != nil {
+			return FarmRuntimeCommandResponse{Type: "command_response", NodeUID: s.NodeUID(), Error: farmRuntimeWireError(err)}, err
+		}
+	}
+	response, err := s.HandleCommand(command)
+	if err != nil {
+		return FarmRuntimeCommandResponse{
+			Type:          "command_response",
+			NodeUID:       s.NodeUID(),
+			CorrelationID: strings.TrimSpace(command.CorrelationID),
+			Error:         farmRuntimeWireError(err),
+		}, err
+	}
+	return response, nil
 }
 
 // DispatchCommand is a response-only convenience for transports that want
@@ -812,8 +1187,8 @@ func (s *FarmRuntimeService) DispatchCommand(command FarmRuntimeCommand) FarmRun
 		return FarmRuntimeCommandResponse{
 			Type:          "command_response",
 			NodeUID:       s.NodeUID(),
-			CorrelationID: command.CorrelationID,
-			Error:         err.Error(),
+			CorrelationID: strings.TrimSpace(command.CorrelationID),
+			Error:         farmRuntimeWireError(err),
 		}
 	}
 	return response

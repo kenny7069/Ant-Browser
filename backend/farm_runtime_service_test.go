@@ -115,6 +115,7 @@ func TestFarmRuntimeEnsureStatusStopAndInventory(t *testing.T) {
 		t.Fatalf("inventory = %#v, err=%v", inventory, err)
 	}
 	stopped, err := fixture.farm.StopRuntime(FarmRuntimeStopRequest{
+		NodeUID:            runtime.NodeUID,
 		ProfileID:          runtime.ProfileID,
 		RuntimeUID:         runtime.RuntimeUID,
 		ProviderInstanceID: runtime.ProviderInstanceID,
@@ -165,6 +166,7 @@ func TestFarmRuntimeRejectsStaleIdentityAndUnknownInventory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := fixture.farm.StopRuntime(FarmRuntimeStopRequest{
+		NodeUID:            first.NodeUID,
 		ProfileID:          first.ProfileID,
 		RuntimeUID:         "stale-runtime",
 		ProviderInstanceID: first.ProviderInstanceID,
@@ -238,6 +240,7 @@ func TestFarmRuntimeStopDoesNotSelfAttestProfileMutation(t *testing.T) {
 	}
 
 	if _, err := fixture.farm.StopRuntime(FarmRuntimeStopRequest{
+		NodeUID:            runtime.NodeUID,
 		ProfileID:          runtime.ProfileID,
 		RuntimeUID:         runtime.RuntimeUID,
 		ProviderInstanceID: runtime.ProviderInstanceID,
@@ -272,6 +275,7 @@ func TestFarmRuntimeStaleRuntimeCannotStopReplacement(t *testing.T) {
 	}
 	stopCallsBefore := fixture.stopCalls.Load()
 	if _, err := fixture.farm.StopRuntime(FarmRuntimeStopRequest{
+		NodeUID:            first.NodeUID,
 		ProfileID:          first.ProfileID,
 		RuntimeUID:         first.RuntimeUID,
 		ProviderInstanceID: first.ProviderInstanceID,
@@ -423,6 +427,7 @@ func TestFarmRuntimeFreshSameProfileLaunchesOneOwnedChild(t *testing.T) {
 		t.Fatalf("owned child launch calls = %d, want one", startCalls.Load())
 	}
 	if _, err := farm.StopRuntime(FarmRuntimeStopRequest{
+		NodeUID:            results[0].NodeUID,
 		ProfileID:          results[0].ProfileID,
 		RuntimeUID:         results[0].RuntimeUID,
 		ProviderInstanceID: results[0].ProviderInstanceID,
