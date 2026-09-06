@@ -1468,6 +1468,14 @@ func (s *BrowserRuntimeService) StartWithOptions(profileID string, options Brows
 // where an unrelated Start could win between a Farm preflight snapshot and a
 // normal Start call.
 func (s *BrowserRuntimeService) StartIfGeneration(profileID string, generation uint64, profileIncarnation string) (*browser.Profile, error) {
+	return s.StartIfGenerationWithOptions(profileID, generation, profileIncarnation, BrowserRuntimeStartOptions{})
+}
+
+// StartIfGenerationWithOptions is the fenced start entrypoint for adapters
+// that need an explicit launch policy. The profile incarnation and shared
+// generation checks remain identical to StartIfGeneration; only the
+// host-neutral start options are carried into the shared lifecycle service.
+func (s *BrowserRuntimeService) StartIfGenerationWithOptions(profileID string, generation uint64, profileIncarnation string, options BrowserRuntimeStartOptions) (*browser.Profile, error) {
 	profileID = strings.TrimSpace(profileID)
 	if profileID == "" || strings.TrimSpace(profileIncarnation) == "" {
 		return nil, fmt.Errorf("%w: profile identity is required", ErrBrowserRuntimeProfileMismatch)
@@ -1512,7 +1520,10 @@ func (s *BrowserRuntimeService) StartIfGeneration(profileID string, generation u
 	if s.startReservationHook != nil {
 		s.startReservationHook()
 	}
-	return s.startLockedWithReservation(host, BrowserRuntimeStartRequest{ProfileID: profileID}, reservation)
+	return s.startLockedWithReservation(host, BrowserRuntimeStartRequest{
+		ProfileID: profileID,
+		Options:   cloneBrowserRuntimeStartOptions(options),
+	}, reservation)
 }
 
 // Status returns an immutable profile snapshot owned by the service. When a

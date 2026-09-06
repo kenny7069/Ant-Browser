@@ -460,7 +460,7 @@ func TestFarmRuntimeCommandHandlerPreservesP17Envelope(t *testing.T) {
 		NodeUID:       "node-test",
 		CorrelationID: "corr-1",
 		Command:       "ensure_runtime",
-		Payload:       map[string]any{"profile_id": "profile-1"},
+		Payload:       map[string]any{"profile_id": "profile-1", "launch_mode": FarmRuntimeLaunchModeDirectNoProxy},
 	})
 	if err != nil {
 		t.Fatal(err)

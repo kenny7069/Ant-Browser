@@ -35,11 +35,16 @@ var (
 	ErrFarmRuntimeConfigMismatch = errors.New("farm runtime config token mismatch")
 	ErrFarmRuntimeStale          = errors.New("farm runtime identity is stale")
 	ErrFarmRuntimeCommand        = errors.New("invalid farm runtime command")
+	ErrFarmRuntimeLaunchMode     = errors.New("farm runtime launch mode must be direct_no_proxy")
 )
 
 const (
 	maxFarmRuntimeEnvelopeBytes = 64 * 1024
 	maxFarmRuntimeCorrelationID = 128
+	// FarmRuntimeLaunchModeDirectNoProxy is the only launch mode admitted by
+	// BF-P1.12. Authenticated proxy configuration is a later gate and must not
+	// be smuggled through this command boundary.
+	FarmRuntimeLaunchModeDirectNoProxy = "direct_no_proxy"
 )
 
 // FarmRuntimeIdentity is the strict, node-safe identity of one runtime
@@ -88,6 +93,7 @@ type FarmRuntime struct {
 	LastError      string              `json:"last_error,omitempty"`
 	LastStartAt    string              `json:"last_start_at,omitempty"`
 	LastStopAt     string              `json:"last_stop_at,omitempty"`
+	LaunchMode     string              `json:"launch_mode"`
 }
 
 // MarshalJSON is an additional wire fence for records assembled by older
@@ -104,6 +110,7 @@ func (runtime FarmRuntime) MarshalJSON() ([]byte, error) {
 		DebugReady  bool                `json:"debug_ready"`
 		LastStartAt string              `json:"last_start_at,omitempty"`
 		LastStopAt  string              `json:"last_stop_at,omitempty"`
+		LaunchMode  string              `json:"launch_mode"`
 	}{
 		FarmRuntimeIdentity: runtime.FarmRuntimeIdentity,
 		State:               runtime.State,
@@ -113,6 +120,7 @@ func (runtime FarmRuntime) MarshalJSON() ([]byte, error) {
 		DebugReady:          runtime.DebugReady,
 		LastStartAt:         runtime.LastStartAt,
 		LastStopAt:          runtime.LastStopAt,
+		LaunchMode:          runtime.LaunchMode,
 	})
 }
 
@@ -201,6 +209,7 @@ type FarmRuntimeEnsureRequest struct {
 	FencingEpoch       uint64 `json:"fencing_epoch,omitempty"`
 	ConfigHash         string `json:"config_hash,omitempty"`
 	Generation         uint64 `json:"generation,omitempty"`
+	LaunchMode         string `json:"launch_mode,omitempty"`
 }
 
 // FarmRuntimeStatusRequest is a read-only selector. Supplying identity fields
@@ -267,6 +276,7 @@ func farmRuntimeStableErrorMessage(message string) string {
 		ErrFarmRuntimeConfigMismatch.Error(),
 		ErrFarmRuntimeStale.Error(),
 		ErrFarmRuntimeCommand.Error(),
+		ErrFarmRuntimeLaunchMode.Error(),
 		ErrFarmAttestationInvalid.Error(),
 		ErrFarmAttestationNotReady.Error(),
 		ErrFarmAttestationTokenMismatch.Error(),
@@ -311,6 +321,7 @@ func (response FarmRuntimeCommandResponse) MarshalJSON() ([]byte, error) {
 type farmRuntimeRecord struct {
 	runtime            FarmRuntime
 	profileIncarnation string
+	launchMode         string
 }
 
 type farmRuntimeProfileGate struct {
@@ -527,6 +538,17 @@ func validateOpaqueConfigHash(requested, stored string) error {
 	return nil
 }
 
+func normalizeFarmRuntimeLaunchMode(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if value != FarmRuntimeLaunchModeDirectNoProxy {
+		return "", fmt.Errorf("%w: %q", ErrFarmRuntimeLaunchMode, value)
+	}
+	return value, nil
+}
+
 func farmRuntimeProfileTelemetry(profile *BrowserProfile) *FarmRuntimeProfile {
 	if profile == nil {
 		return nil
@@ -647,6 +669,10 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	if err := s.validateControllerIdentity(request.NodeUID, request.ProviderInstanceID, request.FencingEpoch); err != nil {
 		return FarmRuntime{}, err
 	}
+	launchMode, err := normalizeFarmRuntimeLaunchMode(request.LaunchMode)
+	if err != nil {
+		return FarmRuntime{}, err
+	}
 	release, err := s.acquire(profileID)
 	if err != nil {
 		return FarmRuntime{}, err
@@ -684,6 +710,10 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		if err := s.validateAgainstRecord(profileID, request.RuntimeUID, request.ProviderInstanceID, request.FencingEpoch, request.ConfigHash, request.Generation, record); err != nil {
 			return FarmRuntime{}, err
 		}
+		if launchMode != "" && record.launchMode != launchMode &&
+			(record.runtime.State == FarmRuntimeStateIdle || record.runtime.State == FarmRuntimeStateStarting) {
+			return FarmRuntime{}, fmt.Errorf("%w: owned runtime launch mode", ErrFarmRuntimeLaunchMode)
+		}
 		observed, observeErr := s.snapshot(profileID)
 		if observeErr != nil {
 			return FarmRuntime{}, observeErr
@@ -720,7 +750,11 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		}
 	}
 
-	profile, startErr := s.runtimeService.StartIfGeneration(profileID, existingActiveGeneration, expectedIncarnation)
+	startOptions := BrowserRuntimeStartOptions{}
+	if launchMode == FarmRuntimeLaunchModeDirectNoProxy {
+		startOptions.ForceDirectProxy = true
+	}
+	profile, startErr := s.runtimeService.StartIfGenerationWithOptions(profileID, existingActiveGeneration, expectedIncarnation, startOptions)
 	if errors.Is(startErr, ErrBrowserRuntimeProfileMismatch) {
 		return FarmRuntime{}, fmt.Errorf("%w: profile changed before start", ErrFarmRuntimeStale)
 	}
@@ -755,10 +789,11 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 			ConfigHash:         request.ConfigHash,
 			Generation:         observed.Generation,
 		},
-		State: FarmRuntimeStateIdle,
+		State:      FarmRuntimeStateIdle,
+		LaunchMode: launchMode,
 	}
 	runtime = farmRuntimeFromSnapshot(farmRuntimeRecord{runtime: runtime}, observed)
-	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation})
+	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, launchMode: launchMode})
 	if startErr != nil {
 		return runtime, startErr
 	}
@@ -1227,6 +1262,8 @@ func farmRuntimeWireError(err error) string {
 		return ErrFarmRuntimeNotFound.Error()
 	case errors.Is(err, ErrFarmRuntimeStale):
 		return ErrFarmRuntimeStale.Error()
+	case errors.Is(err, ErrFarmRuntimeLaunchMode):
+		return ErrFarmRuntimeLaunchMode.Error()
 	case errors.Is(err, ErrFarmRuntimeConfigMismatch):
 		return ErrFarmRuntimeConfigMismatch.Error()
 	case errors.Is(err, ErrFarmRuntimeServiceUnavailable):
@@ -1266,6 +1303,15 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		var request FarmRuntimeEnsureRequest
 		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
 			return FarmRuntimeCommandResponse{}, err
+		}
+		// The command surface is the Control WSS boundary for BF-P1.12. Keep
+		// the older in-process EnsureRuntime compatibility API permissive, but
+		// never allow a remote command to launch with an inherited/profile
+		// proxy or an omitted network policy.
+		if request.LaunchMode != FarmRuntimeLaunchModeDirectNoProxy {
+			err := fmt.Errorf("%w: command ensure requires explicit mode", ErrFarmRuntimeLaunchMode)
+			response.Error = farmRuntimeWireError(err)
+			return response, nil
 		}
 		runtime, err := s.EnsureRuntime(request)
 		if err != nil {
@@ -1326,6 +1372,34 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		response.Error = ErrFarmRuntimeCommand.Error()
 	}
 	return response, nil
+}
+
+// FarmRuntimeControlAdapter is the Wails-free Agent seam used by a Control
+// WSS transport. It deliberately delegates all lifecycle work to the shared
+// FarmRuntimeService; the adapter owns no process, CDP, or proxy state.
+type FarmRuntimeControlAdapter struct {
+	service *FarmRuntimeService
+}
+
+func NewFarmRuntimeControlAdapter(service *FarmRuntimeService) (*FarmRuntimeControlAdapter, error) {
+	if service == nil {
+		return nil, ErrFarmRuntimeServiceUnavailable
+	}
+	return &FarmRuntimeControlAdapter{service: service}, nil
+}
+
+func (adapter *FarmRuntimeControlAdapter) HandleCommand(command FarmRuntimeCommand) (FarmRuntimeCommandResponse, error) {
+	if adapter == nil || adapter.service == nil {
+		return FarmRuntimeCommandResponse{}, ErrFarmRuntimeServiceUnavailable
+	}
+	return adapter.service.HandleCommand(command)
+}
+
+func (adapter *FarmRuntimeControlAdapter) DispatchCommand(command FarmRuntimeCommand) FarmRuntimeCommandResponse {
+	if adapter == nil || adapter.service == nil {
+		return FarmRuntimeCommandResponse{Type: "command_response", Error: farmRuntimeWireError(ErrFarmRuntimeServiceUnavailable)}
+	}
+	return adapter.service.DispatchCommand(command)
 }
 
 // HandleCommandEnvelope is the explicit envelope-named entry point for a
