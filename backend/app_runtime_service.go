@@ -145,9 +145,14 @@ func (a *App) newBrowserRuntimeHost() BrowserRuntimeHost {
 				a.launchServer.SetActiveProfile(profile)
 			}
 		},
-		ClearActiveProfile: func(profileID string, _ uint64) {
+		SetActiveProfileGeneration: func(profile *browser.Profile, generation uint64) {
 			if a != nil && a.launchServer != nil {
-				a.launchServer.ClearActiveProfile(profileID)
+				a.launchServer.SetActiveProfileForGeneration(profile, generation)
+			}
+		},
+		ClearActiveProfile: func(profileID string, generation uint64) {
+			if a != nil && a.launchServer != nil {
+				a.launchServer.ClearActiveProfileIfGeneration(profileID, generation)
 			}
 		},
 		EmitStarted: func(profile *browser.Profile, reused bool) {
@@ -233,9 +238,7 @@ func (s *BrowserRuntimeService) WaitDebugReady(profileID string, debugPort int, 
 					s.mu.RLock()
 					host := s.host
 					s.mu.RUnlock()
-					if host.SetActiveProfile != nil {
-						host.SetActiveProfile(snapshot)
-					}
+					setBrowserRuntimeActiveProfile(host, snapshot, s.identity(profileID))
 					if host.EmitUpdated != nil {
 						host.EmitUpdated(snapshot)
 					}

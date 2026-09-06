@@ -104,12 +104,17 @@ type BrowserRuntimeHost struct {
 	StopProcess        func(*exec.Cmd) error
 	CanConnect         func(int, time.Duration) bool
 	SetActiveProfile   func(*browser.Profile)
-	ClearActiveProfile func(string, uint64)
-	EmitStarted        func(*browser.Profile, bool)
-	EmitUpdated        func(*browser.Profile)
-	EmitStopped        func(string)
-	EmitCrashed        func(string, string, error)
-	GetTabs            func(string) []browser.Tab
+	// SetActiveProfileGeneration is the fenced variant used by the service
+	// when the host has an active binding that can store runtime generations.
+	// Older external hosts may keep using SetActiveProfile as a compatibility
+	// fallback; the service itself never requires this optional callback.
+	SetActiveProfileGeneration func(*browser.Profile, uint64)
+	ClearActiveProfile         func(string, uint64)
+	EmitStarted                func(*browser.Profile, bool)
+	EmitUpdated                func(*browser.Profile)
+	EmitStopped                func(string)
+	EmitCrashed                func(string, string, error)
+	GetTabs                    func(string) []browser.Tab
 }
 
 // BrowserRuntimeLaunchPlan contains host-prepared launch inputs. The service
@@ -127,6 +132,8 @@ type BrowserRuntimeLaunchPlan struct {
 	effectiveProxy       string
 	acquiredProxyBridge  profileProxyBridgeRef
 	releaseProxyBridge   bool
+	planCleanupMu        sync.Mutex
+	planCleanupDone      bool
 	assignedDebugPort    int
 	startReadyTimeout    time.Duration
 	startStableWindow    time.Duration
@@ -146,7 +153,18 @@ type BrowserRuntimeProcess struct {
 	monitor     browserProcessMonitorAPI
 	owner       BrowserRuntimeProcessOwner
 	cleanupFn   func()
-	cleanupOnce sync.Once
+	cleanupMu   sync.Mutex
+	cleanupDone bool
+
+	// teardownMu serializes the destructive part of termination without ever
+	// making Cmd.Wait observable to the service. stopIssued ensures that a
+	// concurrent Stop/Shutdown pair sends only one termination request; the
+	// owner remains the sole reaper and teardownDone closes only after that owner
+	// has reported Done and cleanup has run.
+	teardownMu   sync.Mutex
+	stopIssued   bool
+	teardownDone chan struct{}
+	teardownErr  error
 }
 
 var (
@@ -155,6 +173,8 @@ var (
 	ErrBrowserRuntimeReapPending        = errors.New("browser runtime process reaping is pending")
 	ErrBrowserRuntimeGenerationMismatch = errors.New("browser runtime generation mismatch")
 	ErrBrowserRuntimeProfileMismatch    = errors.New("browser runtime profile incarnation mismatch")
+	ErrBrowserRuntimeServiceShutdown    = errors.New("browser runtime service is shut down")
+	ErrBrowserRuntimeShutdownTimeout    = errors.New("browser runtime shutdown timed out waiting for in-flight start")
 )
 
 // NewBrowserRuntimeProcess constructs a valid host-facing process result. The
@@ -178,17 +198,35 @@ func NewBrowserRuntimeProcess(cmd *exec.Cmd, owner BrowserRuntimeProcessOwner, m
 }
 
 func (p *BrowserRuntimeProcess) cleanup() {
-	if p == nil || p.cleanupFn == nil {
+	if p == nil {
 		return
 	}
-	p.cleanupOnce.Do(p.cleanupFn)
+	p.cleanupMu.Lock()
+	if p.cleanupDone {
+		p.cleanupMu.Unlock()
+		return
+	}
+	p.cleanupDone = true
+	cleanup := p.cleanupFn
+	p.cleanupFn = nil
+	p.cleanupMu.Unlock()
+	if cleanup != nil {
+		cleanup()
+	}
 }
 
-// adoptCleanup transfers a cleanup action to the process owner. It is called
-// before the service starts any monitor, so the wrapper is immutable while
-// cleanup may later run asynchronously.
+// adoptCleanup transfers a cleanup action to the process owner. A host may
+// return a terminal handle after it has already run its own cleanup; in that
+// case the newly adopted action is executed immediately so launch-plan
+// resources cannot be stranded behind an already-consumed cleanupOnce.
 func (p *BrowserRuntimeProcess) adoptCleanup(cleanup func()) {
 	if p == nil || cleanup == nil {
+		return
+	}
+	p.cleanupMu.Lock()
+	if p.cleanupDone {
+		p.cleanupMu.Unlock()
+		cleanup()
 		return
 	}
 	existing := p.cleanupFn
@@ -198,6 +236,72 @@ func (p *BrowserRuntimeProcess) adoptCleanup(cleanup func()) {
 		}
 		cleanup()
 	}
+	p.cleanupMu.Unlock()
+}
+
+func (p *BrowserRuntimeProcess) beginTeardown() (chan struct{}, bool) {
+	if p == nil {
+		return nil, false
+	}
+	p.teardownMu.Lock()
+	defer p.teardownMu.Unlock()
+	if p.teardownDone == nil {
+		p.teardownDone = make(chan struct{})
+	}
+	if p.stopIssued {
+		return p.teardownDone, false
+	}
+	p.stopIssued = true
+	return p.teardownDone, true
+}
+
+func (p *BrowserRuntimeProcess) recordTeardownError(err error) {
+	if p == nil || err == nil {
+		return
+	}
+	p.teardownMu.Lock()
+	p.teardownErr = errors.Join(p.teardownErr, err)
+	p.teardownMu.Unlock()
+}
+
+func (p *BrowserRuntimeProcess) teardownError() error {
+	if p == nil {
+		return nil
+	}
+	p.teardownMu.Lock()
+	err := p.teardownErr
+	p.teardownMu.Unlock()
+	return err
+}
+
+func (p *BrowserRuntimeProcess) completeTeardown() {
+	if p == nil {
+		return
+	}
+	p.cleanup()
+	p.teardownMu.Lock()
+	if p.teardownDone == nil {
+		p.teardownDone = make(chan struct{})
+	}
+	select {
+	case <-p.teardownDone:
+	default:
+		close(p.teardownDone)
+	}
+	p.teardownMu.Unlock()
+}
+
+func (p *BrowserRuntimeProcess) teardownCompletion() <-chan struct{} {
+	if p == nil {
+		return nil
+	}
+	p.teardownMu.Lock()
+	if p.teardownDone == nil {
+		p.teardownDone = make(chan struct{})
+	}
+	done := p.teardownDone
+	p.teardownMu.Unlock()
+	return done
 }
 
 func isNilBrowserRuntimeOwner(owner BrowserRuntimeProcessOwner) bool {
@@ -338,6 +442,16 @@ type browserRuntimePendingReap struct {
 	profile string
 }
 
+// browserRuntimeOwnedProcess records the exact process handle admitted by
+// this service for an active runtime. The identity carries both the opaque
+// generation and the Manager profile pointer incarnation. Shutdown must
+// verify both before it is allowed to mutate the shared profile state.
+type browserRuntimeOwnedProcess struct {
+	profileID string
+	process   *BrowserRuntimeProcess
+	identity  browserRuntimeIdentity
+}
+
 // BrowserRuntimeService is the single lifecycle owner. Manager remains the
 // sole source of profile/process state; the service adds operation gates.
 type BrowserRuntimeService struct {
@@ -369,7 +483,17 @@ type BrowserRuntimeService struct {
 	pendingMu sync.Mutex
 	pending   map[*BrowserRuntimeProcess]browserRuntimePendingReap
 	processMu sync.Mutex
-	processes map[string]*BrowserRuntimeProcess
+	processes map[string]browserRuntimeOwnedProcess
+
+	// startAdmission tracks every in-flight Start call. Shutdown flips shutdown
+	// before waiting, so new Starts are rejected immediately; the bounded wait
+	// prevents a host callback that never returns from blocking Shutdown forever.
+	startAdmissionMu       sync.Mutex
+	startAdmissionIdle     chan struct{}
+	startAdmissionInFlight int
+	shutdown               bool
+	shutdownCallMu         sync.Mutex
+	shutdownWaitTimeout    time.Duration
 
 	// These seams are intentionally unexported. Production keeps the original
 	// 15-second attach grace and 500ms detached probe interval; package tests
@@ -396,7 +520,7 @@ func NewBrowserRuntimeService(config ...BrowserRuntimeServiceConfig) *BrowserRun
 	if len(config) > 0 {
 		cfg = config[0]
 	}
-	return &BrowserRuntimeService{
+	service := &BrowserRuntimeService{
 		manager:               cfg.Manager,
 		config:                cfg.Config,
 		xrayMgr:               cfg.XrayMgr,
@@ -414,8 +538,11 @@ func NewBrowserRuntimeService(config ...BrowserRuntimeServiceConfig) *BrowserRun
 		deferred:              make(map[string]browserRuntimeDeferredTargets),
 		proxyRefs:             make(map[string]browserRuntimeProxyRef),
 		pending:               make(map[*BrowserRuntimeProcess]browserRuntimePendingReap),
-		processes:             make(map[string]*BrowserRuntimeProcess),
+		processes:             make(map[string]browserRuntimeOwnedProcess),
 	}
+	service.startAdmissionIdle = make(chan struct{})
+	close(service.startAdmissionIdle)
+	return service
 }
 
 func (s *BrowserRuntimeService) SetManager(manager *browser.Manager) {
@@ -445,16 +572,29 @@ func (s *BrowserRuntimeService) SetHost(host BrowserRuntimeHost) {
 	s.mu.Unlock()
 }
 
-func (s *BrowserRuntimeService) trackProcess(profileID string, process *BrowserRuntimeProcess) {
+func (s *BrowserRuntimeService) trackProcess(profileID string, process *BrowserRuntimeProcess, identity ...browserRuntimeIdentity) {
 	if s == nil || process == nil || strings.TrimSpace(profileID) == "" {
 		return
 	}
 	profileID = strings.TrimSpace(profileID)
+	ownedIdentity := browserRuntimeIdentity{}
+	if len(identity) > 0 {
+		ownedIdentity = identity[0]
+	} else {
+		ownedIdentity = s.identity(profileID)
+	}
+	if ownedIdentity.generation == 0 || ownedIdentity.profile == nil || ownedIdentity.cmd != process.cmd {
+		return
+	}
 	s.processMu.Lock()
 	if s.processes == nil {
-		s.processes = make(map[string]*BrowserRuntimeProcess)
+		s.processes = make(map[string]browserRuntimeOwnedProcess)
 	}
-	s.processes[profileID] = process
+	s.processes[profileID] = browserRuntimeOwnedProcess{
+		profileID: profileID,
+		process:   process,
+		identity:  ownedIdentity,
+	}
 	s.processMu.Unlock()
 	process.adoptCleanup(func() { s.untrackProcess(profileID, process) })
 }
@@ -464,7 +604,7 @@ func (s *BrowserRuntimeService) untrackProcess(profileID string, process *Browse
 		return
 	}
 	s.processMu.Lock()
-	if current := s.processes[profileID]; current == process {
+	if current := s.processes[profileID]; current.process == process {
 		delete(s.processes, profileID)
 	}
 	s.processMu.Unlock()
@@ -475,9 +615,24 @@ func (s *BrowserRuntimeService) processFor(profileID string) *BrowserRuntimeProc
 		return nil
 	}
 	s.processMu.Lock()
-	process := s.processes[profileID]
+	process := s.processes[profileID].process
 	s.processMu.Unlock()
 	return process
+}
+
+func (s *BrowserRuntimeService) ownedProcessSnapshots() []browserRuntimeOwnedProcess {
+	if s == nil {
+		return nil
+	}
+	s.processMu.Lock()
+	entries := make([]browserRuntimeOwnedProcess, 0, len(s.processes))
+	for _, entry := range s.processes {
+		if entry.process != nil {
+			entries = append(entries, entry)
+		}
+	}
+	s.processMu.Unlock()
+	return entries
 }
 
 func (s *BrowserRuntimeService) bookmarkSnapshot() []BrowserBookmark {
@@ -813,10 +968,43 @@ func (s *BrowserRuntimeService) releaseProxyBridge(ref profileProxyBridgeRef) {
 }
 
 func (s *BrowserRuntimeService) releaseStartPlan(plan *BrowserRuntimeLaunchPlan) {
-	if plan == nil || !plan.releaseProxyBridge {
+	if plan == nil {
 		return
 	}
-	s.releaseProxyBridge(plan.acquiredProxyBridge)
+	plan.planCleanupMu.Lock()
+	if plan.planCleanupDone {
+		plan.planCleanupMu.Unlock()
+		return
+	}
+	if !plan.releaseProxyBridge {
+		plan.planCleanupDone = true
+		plan.planCleanupMu.Unlock()
+		return
+	}
+	ref := plan.acquiredProxyBridge
+	plan.releaseProxyBridge = false
+	plan.planCleanupDone = true
+	plan.planCleanupMu.Unlock()
+	s.releaseProxyBridge(ref)
+}
+
+// takeStartPlanProxyForBinding transfers the launch-plan bridge lease to the
+// per-profile runtime binding. The transfer is atomic with respect to the
+// deferred/adopted launch-plan cleanup action, so a concurrent teardown can
+// release the lease at most once and can never release a bridge already owned
+// by the running profile.
+func takeStartPlanProxyForBinding(plan *BrowserRuntimeLaunchPlan) (profileProxyBridgeRef, bool) {
+	if plan == nil {
+		return profileProxyBridgeRef{}, false
+	}
+	plan.planCleanupMu.Lock()
+	defer plan.planCleanupMu.Unlock()
+	if plan.planCleanupDone || !plan.releaseProxyBridge || !plan.acquiredProxyBridge.valid() {
+		return profileProxyBridgeRef{}, false
+	}
+	plan.releaseProxyBridge = false
+	plan.planCleanupDone = true
+	return plan.acquiredProxyBridge, true
 }
 
 func (s *BrowserRuntimeService) bindProxy(profileID string, identity browserRuntimeIdentity, ref profileProxyBridgeRef) {
@@ -859,6 +1047,134 @@ func (s *BrowserRuntimeService) hostSnapshot() (BrowserRuntimeHost, error) {
 	return host, nil
 }
 
+func setBrowserRuntimeActiveProfile(host BrowserRuntimeHost, profile *browser.Profile, identity browserRuntimeIdentity) {
+	if profile == nil || identity.generation == 0 {
+		return
+	}
+	if host.SetActiveProfileGeneration != nil {
+		host.SetActiveProfileGeneration(profile, identity.generation)
+		return
+	}
+	if host.SetActiveProfile != nil {
+		host.SetActiveProfile(profile)
+	}
+}
+
+// restoreActiveProfileAfterStaleClear is a compatibility guard for hosts that
+// still expose only the legacy ClearActiveProfile callback. The service uses a
+// generation-aware callback when available, but an older callback can block
+// after stopState has fenced the old identity and then clear a replacement
+// binding. Re-applying the still-current binding after that callback returns
+// closes the stale tail without touching any Manager profile.
+func (s *BrowserRuntimeService) restoreActiveProfileAfterStaleClear(host BrowserRuntimeHost, profileID string, stale browserRuntimeIdentity) {
+	if s == nil {
+		return
+	}
+	current := s.identity(profileID)
+	if current.generation == 0 || sameBrowserRuntimeIdentity(current, stale) {
+		return
+	}
+	manager := s.Manager()
+	if manager == nil {
+		return
+	}
+	manager.Mutex.Lock()
+	profile := manager.Profiles[profileID]
+	if profile == nil || profile != current.profile || !profile.Running || !profile.DebugReady {
+		manager.Mutex.Unlock()
+		return
+	}
+	snapshot := copyBrowserProfileSnapshot(profile)
+	manager.Mutex.Unlock()
+	if !s.identityMatches(profileID, current) {
+		return
+	}
+	setBrowserRuntimeActiveProfile(host, snapshot, current)
+}
+
+func (s *BrowserRuntimeService) acquireStartAdmission() (func(), error) {
+	if s == nil {
+		return nil, fmt.Errorf("browser runtime service is nil")
+	}
+	s.startAdmissionMu.Lock()
+	if s.shutdown {
+		s.startAdmissionMu.Unlock()
+		return nil, ErrBrowserRuntimeServiceShutdown
+	}
+	if s.startAdmissionInFlight == 0 {
+		s.startAdmissionIdle = make(chan struct{})
+	}
+	s.startAdmissionInFlight++
+	s.startAdmissionMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.startAdmissionMu.Lock()
+			s.startAdmissionInFlight--
+			if s.startAdmissionInFlight == 0 {
+				close(s.startAdmissionIdle)
+			}
+			s.startAdmissionMu.Unlock()
+		})
+	}, nil
+}
+
+func (s *BrowserRuntimeService) closeStartAdmission() error {
+	s.startAdmissionMu.Lock()
+	s.shutdown = true
+	if s.startAdmissionInFlight == 0 {
+		s.startAdmissionMu.Unlock()
+		return nil
+	}
+	if s.startAdmissionIdle == nil {
+		s.startAdmissionIdle = make(chan struct{})
+	}
+	idle := s.startAdmissionIdle
+	waitTimeout := s.shutdownWaitTimeout
+	if waitTimeout <= 0 {
+		waitTimeout = browserRuntimeProcessReapTimeout
+	}
+	s.startAdmissionMu.Unlock()
+
+	deadline := time.Now().Add(waitTimeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			s.startAdmissionMu.Lock()
+			inFlight := s.startAdmissionInFlight
+			s.startAdmissionMu.Unlock()
+			if inFlight > 0 {
+				return fmt.Errorf("%w: %d Start call(s) still in flight", ErrBrowserRuntimeShutdownTimeout, inFlight)
+			}
+			return nil
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-idle:
+			timer.Stop()
+			return nil
+		case <-timer.C:
+			s.startAdmissionMu.Lock()
+			inFlight := s.startAdmissionInFlight
+			s.startAdmissionMu.Unlock()
+			if inFlight == 0 {
+				return nil
+			}
+			return fmt.Errorf("%w: %d Start call(s) still in flight", ErrBrowserRuntimeShutdownTimeout, inFlight)
+		}
+	}
+}
+
+func (s *BrowserRuntimeService) startAdmissionClosed() bool {
+	if s == nil {
+		return true
+	}
+	s.startAdmissionMu.Lock()
+	closed := s.shutdown
+	s.startAdmissionMu.Unlock()
+	return closed
+}
+
 func (s *BrowserRuntimeService) hasPendingReap(profileID string) bool {
 	if s == nil {
 		return false
@@ -881,6 +1197,19 @@ func (s *BrowserRuntimeService) registerPendingReap(process *BrowserRuntimeProce
 	if plan != nil {
 		profileID = plan.Spec.ProfileID
 	}
+	// Shutdown tears down an already-admitted active process without a launch
+	// plan. Recover its service-owned profile identity before registering the
+	// pending reap so callers can continue to gate/status that exact profile.
+	if profileID == "" {
+		s.processMu.Lock()
+		for candidateID, entry := range s.processes {
+			if entry.process == process {
+				profileID = candidateID
+				break
+			}
+		}
+		s.processMu.Unlock()
+	}
 	s.pendingMu.Lock()
 	if s.pending == nil {
 		s.pending = make(map[*BrowserRuntimeProcess]browserRuntimePendingReap)
@@ -897,36 +1226,143 @@ func (s *BrowserRuntimeService) registerPendingReap(process *BrowserRuntimeProce
 		// Result is a non-blocking read after Done by contract. This is the
 		// only completion observer; it never calls Cmd.Wait.
 		_ = process.owner.Result()
-		process.cleanup()
-		s.pendingMu.Lock()
-		delete(s.pending, process)
-		s.pendingMu.Unlock()
+		process.completeTeardown()
+		s.removePendingReap(process)
 	}()
 }
 
-// Shutdown requests termination of every process whose owner has not yet
-// reached Done. A process that still cannot be observed is retained in the
-// pending registry; its owner completion callback will eventually release its
-// process and launch-plan/proxy resources exactly once.
-func (s *BrowserRuntimeService) Shutdown() error {
+func (s *BrowserRuntimeService) removePendingReap(process *BrowserRuntimeProcess) {
+	if s == nil || process == nil {
+		return
+	}
+	s.pendingMu.Lock()
+	delete(s.pending, process)
+	s.pendingMu.Unlock()
+}
+
+func (s *BrowserRuntimeService) pendingReapSnapshots() []browserRuntimePendingReap {
 	if s == nil {
 		return nil
-	}
-	host, err := s.hostSnapshot()
-	if err != nil {
-		return err
 	}
 	s.pendingMu.Lock()
 	entries := make([]browserRuntimePendingReap, 0, len(s.pending))
 	for _, pending := range s.pending {
-		entries = append(entries, pending)
+		if pending.process != nil {
+			entries = append(entries, pending)
+		}
 	}
 	s.pendingMu.Unlock()
+	return entries
+}
+
+func (s *BrowserRuntimeService) shutdownHostSnapshot() (BrowserRuntimeHost, error) {
+	if s == nil {
+		return BrowserRuntimeHost{}, fmt.Errorf("browser runtime service is nil")
+	}
+	s.mu.RLock()
+	host := s.host
+	s.mu.RUnlock()
+	if host.StopProcess == nil {
+		return BrowserRuntimeHost{}, fmt.Errorf("browser runtime host has no stop capability")
+	}
+	return host, nil
+}
+
+func (s *BrowserRuntimeService) ownedProcessMatchesCurrent(entry browserRuntimeOwnedProcess) error {
+	if entry.process == nil || entry.identity.generation == 0 || entry.identity.profile == nil {
+		return fmt.Errorf("%w: service-owned process record is incomplete", ErrBrowserRuntimeProfileMismatch)
+	}
+	if !sameBrowserRuntimeIdentity(s.identity(entry.profileID), entry.identity) {
+		return fmt.Errorf("%w: active identity changed for profile %s", ErrBrowserRuntimeProfileMismatch, entry.profileID)
+	}
+	manager := s.Manager()
+	if manager == nil {
+		return fmt.Errorf("browser manager is not initialized")
+	}
+	manager.Mutex.Lock()
+	profile := manager.Profiles[entry.profileID]
+	manager.Mutex.Unlock()
+	if profile != entry.identity.profile {
+		return fmt.Errorf("%w: active profile incarnation changed for profile %s", ErrBrowserRuntimeProfileMismatch, entry.profileID)
+	}
+	return nil
+}
+
+// Shutdown terminates only process handles admitted by this service. It never
+// walks Manager.Profiles or Manager.BrowserProcesses: a running profile with
+// no matching service-owned record may belong to a recovered runtime, another
+// Wails session, or an external host and must remain untouched.
+//
+// The write side of startAdmission waits for every in-flight Start to leave
+// its read section, then closes admission before taking ownership snapshots.
+// A profile incarnation mismatch is reported and its process record is kept;
+// this prevents a stale service operation from mutating a replacement profile
+// while making it impossible to report a clean shutdown with an unaccounted
+// owner still alive.
+func (s *BrowserRuntimeService) Shutdown() error {
+	if s == nil {
+		return nil
+	}
+	s.shutdownCallMu.Lock()
+	defer s.shutdownCallMu.Unlock()
+	admissionErr := s.closeStartAdmission()
+	if admissionErr != nil {
+		// A host launch callback may still be running. It will observe the
+		// closed admission before it can publish state, and will retain/reap
+		// any process it returns. Do not claim a clean shutdown yet.
+		return admissionErr
+	}
+	active := s.ownedProcessSnapshots()
+	pending := s.pendingReapSnapshots()
+	if len(active) == 0 && len(pending) == 0 {
+		return nil
+	}
+	host, err := s.shutdownHostSnapshot()
+	if err != nil {
+		return err
+	}
 	var errs []error
-	for _, pending := range entries {
-		if err := s.stopAndCleanupBrowserRuntimeProcess(host, pending.process, pending.plan); err != nil {
-			errs = append(errs, err)
+	seen := make(map[*BrowserRuntimeProcess]struct{}, len(active)+len(pending))
+	for _, entry := range active {
+		releaseProfile, gateErr := s.acquire(entry.profileID)
+		if gateErr != nil {
+			errs = append(errs, fmt.Errorf("profile %s shutdown gate: %w", entry.profileID, gateErr))
+			continue
 		}
+		if err := s.ownedProcessMatchesCurrent(entry); err != nil {
+			// Keep the process record and owner for a later explicit, correctly
+			// fenced operation. Shutdown must not kill a handle after its profile
+			// incarnation or generation no longer matches.
+			errs = append(errs, fmt.Errorf("profile %s shutdown skipped: %w", entry.profileID, err))
+			releaseProfile()
+			continue
+		}
+		teardownErr := s.stopAndCleanupBrowserRuntimeProcessForShutdown(host, entry.process, nil)
+		if teardownErr != nil {
+			errs = append(errs, fmt.Errorf("profile %s shutdown: %w", entry.profileID, teardownErr))
+		}
+		seen[entry.process] = struct{}{}
+		if errors.Is(teardownErr, ErrBrowserRuntimeReapPending) {
+			releaseProfile()
+			continue
+		}
+		if _, stopped := s.stopState(host, entry.profileID, &entry.identity); stopped && host.EmitStopped != nil {
+			host.EmitStopped(entry.profileID)
+		}
+		releaseProfile()
+	}
+	for _, entry := range pending {
+		if entry.process == nil {
+			continue
+		}
+		if _, alreadyHandled := seen[entry.process]; alreadyHandled {
+			continue
+		}
+		teardownErr := s.stopAndCleanupBrowserRuntimeProcessForShutdown(host, entry.process, entry.plan)
+		if teardownErr != nil {
+			errs = append(errs, fmt.Errorf("pending browser runtime shutdown: %w", teardownErr))
+		}
+		seen[entry.process] = struct{}{}
 	}
 	return errors.Join(errs...)
 }
@@ -999,6 +1435,11 @@ func (s *BrowserRuntimeService) Start(profileID string) (*browser.Profile, error
 
 func (s *BrowserRuntimeService) StartWithOptions(profileID string, options BrowserRuntimeStartOptions) (*browser.Profile, error) {
 	profileID = strings.TrimSpace(profileID)
+	releaseAdmission, err := s.acquireStartAdmission()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAdmission()
 	return s.withProfileResult(profileID, func(host BrowserRuntimeHost) (*browser.Profile, error) {
 		return s.startLocked(host, BrowserRuntimeStartRequest{ProfileID: profileID, Options: cloneBrowserRuntimeStartOptions(options)})
 	})
@@ -1014,6 +1455,11 @@ func (s *BrowserRuntimeService) StartIfGeneration(profileID string, generation u
 	if profileID == "" || strings.TrimSpace(profileIncarnation) == "" {
 		return nil, fmt.Errorf("%w: profile identity is required", ErrBrowserRuntimeProfileMismatch)
 	}
+	releaseAdmission, err := s.acquireStartAdmission()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAdmission()
 	host, err := s.hostSnapshot()
 	if err != nil {
 		return nil, err
@@ -1139,9 +1585,9 @@ func (s *BrowserRuntimeService) statusLocked(host BrowserRuntimeHost, profileID 
 
 	// Match BrowserInstanceStatus: adoption makes this runtime active but is
 	// a read/status operation, so it does not emit browser:instance:started.
-	if host.SetActiveProfile != nil && identity.generation != 0 {
+	if identity.generation != 0 {
 		if current, err := s.profileSnapshot(profileID); err == nil {
-			host.SetActiveProfile(current)
+			setBrowserRuntimeActiveProfile(host, current, identity)
 		}
 	}
 	return s.profileSnapshot(profileID)
@@ -1240,6 +1686,112 @@ func (s *BrowserRuntimeService) StopIfGeneration(profileID string, generation ui
 	})
 }
 
+// markStaleRuntimeStoppedIfCurrent commits the fail-closed transition used when
+// an App OpenUrl liveness probe has already proved that a runtime is gone. The
+// profile pointer and identity captured by the probe are checked after the
+// service gate is acquired; a replacement Start that wins between the probe
+// and this transition is therefore left untouched. Service-owned process
+// handles are terminated through stopLocked, while an unowned Manager command
+// or recovered runtime has no kill authority and is only fenced out of service
+// state. The stopped event and stale error are published while the same gate is
+// held, so a replacement cannot be poisoned after the transition check.
+func (s *BrowserRuntimeService) markStaleRuntimeStoppedIfCurrent(profileID string, expectedIdentity browserRuntimeIdentity, expectedProfile *browser.Profile, staleError string) (*browser.Profile, bool, error) {
+	profileID = strings.TrimSpace(profileID)
+	if s == nil {
+		return nil, false, fmt.Errorf("browser runtime service is nil")
+	}
+	release, err := s.acquire(profileID)
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
+	s.mu.RLock()
+	host := s.host
+	s.mu.RUnlock()
+	manager := s.Manager()
+	if manager == nil {
+		return nil, false, fmt.Errorf("browser manager is not initialized")
+	}
+	manager.Mutex.Lock()
+	profile := manager.Profiles[profileID]
+	if profile == nil {
+		manager.Mutex.Unlock()
+		return nil, false, fmt.Errorf("profile not found")
+	}
+	identity := s.identity(profileID)
+	if expectedProfile != nil && profile != expectedProfile {
+		snapshot := copyBrowserProfileSnapshot(profile)
+		manager.Mutex.Unlock()
+		return snapshot, false, nil
+	}
+	if expectedIdentity.generation != 0 {
+		if !sameBrowserRuntimeIdentity(identity, expectedIdentity) {
+			snapshot := copyBrowserProfileSnapshot(profile)
+			manager.Mutex.Unlock()
+			return snapshot, false, nil
+		}
+	} else if identity.generation != 0 {
+		snapshot := copyBrowserProfileSnapshot(profile)
+		manager.Mutex.Unlock()
+		return snapshot, false, nil
+	}
+	running := profile.Running
+	manager.Mutex.Unlock()
+	if !running {
+		return s.currentProfileSnapshot(profileID, profile), false, nil
+	}
+
+	if process := s.processFor(profileID); process != nil {
+		if host.StopProcess == nil {
+			return s.currentProfileSnapshot(profileID, profile), false, fmt.Errorf("browser runtime stop unavailable: service-owned process has no stop capability")
+		}
+		snapshot, stopErr := s.stopLocked(host, profileID)
+		if errors.Is(stopErr, ErrBrowserRuntimeReapPending) {
+			return snapshot, false, stopErr
+		}
+		if snapshot == nil {
+			snapshot = s.currentProfileSnapshot(profileID, profile)
+		}
+		if staleError != "" {
+			manager.Mutex.Lock()
+			if current := manager.Profiles[profileID]; current != nil && (expectedProfile == nil || current == expectedProfile) && !current.Running {
+				current.LastError = staleError
+				snapshot = copyBrowserProfileSnapshot(current)
+			}
+			manager.Mutex.Unlock()
+		}
+		return snapshot, snapshot != nil && !snapshot.Running, stopErr
+	}
+	var expected *browserRuntimeIdentity
+	if identity.generation != 0 {
+		expected = &identity
+	}
+	snapshot, stopped := s.stopState(host, profileID, expected)
+	if !stopped {
+		return snapshot, false, nil
+	}
+	if staleError != "" {
+		manager.Mutex.Lock()
+		if current := manager.Profiles[profileID]; current != nil && (expectedProfile == nil || current == expectedProfile) && !current.Running {
+			current.LastError = staleError
+			snapshot = copyBrowserProfileSnapshot(current)
+		}
+		manager.Mutex.Unlock()
+	}
+	if host.EmitStopped != nil {
+		host.EmitStopped(profileID)
+	}
+	return snapshot, true, nil
+}
+
+// markStaleRuntimeStopped retains the package-local compatibility entrypoint
+// for callers that do not have a liveness observation to fence. OpenUrl uses
+// markStaleRuntimeStoppedIfCurrent instead.
+func (s *BrowserRuntimeService) markStaleRuntimeStopped(profileID string) (*browser.Profile, error) {
+	snapshot, _, err := s.markStaleRuntimeStoppedIfCurrent(profileID, browserRuntimeIdentity{}, nil, "")
+	return snapshot, err
+}
+
 func (s *BrowserRuntimeService) stopLocked(host BrowserRuntimeHost, profileID string) (*browser.Profile, error) {
 	manager := s.Manager()
 	if manager == nil {
@@ -1333,10 +1885,10 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 	if running {
 		live := host.IsProfileLive == nil || host.IsProfileLive(profile, trackedCmd)
 		if live {
-			s.ensureIdentity(profileID, profile.Pid, profile.DebugPort, trackedCmd)
+			identity := s.ensureIdentity(profileID, profile.Pid, profile.DebugPort, trackedCmd)
 			if len(normalizeNonEmptyStrings(request.Options.StartURLs)) == 0 && len(normalizeNonEmptyStrings(request.Options.ExtraLaunchArgs)) == 0 {
-				if host.SetActiveProfile != nil && profile.DebugReady {
-					host.SetActiveProfile(profile)
+				if profile.DebugReady {
+					setBrowserRuntimeActiveProfile(host, profile, identity)
 				}
 				if host.EmitStarted != nil {
 					host.EmitStarted(profile, true)
@@ -1353,8 +1905,8 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 				manager.Mutex.Unlock()
 				return profile, startErr
 			}
-			if host.SetActiveProfile != nil && profile.DebugReady {
-				host.SetActiveProfile(profile)
+			if profile.DebugReady {
+				setBrowserRuntimeActiveProfile(host, profile, identity)
 			}
 			if host.EmitStarted != nil {
 				host.EmitStarted(profile, true)
@@ -1382,7 +1934,16 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 		}
 		return s.currentProfileSnapshot(profileID, profile), fmt.Errorf("实例启动失败：实例配置在启动准备期间发生变化，请重试。")
 	}
+	// The host process callback runs outside Manager.Mutex. Retain the exact
+	// pointer/value fence committed immediately before launch so a Manager
+	// update or delete/recreate during StartProcess cannot let this child become
+	// the runtime of a replacement profile.
+	launchIncarnation := prepareIncarnation
+	launchRevision := copyBrowserProfileSnapshot(profile)
 	if err == errBrowserStartHandledByRecoveredRuntime {
+		if fenceErr := s.startProfileFenceError(profileID, launchRevision, launchIncarnation); fenceErr != nil {
+			return s.currentProfileSnapshot(profileID, profile), fenceErr
+		}
 		identity := s.markRunning(profileID, profile, nil, profile.Pid, profile.DebugPort, true, "")
 		manager.Mutex.Lock()
 		if current := manager.Profiles[profileID]; current != nil && s.identityMatches(profileID, identity) {
@@ -1401,9 +1962,7 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 				return profile, startErr
 			}
 		}
-		if host.SetActiveProfile != nil {
-			host.SetActiveProfile(profile)
-		}
+		setBrowserRuntimeActiveProfile(host, profile, identity)
 		if host.EmitStarted != nil {
 			manager.Mutex.Lock()
 			profile = copyBrowserProfileSnapshot(manager.Profiles[profileID])
@@ -1426,7 +1985,17 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 	}()
 
 	process, err := host.StartProcess(plan)
+	if err == nil && s.startAdmissionClosed() {
+		shutdownErr := ErrBrowserRuntimeServiceShutdown
+		if process != nil && process.cmd != nil && process.owner != nil && process.owner.Done() != nil {
+			processOwnsPlan.Store(true)
+			process.adoptCleanup(func() { s.releaseStartPlan(plan) })
+			shutdownErr = errors.Join(shutdownErr, s.stopAndCleanupBrowserRuntimeProcess(host, process, plan))
+		}
+		return s.currentProfileSnapshot(profileID, profile), shutdownErr
+	}
 	if err != nil {
+		fenceErr := s.startProfileFenceError(profileID, launchRevision, launchIncarnation)
 		if process != nil && process.cmd != nil && process.owner != nil && process.owner.Done() != nil {
 			// A host may return a started process together with an error after a
 			// bounded local-factory cleanup attempt. Transfer plan ownership before
@@ -1441,11 +2010,16 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 			}
 		}
 		manager.Mutex.Lock()
-		if current := manager.Profiles[profileID]; current != nil {
-			current.LastError = err.Error()
-			profile = current
+		if fenceErr == nil {
+			if current := manager.Profiles[profileID]; current != nil {
+				current.LastError = err.Error()
+				profile = current
+			}
 		}
 		manager.Mutex.Unlock()
+		if fenceErr != nil {
+			return s.currentProfileSnapshot(profileID, profile), errors.Join(err, fenceErr)
+		}
 		return profile, err
 	}
 	if process != nil && process.cmd != nil && process.owner != nil && process.owner.Done() != nil {
@@ -1459,9 +2033,11 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 				invalidHandleErr = errors.Join(invalidHandleErr, teardownErr)
 			}
 		}
+		if fenceErr := s.startProfileFenceError(profileID, launchRevision, launchIncarnation); fenceErr != nil {
+			return s.currentProfileSnapshot(profileID, profile), errors.Join(invalidHandleErr, fenceErr)
+		}
 		return profile, invalidHandleErr
 	}
-	s.trackProcess(profileID, process)
 	processOwned := true
 	defer func() {
 		if processOwned {
@@ -1477,17 +2053,22 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 	for attempt := 1; attempt <= attempts; attempt++ {
 		stablePort, readyErr := waitBrowserDebugPortStable(plan.assignedDebugPort, plan.userDataDir, plan.startReadyTimeout, plan.startStableWindow, process.monitor)
 		if readyErr == nil {
+			if fenceErr := s.startProfileFenceError(profileID, launchRevision, launchIncarnation); fenceErr != nil {
+				teardownErr := s.stopAndCleanupBrowserRuntimeProcess(host, process, plan)
+				processOwned = false
+				return s.currentProfileSnapshot(profileID, profile), errors.Join(fenceErr, teardownErr)
+			}
 			identity := s.markRunning(profileID, profile, process.cmd, process.cmd.Process.Pid, stablePort, true, "")
-			if plan.acquiredProxyBridge.valid() {
-				s.bindProxy(profileID, identity, plan.acquiredProxyBridge)
-				plan.releaseProxyBridge = false
+			s.trackProcess(profileID, process, identity)
+			if proxyBridge, acquired := takeStartPlanProxyForBinding(plan); acquired {
+				s.bindProxy(profileID, identity, proxyBridge)
 			}
 			if err := s.openDeferredTargets(host, stablePort, plan.deferredStartTargets, plan.deferredStartNewTabs); err != nil {
 				s.setRuntimeWarning(profileID, identity, deferredStartTargetsWarning(plan.deferredStartTargets, err))
 			}
 			profile = s.currentProfileSnapshot(profileID, profile)
-			if host.SetActiveProfile != nil && profile.DebugReady {
-				host.SetActiveProfile(profile)
+			if profile.DebugReady {
+				setBrowserRuntimeActiveProfile(host, profile, identity)
 			}
 			if host.EmitStarted != nil {
 				host.EmitStarted(profile, false)
@@ -1504,15 +2085,20 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 	}
 
 	if shouldKeepBrowserRunningPendingDebugReady(plan.assignedDebugPort, process.monitor) {
+		if fenceErr := s.startProfileFenceError(profileID, launchRevision, launchIncarnation); fenceErr != nil {
+			teardownErr := s.stopAndCleanupBrowserRuntimeProcess(host, process, plan)
+			processOwned = false
+			return s.currentProfileSnapshot(profileID, profile), errors.Join(fenceErr, teardownErr)
+		}
 		warning := browserDebugPendingWarning(plan.totalReadyTimeout)
 		pendingNotice := browserDebugPendingStartNotice(plan.totalReadyTimeout)
 		identity := s.markRunning(profileID, profile, process.cmd, process.cmd.Process.Pid, plan.assignedDebugPort, false, warning)
+		s.trackProcess(profileID, process, identity)
 		if len(plan.deferredStartTargets) > 0 {
 			s.storeDeferredTargets(profileID, identity, plan.deferredStartTargets, plan.deferredStartNewTabs)
 		}
-		if plan.acquiredProxyBridge.valid() {
-			s.bindProxy(profileID, identity, plan.acquiredProxyBridge)
-			plan.releaseProxyBridge = false
+		if proxyBridge, acquired := takeStartPlanProxyForBinding(plan); acquired {
+			s.bindProxy(profileID, identity, proxyBridge)
 		}
 		profile = s.currentProfileSnapshot(profileID, profile)
 		if host.EmitStarted != nil {
@@ -1538,6 +2124,9 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 	if teardownErr != nil {
 		lastStartErr = errors.Join(lastStartErr, teardownErr)
 	}
+	if fenceErr := s.startProfileFenceError(profileID, launchRevision, launchIncarnation); fenceErr != nil {
+		return s.currentProfileSnapshot(profileID, profile), errors.Join(lastStartErr, fenceErr)
+	}
 	s.clearDeferredTargets(profileID, s.identity(profileID).generation)
 	manager.Mutex.Lock()
 	if current := manager.Profiles[profileID]; current != nil {
@@ -1551,11 +2140,30 @@ func (s *BrowserRuntimeService) startLocked(host BrowserRuntimeHost, request Bro
 const browserRuntimeProcessReapTimeout = 5 * time.Second
 
 func (s *BrowserRuntimeService) stopAndCleanupBrowserRuntimeProcess(host BrowserRuntimeHost, process *BrowserRuntimeProcess, plan *BrowserRuntimeLaunchPlan) error {
-	return stopAndCleanupBrowserRuntimeProcessWithPending(host, process, func() {
+	return s.stopAndCleanupBrowserRuntimeProcessWithTimeout(host, process, plan, browserRuntimeProcessReapTimeout)
+}
+
+// stopAndCleanupBrowserRuntimeProcessForShutdown keeps shutdown tests and
+// callers bounded through the service seam while ordinary Start/Stop retain
+// the normal process-reap grace period.
+func (s *BrowserRuntimeService) stopAndCleanupBrowserRuntimeProcessForShutdown(host BrowserRuntimeHost, process *BrowserRuntimeProcess, plan *BrowserRuntimeLaunchPlan) error {
+	timeout := browserRuntimeProcessReapTimeout
+	if s != nil && s.shutdownWaitTimeout > 0 {
+		timeout = s.shutdownWaitTimeout
+	}
+	return s.stopAndCleanupBrowserRuntimeProcessWithTimeout(host, process, plan, timeout)
+}
+
+func (s *BrowserRuntimeService) stopAndCleanupBrowserRuntimeProcessWithTimeout(host BrowserRuntimeHost, process *BrowserRuntimeProcess, plan *BrowserRuntimeLaunchPlan, timeout time.Duration) error {
+	err := stopAndCleanupBrowserRuntimeProcessWithPendingTimeout(host, process, func() {
 		if s != nil {
 			s.registerPendingReap(process, plan)
 		}
-	})
+	}, timeout)
+	if s != nil && process != nil && process.owner != nil && browserRuntimeDone(process.owner.Done()) {
+		s.removePendingReap(process)
+	}
+	return err
 }
 
 // stopAndCleanupBrowserRuntimeProcess is retained for focused package tests.
@@ -1566,6 +2174,10 @@ func stopAndCleanupBrowserRuntimeProcess(host BrowserRuntimeHost, process *Brows
 }
 
 func stopAndCleanupBrowserRuntimeProcessWithPending(host BrowserRuntimeHost, process *BrowserRuntimeProcess, pending func()) error {
+	return stopAndCleanupBrowserRuntimeProcessWithPendingTimeout(host, process, pending, browserRuntimeProcessReapTimeout)
+}
+
+func stopAndCleanupBrowserRuntimeProcessWithPendingTimeout(host BrowserRuntimeHost, process *BrowserRuntimeProcess, pending func(), timeout time.Duration) error {
 	if process == nil {
 		return nil
 	}
@@ -1573,48 +2185,36 @@ func stopAndCleanupBrowserRuntimeProcessWithPending(host BrowserRuntimeHost, pro
 		return ErrInvalidBrowserRuntimeProcess
 	}
 
-	var errs []error
 	ownerDone := process.owner.Done()
-	shouldStop := !browserRuntimeDone(ownerDone)
-	if shouldStop && host.StopProcess != nil {
+	_, firstTeardown := process.beginTeardown()
+	if firstTeardown && !browserRuntimeDone(ownerDone) && host.StopProcess != nil {
 		if err := host.StopProcess(process.cmd); err != nil {
-			errs = append(errs, fmt.Errorf("browser process stop failed: %w", err))
+			stopErr := fmt.Errorf("browser process stop failed: %w", err)
+			process.recordTeardownError(stopErr)
 			if killErr := process.cmd.Process.Kill(); killErr != nil && !isProcessAlreadyFinished(killErr) {
-				errs = append(errs, fmt.Errorf("browser process fallback kill failed: %w", killErr))
+				process.recordTeardownError(fmt.Errorf("browser process fallback kill failed: %w", killErr))
 			}
 		}
 	}
 
-	deadline := time.Now().Add(browserRuntimeProcessReapTimeout)
-	remaining := time.Until(deadline)
-	if remaining < 0 {
-		remaining = 0
+	if timeout <= 0 {
+		timeout = browserRuntimeProcessReapTimeout
 	}
-	timer := time.NewTimer(remaining)
-	defer timer.Stop()
-	select {
-	case <-ownerDone:
+	if browserRuntimeWaitOwnerUntil(ownerDone, timeout) {
 		// The owner result is observed only after Done. A non-zero exit is
-		// expected after an explicit stop/kill and is reported by the original
-		// StopProcess error when one exists; it is not a second teardown fault.
+		// expected after an explicit stop/kill and is not a second teardown
+		// fault. completeTeardown is idempotent across monitor, Stop and
+		// Shutdown callers and invokes cleanup exactly once.
 		_ = process.owner.Result()
-		process.cleanup()
-		return errors.Join(errs...)
-	case <-timer.C:
-		if killErr := process.cmd.Process.Kill(); killErr != nil && !isProcessAlreadyFinished(killErr) {
-			errs = append(errs, fmt.Errorf("browser process fallback kill failed: %w", killErr))
-		}
-		if browserRuntimeWaitOwnerUntil(ownerDone, time.Until(deadline)) {
-			_ = process.owner.Result()
-			process.cleanup()
-			return errors.Join(errs...)
-		}
-		errs = append(errs, fmt.Errorf("%w: owner did not terminate within %s", ErrBrowserRuntimeReapPending, browserRuntimeProcessReapTimeout))
-		if pending != nil {
-			pending()
-		}
-		return errors.Join(errs...)
+		process.completeTeardown()
+		return process.teardownError()
 	}
+
+	pendingErr := fmt.Errorf("%w: owner did not terminate within %s", ErrBrowserRuntimeReapPending, timeout)
+	if pending != nil {
+		pending()
+	}
+	return errors.Join(process.teardownError(), pendingErr)
 }
 
 func browserRuntimeDone(done <-chan struct{}) bool {
@@ -1733,6 +2333,27 @@ func (s *BrowserRuntimeService) commitProfileSnapshot(profileID string, expected
 		_ = manager.SaveProfiles()
 	}
 	return true
+}
+
+func (s *BrowserRuntimeService) startProfileFenceError(profileID string, expectedRevision, expectedIncarnation *BrowserProfile) error {
+	if s.startAdmissionClosed() {
+		return ErrBrowserRuntimeServiceShutdown
+	}
+	manager := s.Manager()
+	if manager == nil {
+		return fmt.Errorf("%w: browser manager is not initialized", ErrBrowserRuntimeProfileMismatch)
+	}
+	if expectedRevision == nil || expectedIncarnation == nil {
+		return fmt.Errorf("%w: launch profile fence is incomplete", ErrBrowserRuntimeProfileMismatch)
+	}
+	manager.Mutex.Lock()
+	current := manager.Profiles[profileID]
+	valid := current != nil && current == expectedIncarnation && reflect.DeepEqual(*current, *expectedRevision)
+	manager.Mutex.Unlock()
+	if valid {
+		return nil
+	}
+	return fmt.Errorf("%w: profile %s changed during browser launch", ErrBrowserRuntimeProfileMismatch, profileID)
 }
 
 func (s *BrowserRuntimeService) identity(profileID string) browserRuntimeIdentity {
@@ -1891,8 +2512,31 @@ func (s *BrowserRuntimeService) stopState(host BrowserRuntimeHost, profileID str
 	s.releaseProfileProxy(profileID, generation)
 	if host.ClearActiveProfile != nil {
 		host.ClearActiveProfile(profileID, generation)
+		s.restoreActiveProfileAfterStaleClear(host, profileID, currentIdentity)
 	}
 	return snapshot, true
+}
+
+// shouldEmitMonitorStopped reports whether a process monitor that owned an
+// older generation may publish its terminal event. stopState fences and clears
+// the old identity before invoking the host's active-profile callback; that
+// callback can be delayed while a replacement generation starts. In that case
+// the old monitor must not emit a stopped event after the replacement's
+// started event. The monotonically increasing nextGen value also covers the
+// narrow case where the replacement has already started and stopped again
+// before the old callback returns.
+func (s *BrowserRuntimeService) shouldEmitMonitorStopped(profileID string, expected browserRuntimeIdentity) bool {
+	if s == nil || expected.generation == 0 {
+		return false
+	}
+	s.identityMu.Lock()
+	current := s.active[profileID]
+	latest := s.nextGen[profileID]
+	s.identityMu.Unlock()
+	if current.generation != 0 {
+		return false
+	}
+	return latest <= expected.generation
 }
 
 func (s *BrowserRuntimeService) openRunningProfile(host BrowserRuntimeHost, profileID string, profile *browser.Profile, extraArgs, startURLs []string) error {
@@ -2070,7 +2714,7 @@ func (s *BrowserRuntimeService) monitorProcess(host BrowserRuntimeHost, profileI
 			}
 			manager.Mutex.Unlock()
 			if s.waitRuntimeDebugDisconnectFor(host.CanConnect, debugPort) {
-				if _, stopped := s.stopState(host, profileID, &expected); stopped && host.EmitStopped != nil {
+				if _, stopped := s.stopState(host, profileID, &expected); stopped && host.EmitStopped != nil && s.shouldEmitMonitorStopped(profileID, expected) {
 					host.EmitStopped(profileID)
 				}
 			}
@@ -2079,9 +2723,12 @@ func (s *BrowserRuntimeService) monitorProcess(host BrowserRuntimeHost, profileI
 		if _, stopped := s.stopState(host, profileID, &expected); !stopped {
 			return
 		}
+		if !s.shouldEmitMonitorStopped(profileID, expected) {
+			return
+		}
 		if err != nil && host.EmitCrashed != nil {
 			host.EmitCrashed(profileID, profileName, err)
-		} else if host.EmitStopped != nil {
+		} else if host.EmitStopped != nil && s.shouldEmitMonitorStopped(profileID, expected) {
 			host.EmitStopped(profileID)
 		}
 	}()
@@ -2170,9 +2817,7 @@ func (s *BrowserRuntimeService) waitDebugReadyAsync(host BrowserRuntimeHost, pro
 			profile.LastError = ""
 			snapshot := copyBrowserProfileSnapshot(profile)
 			manager.Mutex.Unlock()
-			if host.SetActiveProfile != nil {
-				host.SetActiveProfile(snapshot)
-			}
+			setBrowserRuntimeActiveProfile(host, snapshot, expected)
 			if host.EmitUpdated != nil {
 				host.EmitUpdated(snapshot)
 			}
