@@ -58,4 +58,24 @@ func (m *XrayManager) stopBridgeProcess(bridge *XrayBridge) {
 		return
 	}
 	_ = bridge.Cmd.Process.Kill()
+	go m.cleanupRuntimeWhenTerminated(bridge)
+}
+
+func (m *XrayManager) cleanupRuntimeWhenTerminated(bridge *XrayBridge) {
+	if bridge == nil {
+		return
+	}
+	if bridge.ExitDone != nil {
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-bridge.ExitDone:
+		case <-timer.C:
+			return
+		}
+	} else if bridge.Cmd != nil && bridge.Cmd.ProcessState == nil {
+		return
+	}
+	bridge.Runtime.markProcessTerminated(bridge.RuntimeToken)
+	_ = bridge.Runtime.cleanup()
 }

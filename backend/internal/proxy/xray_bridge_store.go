@@ -91,6 +91,7 @@ func (m *XrayManager) watchBridge(bridge *XrayBridge, key string) {
 		return
 	}
 	_ = bridge.waitExit()
+	bridge.Runtime.markProcessTerminated(bridge.RuntimeToken)
 
 	var shouldRestart bool
 	var refCount int
@@ -113,15 +114,19 @@ func (m *XrayManager) watchBridge(bridge *XrayBridge, key string) {
 		if err := m.restartPinnedBridge(log, key, bridge, refCount); err == nil {
 			return
 		} else if errors.Is(err, errXrayBridgeRestartNotNeeded) {
+			_ = bridge.Runtime.cleanup()
 			return
 		} else {
-			log.Error("xray 桥接同端口恢复失败", logger.F("key", key), logger.F("port", bridge.Port), logger.F("error", err.Error()))
+			log.Error("xray 桥接同端口恢复失败", logger.F("key", key), logger.F("port", bridge.Port), logger.F("error", safeProxyError(err)))
 			m.mu.Lock()
 			if current, ok := m.Bridges[key]; ok && current == bridge {
 				delete(m.Bridges, key)
 			}
 			m.mu.Unlock()
+			_ = bridge.Runtime.cleanup()
 		}
+	} else {
+		_ = bridge.Runtime.cleanup()
 	}
 
 	if !stopping && m.OnBridgeDied != nil {

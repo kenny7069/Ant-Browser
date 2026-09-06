@@ -28,7 +28,7 @@ func TestConnectivity(proxyId string, proxyConfig string, proxies []config.Brows
 
 	endpoint, err := proxyEndpoint(src)
 	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Engine: "tcp", Error: fmt.Sprintf("地址解析失败: %v", err)}
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: "tcp", Error: "地址解析失败: " + safeProxyError(err)}
 	}
 
 	start := time.Now()
@@ -36,7 +36,7 @@ func TestConnectivity(proxyId string, proxyConfig string, proxies []config.Brows
 	latency := time.Since(start).Milliseconds()
 
 	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Engine: "tcp", Error: err.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Engine: "tcp", Error: safeProxyError(err)}
 	}
 	conn.Close()
 	return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: latency, Engine: "tcp"}
@@ -109,7 +109,7 @@ func TestRealConnectivityWithRuntimeConfig(
 
 	client, err := buildProxyHTTPClient(src, proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, timeout)
 	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Engine: engine, Error: err.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: engine, Error: safeProxyError(err)}
 	}
 
 	var lastErr error
@@ -131,7 +131,7 @@ func TestRealConnectivityWithRuntimeConfig(
 	}
 
 	if lastErr != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: lastLatency, Engine: engine, Error: "真实访问失败: " + lastErr.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: lastLatency, Engine: engine, Error: "真实访问失败: " + safeProxyError(lastErr)}
 	}
 	return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: lastLatency, Engine: engine, Error: "真实连通性测试失败"}
 }

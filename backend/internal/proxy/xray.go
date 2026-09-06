@@ -15,14 +15,17 @@ const (
 
 // XrayManager Xray 桥接管理器
 type XrayManager struct {
-	Config       *config.Config
-	AppRoot      string // 应用根目录，所有相对路径基于此解析
-	Bridges      map[string]*XrayBridge
-	OnBridgeDied func(key string, err error) // 桥接进程意外退出回调
-	mu           sync.Mutex
-	launchLocks  map[string]*bridgeLaunchLock
-	stopCh       chan struct{}
-	stopOnce     sync.Once
+	Config                  *config.Config
+	AppRoot                 string // 应用根目录，所有相对路径基于此解析
+	Bridges                 map[string]*XrayBridge
+	OnBridgeDied            func(key string, err error) // 桥接进程意外退出回调
+	mu                      sync.Mutex
+	launchLocks             map[string]*bridgeLaunchLock
+	stopCh                  chan struct{}
+	stopOnce                sync.Once
+	runtimeConfigWriter     *secureRuntimeWriter
+	runtimeConfigWriterOnce sync.Once
+	runtimeConfigWriterErr  error
 }
 
 // NewXrayManager 创建 Xray 管理器
@@ -36,6 +39,16 @@ func NewXrayManager(cfg *config.Config, appRoot string) *XrayManager {
 	}
 	go manager.cleanupLoop()
 	return manager
+}
+
+func (m *XrayManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) {
+	if m == nil {
+		return nil, fmt.Errorf("xray 管理器未初始化")
+	}
+	m.runtimeConfigWriterOnce.Do(func() {
+		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriter("xray")
+	})
+	return m.runtimeConfigWriter, m.runtimeConfigWriterErr
 }
 
 // ValidateProxyConfig 验证代理配置是否支持
@@ -60,7 +73,7 @@ func ValidateProxyConfig(proxyConfig string, proxies []config.BrowserProxy, prox
 		}
 	}
 	if resolution, err := ResolveProxyKernel(src, proxies, "", preferredKernel); err != nil {
-		return false, fmt.Sprintf("代理配置解析失败: %v", err)
+		return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 	} else if len(resolution.SupportedKernels) == 0 {
 		return false, "代理配置无效"
 	}
@@ -76,26 +89,26 @@ func ValidateProxyConfig(proxyConfig string, proxies []config.BrowserProxy, prox
 	}
 	if IsChainSocks5Proxy(src) {
 		if _, err := ParseChainSocks5Config(src); err != nil {
-			return false, fmt.Sprintf("链式代理配置解析失败: %v", err)
+			return false, maskProxySensitiveText(fmt.Sprintf("链式代理配置解析失败: %v", err))
 		}
 		return true, ""
 	}
 	if IsSingBoxProtocol(src) {
 		if _, err := BuildSingBoxOutbound(src); err != nil {
-			return false, fmt.Sprintf("代理配置解析失败: %v", err)
+			return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 		}
 		return true, ""
 	}
 	if IsMihomoOnlyProtocol(src) {
 		if err := validateMihomoOnlyProtocol(src); err != nil {
-			return false, fmt.Sprintf("代理配置解析失败: %v", err)
+			return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 		}
 		return true, ""
 	}
 
 	standardProxy, outbound, err := ParseProxyNode(src)
 	if err != nil {
-		return false, fmt.Sprintf("代理配置解析失败: %v", err)
+		return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 	}
 	if strings.TrimSpace(standardProxy) == "" && outbound == nil {
 		return false, "代理配置无效"

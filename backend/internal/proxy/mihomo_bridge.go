@@ -33,6 +33,8 @@ type MihomoNodeBridge struct {
 	LastUsedAt     time.Time
 	ExitDone       chan struct{}
 	ExitErr        error
+	Runtime        *secureRuntimeHandle
+	RuntimeToken   uint64
 }
 
 func (m *ClashManager) EnsureNodeBridge(proxyConfig string, proxies []config.BrowserProxy, proxyId string) (string, error) {
@@ -86,7 +88,7 @@ func (m *ClashManager) ensureNodeBridge(proxyConfig string, proxies []config.Bro
 	defer unlock()
 
 	if proxyURL, reused := m.tryReuseMihomoNodeBridge(key, pin); reused {
-		log.Info("复用 mihomo 桥接", logger.F("engine", "mihomo"), logger.F("key", key[:8]), logger.F("proxy_url", proxyURL))
+		log.Info("复用 mihomo 桥接", logger.F("engine", "mihomo"), logger.F("key", key[:8]), logger.F("proxy_url", safeProxyURI(proxyURL)))
 		return proxyURL, key, nil
 	}
 
@@ -110,22 +112,29 @@ func (m *ClashManager) ensureNodeBridge(proxyConfig string, proxies []config.Bro
 	if err != nil {
 		return "", "", err
 	}
+	writer, err := m.getSecureRuntimeWriter()
+	if err != nil {
+		return "", "", err
+	}
+	runtimeHandle, err := writer.handle(key)
+	if err != nil {
+		return "", "", err
+	}
 
 	cmd := exec.Command(binaryPath, "-f", cfgPath, "-d", filepath.Dir(cfgPath))
 	hideWindow(cmd)
 	cmd.Dir = filepath.Dir(cfgPath)
-	stderrPath := filepath.Join(filepath.Dir(cfgPath), "mihomo-stderr.log")
-	stderrFile, _ := os.Create(stderrPath)
-	if stderrFile != nil {
-		cmd.Stderr = stderrFile
+	stderrFile, _, err := writer.openLog(key, "mihomo-stderr.log")
+	if err != nil {
+		return "", "", err
 	}
+	cmd.Stderr = stderrFile
 	if err := cmd.Start(); err != nil {
-		if stderrFile != nil {
-			stderrFile.Close()
-		}
+		_ = stderrFile.Close()
 		return "", "", fmt.Errorf("mihomo 启动失败: %w", err)
 	}
-	bridge := &MihomoNodeBridge{NodeKey: key, Port: port, ControllerPort: controllerPort, Cmd: cmd, Pid: cmd.Process.Pid, ConfigPath: cfgPath, Running: true, LastUsedAt: time.Now(), ExitDone: make(chan struct{})}
+	runtimeToken := runtimeHandle.markProcessStarted()
+	bridge := &MihomoNodeBridge{NodeKey: key, Port: port, ControllerPort: controllerPort, Cmd: cmd, Pid: cmd.Process.Pid, ConfigPath: cfgPath, Running: true, LastUsedAt: time.Now(), ExitDone: make(chan struct{}), Runtime: runtimeHandle, RuntimeToken: runtimeToken}
 	if pin {
 		bridge.RefCount = 1
 	}
@@ -202,7 +211,7 @@ func (m *ClashManager) TestNodeDelay(proxyId string, proxies []config.BrowserPro
 		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: "mihomo 管理器未初始化"}
 	}
 	if _, err := m.EnsureNodeBridge(src, proxies, proxyId); err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: err.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: safeProxyError(err)}
 	}
 	key := computeNodeKey(src + "\x00mihomo")
 	m.mu.Lock()
@@ -231,7 +240,7 @@ func (m *ClashManager) TestNodeDelay(proxyId string, proxies []config.BrowserPro
 	client := &http.Client{Timeout: timeout + time.Second}
 	resp, err := client.Get(apiURL)
 	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: "mihomo 延迟测试失败: " + err.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: "mihomo 延迟测试失败: " + safeProxyError(err)}
 	}
 	defer resp.Body.Close()
 	var payload struct {
@@ -239,17 +248,17 @@ func (m *ClashManager) TestNodeDelay(proxyId string, proxies []config.BrowserPro
 		Error string `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: "mihomo 延迟结果解析失败: " + err.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: "mihomo 延迟结果解析失败: " + safeProxyError(err)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if payload.Error != "" {
-			return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: payload.Error}
+			return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: maskProxySensitiveText(payload.Error)}
 		}
 		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: fmt.Sprintf("mihomo 延迟测试失败: HTTP %d", resp.StatusCode)}
 	}
 	if payload.Delay <= 0 {
 		if payload.Error != "" {
-			return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: payload.Error}
+			return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: maskProxySensitiveText(payload.Error)}
 		}
 		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: "mihomo 延迟测试无结果"}
 	}
@@ -275,6 +284,7 @@ func (m *ClashManager) watchMihomoNodeBridge(bridge *MihomoNodeBridge) {
 	}
 	go func() {
 		err := bridge.Cmd.Wait()
+		bridge.Runtime.markProcessTerminated(bridge.RuntimeToken)
 		m.mu.Lock()
 		bridge.Running = false
 		bridge.ExitErr = err
@@ -283,6 +293,7 @@ func (m *ClashManager) watchMihomoNodeBridge(bridge *MihomoNodeBridge) {
 		}
 		m.mu.Unlock()
 		close(bridge.ExitDone)
+		_ = bridge.Runtime.cleanup()
 	}()
 }
 
@@ -315,8 +326,12 @@ func (m *ClashManager) lockLaunchForKey(key string) func() {
 }
 
 func (m *ClashManager) buildMihomoNodeConfig(key string, node map[string]interface{}, port int, controllerPort int) (string, error) {
-	baseDir := m.resolveMihomoWorkdir(key)
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+	writer, err := m.getSecureRuntimeWriter()
+	if err != nil {
+		return "", err
+	}
+	baseDir, err := writer.runtimeDir(key)
+	if err != nil {
 		return "", err
 	}
 	name := strings.TrimSpace(getMapString(node, "name"))
@@ -348,7 +363,7 @@ func (m *ClashManager) buildMihomoNodeConfig(key string, node map[string]interfa
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(cfgPath, data, 0o644); err != nil {
+	if _, err := writer.writeAtomic(key, filepath.Base(cfgPath), data); err != nil {
 		return "", err
 	}
 	return cfgPath, nil
@@ -423,17 +438,11 @@ func (m *ClashManager) resolveMihomoBinary() (string, error) {
 }
 
 func (m *ClashManager) resolveMihomoWorkdir(key string) string {
-	root := "data"
-	if m != nil && m.Config != nil {
-		root = strings.TrimSpace(m.Config.Browser.UserDataRoot)
-		if root == "" {
-			root = "data"
-		}
+	writer, err := m.getSecureRuntimeWriter()
+	if err != nil {
+		return ""
 	}
-	if !filepath.IsAbs(root) && m != nil {
-		root = apppath.Resolve(m.AppRoot, root)
-	}
-	return filepath.Join(root, "_mihomo", key)
+	return writer.runtimeDirIfExists(key)
 }
 
 func waitTCPPortReady(host string, port int, timeout time.Duration) error {

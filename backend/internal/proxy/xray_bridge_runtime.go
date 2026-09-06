@@ -72,7 +72,7 @@ func (m *XrayManager) restartPinnedBridge(log *logger.Logger, key string, bridge
 		logger.F("key", key),
 		logger.F("port", restarted.Port),
 		logger.F("pid", restarted.Pid),
-		logger.F("socks_url", socksURL),
+		logger.F("socks_url", safeProxyURI(socksURL)),
 		logger.F("ref_count", refCount),
 	)
 	go m.watchBridge(restarted, key)

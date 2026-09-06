@@ -1,14 +1,12 @@
 package proxy
 
 import (
-	"ant-chrome/backend/internal/apppath"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"net"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -37,8 +35,12 @@ func (m *XrayManager) buildRuntimeConfig(key string, outbound map[string]interfa
 }
 
 func (m *XrayManager) buildRuntimeConfigWithRoute(key string, outbounds []interface{}, rules []interface{}, port int, dnsServers string) (string, error) {
-	baseDir := m.resolveWorkdir(key)
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+	writer, err := m.getSecureRuntimeWriter()
+	if err != nil {
+		return "", err
+	}
+	baseDir, err := writer.runtimeDir(key)
+	if err != nil {
 		return "", err
 	}
 	outbounds = sanitizeXrayOutbounds(outbounds)
@@ -84,7 +86,10 @@ func (m *XrayManager) buildRuntimeConfigWithRoute(key string, outbounds []interf
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(cfgPath, data, 0o644); err != nil {
+	if _, err := writer.writeAtomic(key, filepath.Base(cfgPath), data); err != nil {
+		return "", err
+	}
+	if _, err := writer.ensureLog(key, "xray-error.log"); err != nil {
 		return "", err
 	}
 	return cfgPath, nil
@@ -253,12 +258,9 @@ func removeXrayDeprecatedFields(value interface{}) {
 }
 
 func (m *XrayManager) resolveWorkdir(key string) string {
-	root := strings.TrimSpace(m.Config.Browser.UserDataRoot)
-	if root == "" {
-		root = "data"
+	writer, err := m.getSecureRuntimeWriter()
+	if err != nil {
+		return ""
 	}
-	if !filepath.IsAbs(root) {
-		root = apppath.Resolve(m.AppRoot, root)
-	}
-	return filepath.Join(root, "_xray", key)
+	return writer.runtimeDirIfExists(key)
 }

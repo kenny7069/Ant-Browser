@@ -20,13 +20,13 @@ func unifiedDelayTest(proxyId string, px C.Proxy, testURL string, timeout time.D
 
 	addr, err := urlToMeta(testURL)
 	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Error: fmt.Sprintf("URL 解析失败: %v", err)}
+		return TestResult{ProxyId: proxyId, Ok: false, Error: "URL 解析失败: " + safeProxyError(err)}
 	}
 
 	start := time.Now()
 	conn, err := px.DialContext(ctx, &addr)
 	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Error: fmt.Sprintf("代理连接失败: %v", err)}
+		return TestResult{ProxyId: proxyId, Ok: false, Error: "代理连接失败: " + safeProxyError(err)}
 	}
 	defer conn.Close()
 
@@ -49,7 +49,7 @@ func unifiedDelayTest(proxyId string, px C.Proxy, testURL string, timeout time.D
 	resp, err := client.Do(req)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Error: err.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Error: safeProxyError(err)}
 	}
 	resp.Body.Close()
 
