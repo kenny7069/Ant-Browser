@@ -10,9 +10,16 @@ import (
 	"ant-chrome/backend/internal/config"
 )
 
-// TestConnectivity 通过 TCP 握手测试代理服务器的可达性和延迟
-// 直接对 server:port 建立 TCP 连接测量 RTT，无需启动外部进程
+// TestConnectivity 保留旧调用方的显式 xray 兼容入口。生产 operation
+// boundary 应使用 TestConnectivityWithConnector，避免 TCP probe 绕过 stack policy。
 func TestConnectivity(proxyId string, proxyConfig string, proxies []config.BrowserProxy, _ interface{}) TestResult {
+	return TestConnectivityWithConnector(proxyId, proxyConfig, proxies, config.BrowserConnectorXray)
+}
+
+// TestConnectivityWithConnector 通过 TCP 握手测试代理服务器的可达性和延迟。
+// TCP probe 本身不启动 bridge，但仍先经 connector-aware resolver 验证协议属于
+// 当前 stack；因此它不能把 Mihomo-only 节点当成 xray operation 的有效输入。
+func TestConnectivityWithConnector(proxyId string, proxyConfig string, proxies []config.BrowserProxy, connectorType string) TestResult {
 	src := strings.TrimSpace(proxyConfig)
 	if proxyId != "" {
 		for _, item := range proxies {
@@ -24,6 +31,9 @@ func TestConnectivity(proxyId string, proxyConfig string, proxies []config.Brows
 	}
 	if src == "" {
 		return TestResult{ProxyId: proxyId, Ok: false, Engine: "tcp", Error: "代理配置为空"}
+	}
+	if _, err := ResolveProxyKernelForConnector(src, proxies, proxyId, connectorType); err != nil {
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: strings.TrimSpace(connectorType), Error: safeProxyError(err)}
 	}
 
 	endpoint, err := proxyEndpoint(src)
@@ -42,10 +52,8 @@ func TestConnectivity(proxyId string, proxyConfig string, proxies []config.Brows
 	return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: latency, Engine: "tcp"}
 }
 
-// TestRealConnectivity 通过代理链路发起真实 HTTP 请求测量端到端延迟。
-// - DirectProxy (http/https/socks5)：直接通过该代理发送请求
-// - BridgeProxy (vmess/vless/Clash)：调用 EnsureBridge 获取 socks5 地址后发送请求
-// - SingBoxProxy (hysteria2/tuic)：调用 SingBoxManager.EnsureBridge 后发送请求
+// TestRealConnectivity 通过显式 connector 的代理链路发起真实 HTTP 请求测量端到端延迟。
+// 非 direct:// 配置一律由选定 stack 建立 bridge/client；不会旁路到 native proxy。
 func TestRealConnectivity(
 	proxyId string,
 	proxies []config.BrowserProxy,

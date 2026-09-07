@@ -23,15 +23,19 @@ const (
 )
 
 // NormalizeBrowserConnectorType 只用于兼容历史 default_connector_type 输入。
-// 新代理执行入口应使用 proxy.ResolveProxyKernel 按单个代理选择内核。
+// 新代理执行入口必须把规范化后的 connector 传入
+// proxy.ResolveProxyKernelForConnector；未知值会保留并由 operation boundary 拒绝。
 func NormalizeBrowserConnectorType(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
 	case BrowserConnectorMihomo, "clash", "clash-meta":
 		return BrowserConnectorMihomo
 	case BrowserConnectorXray, "sing-box", "singbox", "sing_box", "":
 		return BrowserConnectorXray
 	default:
-		return BrowserConnectorXray
+		// Preserve unknown values so the operation boundary can fail closed.
+		// Silently turning a typo into xray would permit a cross-stack fallback.
+		return normalized
 	}
 }
 

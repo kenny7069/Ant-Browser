@@ -51,17 +51,21 @@ func (m *XrayManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) {
 	return m.runtimeConfigWriter, m.runtimeConfigWriterErr
 }
 
-// ValidateProxyConfig 验证代理配置是否支持
-// 返回: supported bool, errorMsg string
+// ValidateProxyConfig is retained for source compatibility and deliberately
+// fails closed because validation without an operation connector is unsafe.
 func ValidateProxyConfig(proxyConfig string, proxies []config.BrowserProxy, proxyId string) (bool, string) {
+	return ValidateProxyConfigForConnector(proxyConfig, proxies, proxyId, "")
+}
+
+// ValidateProxyConfigForConnector validates a proxy against the same explicit
+// connector policy used by launch, warmup, and HTTP operations.
+func ValidateProxyConfigForConnector(proxyConfig string, proxies []config.BrowserProxy, proxyId string, connectorType string) (bool, string) {
 	src := strings.TrimSpace(proxyConfig)
-	preferredKernel := ""
 	if proxyId != "" {
 		found := false
 		for _, item := range proxies {
 			if strings.EqualFold(item.ProxyId, proxyId) {
 				src = strings.TrimSpace(item.ProxyConfig)
-				preferredKernel = strings.TrimSpace(item.PreferredKernel)
 				found = true
 				break
 			}
@@ -72,13 +76,13 @@ func ValidateProxyConfig(proxyConfig string, proxies []config.BrowserProxy, prox
 			}
 		}
 	}
-	if resolution, err := ResolveProxyKernel(src, proxies, "", preferredKernel); err != nil {
+	if resolution, err := ResolveProxyKernelForConnector(src, proxies, proxyId, connectorType); err != nil {
 		return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 	} else if len(resolution.SupportedKernels) == 0 {
 		return false, "代理配置无效"
 	}
 	if src == "" {
-		return true, ""
+		return false, "代理配置为空"
 	}
 	if strings.EqualFold(src, "direct://") {
 		return true, ""

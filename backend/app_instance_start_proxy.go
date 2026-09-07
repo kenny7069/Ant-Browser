@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/logger"
 	"ant-chrome/backend/internal/proxy"
 	"fmt"
@@ -50,6 +49,9 @@ func (a *App) resolveBrowserStartProxy(input browserStartInput, profile *Browser
 			}
 		}
 	}
+	if resolvedProxyID == "" && strings.TrimSpace(resolvedProxyConfig) == "" {
+		resolvedProxyConfig = "direct://"
+	}
 
 	log.Info("代理配置检查",
 		logger.F("profile_id", profileID),
@@ -60,7 +62,8 @@ func (a *App) resolveBrowserStartProxy(input browserStartInput, profile *Browser
 		logger.F("temporary_proxy_config", proxy.MaskProxySensitiveText(input.TemporaryProxyConfig)),
 		logger.F("resolved_proxy_config", proxy.MaskProxySensitiveText(resolvedProxyConfig)),
 	)
-	if supported, errorMsg := proxy.ValidateProxyConfig(resolvedProxyConfig, proxies, resolvedProxyID); !supported {
+	connectorType := a.defaultProxyConnectorType()
+	if supported, errorMsg := proxy.ValidateProxyConfigForConnector(resolvedProxyConfig, proxies, resolvedProxyID, connectorType); !supported {
 		safeErrorMsg := proxy.MaskProxySensitiveText(errorMsg)
 		startErr := fmt.Errorf("实例启动失败：%s", safeErrorMsg)
 		profile.LastError = startErr.Error()
@@ -73,10 +76,6 @@ func (a *App) resolveBrowserStartProxy(input browserStartInput, profile *Browser
 		return "", profileProxyBridgeRef{}, false, startErr
 	}
 
-	connectorType := config.BrowserConnectorXray
-	if a.config != nil {
-		connectorType = config.NormalizeBrowserConnectorType(a.config.Browser.DefaultConnectorType)
-	}
 	resolution, err := proxy.ResolveProxyKernelForConnector(resolvedProxyConfig, proxies, resolvedProxyID, connectorType)
 	if err != nil {
 		safeErr := proxy.MaskProxySensitiveText(err.Error())

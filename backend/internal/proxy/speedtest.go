@@ -49,8 +49,7 @@ func SpeedTest(
 	return SpeedTestWithConnector(proxyId, proxies, xrayMgr, singboxMgr, nil, config.BrowserConnectorXray, cfg)
 }
 
-// SpeedTestWithConnector 保留 connectorType 参数用于旧调用兼容。
-// 实际测速内核由 ResolveProxyKernel 按单个代理决定。
+// SpeedTestWithConnector requires the operation's explicit connector policy.
 func SpeedTestWithConnector(
 	proxyId string,
 	proxies []config.BrowserProxy,
@@ -60,7 +59,11 @@ func SpeedTestWithConnector(
 	connectorType string,
 	cfg *SpeedTestConfig,
 ) TestResult {
-	connectorType = config.NormalizeBrowserConnectorType(connectorType)
+	canonicalConnector, err := RequireConnectorType(connectorType)
+	if err != nil {
+		return TestResult{ProxyId: proxyId, Ok: false, Error: err.Error()}
+	}
+	connectorType = canonicalConnector
 	return lightHTTPDelayTestWithConnector(proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, cfg)
 }
 
@@ -233,7 +236,7 @@ func speedTestProbeEngine(src string, proxies []config.BrowserProxy, proxyId str
 		if resolution.Kernel != "" {
 			return resolution.Kernel
 		}
-		return config.NormalizeBrowserConnectorType(connectorType)
+		return connectorType
 	}
 	if resolution.Kernel == ProxyKernelNative {
 		return "native"

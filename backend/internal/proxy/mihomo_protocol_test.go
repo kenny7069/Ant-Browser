@@ -30,7 +30,7 @@ func TestMieruClashNodeIsMihomoOnlyProtocol(t *testing.T) {
 	if RequiresBridge(mieruClashNode, nil, "") {
 		t.Fatalf("mieru must not require xray bridge")
 	}
-	ok, msg := ValidateProxyConfig(mieruClashNode, nil, "")
+	ok, msg := ValidateProxyConfigForConnector(mieruClashNode, nil, "", config.BrowserConnectorMihomo)
 	if !ok {
 		t.Fatalf("ValidateProxyConfig rejected mieru node: %s", msg)
 	}

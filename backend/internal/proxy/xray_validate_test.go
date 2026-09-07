@@ -9,7 +9,7 @@ import (
 )
 
 func TestValidateProxyConfigInvalidRawString(t *testing.T) {
-	ok, msg := ValidateProxyConfig("not-a-proxy-config", nil, "")
+	ok, msg := ValidateProxyConfigForConnector("not-a-proxy-config", nil, "", config.BrowserConnectorXray)
 	if ok {
 		t.Fatalf("expected invalid raw string to fail validation")
 	}
@@ -19,9 +19,9 @@ func TestValidateProxyConfigInvalidRawString(t *testing.T) {
 }
 
 func TestValidateProxyConfigMissingProxyId(t *testing.T) {
-	ok, msg := ValidateProxyConfig("", []config.BrowserProxy{
+	ok, msg := ValidateProxyConfigForConnector("", []config.BrowserProxy{
 		{ProxyId: "p1", ProxyConfig: "http://proxy.invalid:8080"},
-	}, "missing-proxy")
+	}, "missing-proxy", config.BrowserConnectorXray)
 	if ok {
 		t.Fatalf("expected missing proxyId to fail validation")
 	}
@@ -31,16 +31,16 @@ func TestValidateProxyConfigMissingProxyId(t *testing.T) {
 }
 
 func TestValidateProxyConfigMissingProxyIdFallbackToRawConfig(t *testing.T) {
-	ok, msg := ValidateProxyConfig("socks5://127.0.0.1:1080", []config.BrowserProxy{
+	ok, msg := ValidateProxyConfigForConnector("socks5://127.0.0.1:1080", []config.BrowserProxy{
 		{ProxyId: "p1", ProxyConfig: "http://proxy.invalid:8080"},
-	}, "missing-proxy")
+	}, "missing-proxy", config.BrowserConnectorXray)
 	if !ok {
 		t.Fatalf("expected fallback proxyConfig to pass, msg=%s", msg)
 	}
 }
 
 func TestValidateProxyConfigStandardProxy(t *testing.T) {
-	ok, msg := ValidateProxyConfig("socks5://127.0.0.1:1080", nil, "")
+	ok, msg := ValidateProxyConfigForConnector("socks5://127.0.0.1:1080", nil, "", config.BrowserConnectorXray)
 	if !ok {
 		t.Fatalf("expected standard proxy to pass: %s", msg)
 	}
@@ -48,7 +48,7 @@ func TestValidateProxyConfigStandardProxy(t *testing.T) {
 
 func TestValidateProxyConfigChainSocks5Proxy(t *testing.T) {
 	chainConfig := buildTestChainSocks5Config(t, 0)
-	ok, msg := ValidateProxyConfig(chainConfig, nil, "")
+	ok, msg := ValidateProxyConfigForConnector(chainConfig, nil, "", config.BrowserConnectorXray)
 	if !ok {
 		t.Fatalf("expected chain proxy to pass: %s", msg)
 	}
@@ -59,7 +59,7 @@ func TestValidateProxyConfigChainSocks5Proxy(t *testing.T) {
 
 func TestValidateProxyConfigChainHTTPProxy(t *testing.T) {
 	chainConfig := buildTestChainHTTPConfig(t)
-	ok, msg := ValidateProxyConfig(chainConfig, nil, "")
+	ok, msg := ValidateProxyConfigForConnector(chainConfig, nil, "", config.BrowserConnectorXray)
 	if !ok {
 		t.Fatalf("expected chain http proxy to pass: %s", msg)
 	}
@@ -129,6 +129,31 @@ func TestBuildDirectProxyBridgeOutboundAuthenticatedSocks5(t *testing.T) {
 	}
 	if user["user"] != "user" || user["pass"] != "pass" {
 		t.Fatalf("unexpected user payload: %+v", user)
+	}
+}
+
+func TestBuildDirectProxyBridgeOutboundUnauthenticatedSocks5(t *testing.T) {
+	outbound, ok, err := buildDirectProxyBridgeOutbound("socks5://127.0.0.1:1080")
+	if err != nil {
+		t.Fatalf("buildDirectProxyBridgeOutbound returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected unauthenticated socks5 proxy to remain stack-owned")
+	}
+	settings, ok := outbound["settings"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("settings missing: %+v", outbound)
+	}
+	servers, ok := settings["servers"].([]interface{})
+	if !ok || len(servers) != 1 {
+		t.Fatalf("servers invalid: %+v", settings["servers"])
+	}
+	server, ok := servers[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("server invalid: %+v", servers[0])
+	}
+	if _, hasUsers := server["users"]; hasUsers {
+		t.Fatalf("unauthenticated outbound unexpectedly contains credentials: %+v", server)
 	}
 }
 

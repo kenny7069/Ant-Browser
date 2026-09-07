@@ -16,6 +16,7 @@ const (
 )
 
 type ProxyKernelResolution struct {
+	ConnectorType    string   `json:"connectorType"`
 	Protocol         string   `json:"protocol"`
 	PreferredKernel  string   `json:"preferredKernel"`
 	Kernel           string   `json:"kernel"`
@@ -42,60 +43,30 @@ func NormalizePreferredKernel(value string) string {
 }
 
 func ResolveProxyKernel(proxyConfig string, proxies []config.BrowserProxy, proxyId string, preferredKernel string) (ProxyKernelResolution, error) {
-	src := strings.TrimSpace(resolveProxyConfig(proxyConfig, proxies, proxyId))
-	if strings.TrimSpace(preferredKernel) == "" && strings.TrimSpace(proxyId) != "" {
-		for _, item := range proxies {
-			if strings.EqualFold(strings.TrimSpace(item.ProxyId), strings.TrimSpace(proxyId)) {
-				preferredKernel = item.PreferredKernel
-				break
-			}
-		}
-	}
-	preferred := NormalizePreferredKernel(preferredKernel)
-	if preferred == "" {
-		preferred = ProxyKernelAuto
-	}
-	resolution := ProxyKernelResolution{PreferredKernel: preferred}
-	if src == "" || strings.EqualFold(src, "direct://") {
-		resolution.Protocol = "direct"
-		resolution.Kernel = ProxyKernelNative
-		resolution.SupportedKernels = []string{ProxyKernelNative}
-		resolution.Reason = "直连无需代理内核"
-		return resolution, validatePreferredKernel(resolution, preferred)
-	}
-
-	protocol := DetectProxyProtocol(src)
-	resolution.Protocol = protocol
-	resolution.SupportedKernels = SupportedKernelsForProtocol(protocol, src, proxies, proxyId)
-	if len(resolution.SupportedKernels) == 0 {
-		return resolution, fmt.Errorf("不支持的代理协议: %s", protocol)
-	}
-	if preferred != ProxyKernelAuto {
-		if !containsKernel(resolution.SupportedKernels, preferred) {
-			return resolution, fmt.Errorf("协议 %s 不支持指定内核 %s", protocol, preferred)
-		}
-		resolution.Kernel = preferred
-		resolution.Reason = "使用代理指定内核"
-		return resolution, nil
-	}
-	resolution.Kernel = resolution.SupportedKernels[0]
-	resolution.Reason = "按默认内核优先级自动选择"
-	return resolution, nil
+	// Keep the historical symbol for source compatibility, but do not allow an
+	// operation to silently select a stack. Every production caller must carry
+	// an explicit connector through ResolveProxyKernelForConnector.
+	_ = proxyConfig
+	_ = proxies
+	_ = proxyId
+	_ = preferredKernel
+	return ProxyKernelResolution{}, fmt.Errorf("connector type is required; use ResolveProxyKernelForConnector")
 }
 
 func ResolveProxyKernelForConnector(proxyConfig string, proxies []config.BrowserProxy, proxyId string, connectorType string) (ProxyKernelResolution, error) {
 	src := strings.TrimSpace(resolveProxyConfig(proxyConfig, proxies, proxyId))
-	connector, err := normalizeConnectorBoundary(connectorType)
+	connector, err := RequireConnectorType(connectorType)
+	resolution := ProxyKernelResolution{ConnectorType: connector, PreferredKernel: ProxyKernelAuto}
 	if err != nil {
-		return ProxyKernelResolution{}, err
+		return resolution, err
+	}
+	if src == "" {
+		return resolution, fmt.Errorf("代理配置为空")
 	}
 	protocol := DetectProxyProtocol(src)
 	supported := SupportedKernelsForProtocol(protocol, src, proxies, proxyId)
-	resolution := ProxyKernelResolution{
-		Protocol:         protocol,
-		PreferredKernel:  ProxyKernelAuto,
-		SupportedKernels: supported,
-	}
+	resolution.Protocol = protocol
+	resolution.SupportedKernels = supported
 	if len(supported) == 0 {
 		return resolution, fmt.Errorf("不支持的代理协议: %s", protocol)
 	}
@@ -162,13 +133,9 @@ func SupportedKernelsForProtocol(protocol string, proxyConfig string, proxies []
 	case "direct":
 		return []string{ProxyKernelNative}
 	case "http", "https", "socks5":
-		// 带账号密码鉴权的 socks5/http 代理：Chromium 的 --proxy-server 无法携带凭据，
-		// 浏览器 native 会静默丢弃鉴权信息导致连接失败。这类代理必须通过 xray / mihomo
-		// 桥接成本地无鉴权 socks5 再交给浏览器。无鉴权的代理仍走 native。
-		if RequiresLocalProxyBridgeForBrowser(proxyConfig) {
-			return []string{ProxyKernelXray, ProxyKernelMihomo}
-		}
-		return []string{ProxyKernelNative}
+		// Every non-direct proxy is stack-owned. Xray and Mihomo can both bridge
+		// standard HTTP/SOCKS5 upstreams; the connector policy chooses one.
+		return []string{ProxyKernelXray, ProxyKernelMihomo}
 	case "vmess", "vless", "trojan", "chain+socks5":
 		return []string{ProxyKernelXray, ProxyKernelMihomo}
 	case "ss", "shadowsocks":
@@ -181,27 +148,11 @@ func SupportedKernelsForProtocol(protocol string, proxyConfig string, proxies []
 	case "mieru", "wireguard":
 		return []string{ProxyKernelMihomo}
 	default:
-		if RequiresLocalProxyBridgeForBrowser(proxyConfig) || RequiresBridge(proxyConfig, proxies, proxyId) {
-			return []string{ProxyKernelXray, ProxyKernelMihomo}
-		}
-		if IsSingBoxProtocol(proxyConfig) {
-			return []string{ProxyKernelSingBox, ProxyKernelMihomo}
-		}
-		if IsMihomoOnlyProtocol(proxyConfig) {
-			return []string{ProxyKernelMihomo}
-		}
+		_ = proxyConfig
+		_ = proxies
+		_ = proxyId
 		return nil
 	}
-}
-
-func validatePreferredKernel(resolution ProxyKernelResolution, preferred string) error {
-	if preferred == "" || preferred == ProxyKernelAuto {
-		return nil
-	}
-	if !containsKernel(resolution.SupportedKernels, preferred) {
-		return fmt.Errorf("协议 %s 不支持指定内核 %s", resolution.Protocol, preferred)
-	}
-	return nil
 }
 
 func containsKernel(kernels []string, kernel string) bool {
@@ -214,40 +165,17 @@ func containsKernel(kernels []string, kernel string) bool {
 	return false
 }
 
-func preferredKernelForConnector(src string, proxies []config.BrowserProxy, proxyId string, connectorType string) string {
-	if config.NormalizeBrowserConnectorType(connectorType) != config.BrowserConnectorMihomo {
-		return ""
-	}
-	if proxyHasExplicitPreferredKernel(proxies, proxyId) {
-		return ""
-	}
-	src = strings.TrimSpace(resolveProxyConfig(src, proxies, proxyId))
-	protocol := DetectProxyProtocol(src)
-	if containsKernel(SupportedKernelsForProtocol(protocol, src, proxies, proxyId), ProxyKernelMihomo) {
-		return ProxyKernelMihomo
-	}
-	return ""
-}
-
-func proxyHasExplicitPreferredKernel(proxies []config.BrowserProxy, proxyId string) bool {
-	proxyId = strings.TrimSpace(proxyId)
-	if proxyId == "" {
-		return false
-	}
-	for _, item := range proxies {
-		if strings.EqualFold(strings.TrimSpace(item.ProxyId), proxyId) {
-			return NormalizePreferredKernel(item.PreferredKernel) != ""
-		}
-	}
-	return false
-}
-
-func normalizeConnectorBoundary(value string) (string, error) {
+// RequireConnectorType is the operation-boundary connector validator. Alias
+// normalization belongs to browser configuration compatibility code; an
+// operation must receive the canonical xray/mihomo value explicitly.
+func RequireConnectorType(value string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", config.BrowserConnectorXray, "sing-box", "singbox", "sing_box":
+	case config.BrowserConnectorXray:
 		return config.BrowserConnectorXray, nil
-	case config.BrowserConnectorMihomo, "clash", "clash-meta":
+	case config.BrowserConnectorMihomo:
 		return config.BrowserConnectorMihomo, nil
+	case "":
+		return "", fmt.Errorf("connector type is required")
 	default:
 		return "", fmt.Errorf("未知连接栈: %s", strings.TrimSpace(value))
 	}
@@ -269,9 +197,9 @@ func explicitPreferredKernel(proxies []config.BrowserProxy, proxyId string) stri
 func connectorKernelPriority(connector string) []string {
 	switch connector {
 	case config.BrowserConnectorMihomo:
-		return []string{ProxyKernelMihomo, ProxyKernelNative}
+		return []string{ProxyKernelMihomo}
 	default:
-		return []string{ProxyKernelXray, ProxyKernelSingBox, ProxyKernelNative}
+		return []string{ProxyKernelXray, ProxyKernelSingBox}
 	}
 }
 

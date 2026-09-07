@@ -10,9 +10,10 @@ import (
 
 // BuildDiagnosticOptions 控制代理诊断构建行为。
 type BuildDiagnosticOptions struct {
-	XrayMgr    *XrayManager
-	SingBoxMgr *SingBoxManager
-	ClashMgr   *ClashManager
+	XrayMgr       *XrayManager
+	SingBoxMgr    *SingBoxManager
+	ClashMgr      *ClashManager
+	ConnectorType string
 }
 
 // ProxyBuildDiagnostic 是不启动桥接进程的代理构建诊断结果。
@@ -67,13 +68,18 @@ func BuildProxyDiagnostic(proxyConfig string, proxies []config.BrowserProxy, pro
 	if found {
 		result.ProxyName = item.ProxyName
 	}
+	connectorType, connectorErr := RequireConnectorType(options.ConnectorType)
+	if connectorErr != nil {
+		result.Errors = append(result.Errors, safeProxyError(connectorErr))
+		return result
+	}
+	options.ConnectorType = connectorType
 	if proxyId != "" && !found && src == "" {
 		result.Errors = append(result.Errors, fmt.Sprintf("代理池节点已不存在: %s", proxyId))
 		return result
 	}
 	if src == "" {
-		result.Engine = "empty"
-		result.Ok = true
+		result.Errors = append(result.Errors, "代理配置为空")
 		return result
 	}
 	if strings.EqualFold(src, "direct://") {
@@ -84,7 +90,7 @@ func BuildProxyDiagnostic(proxyConfig string, proxies []config.BrowserProxy, pro
 
 	src = normalizeNodeScheme(src)
 	result.RawConfigMasked = maskProxyConfig(src)
-	resolution, err := ResolveProxyKernel(src, proxies, proxyId, "")
+	resolution, err := ResolveProxyKernelForConnector(src, proxies, proxyId, options.ConnectorType)
 	if err != nil {
 		result.Errors = append(result.Errors, safeProxyError(err))
 		return result

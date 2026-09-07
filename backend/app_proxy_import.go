@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/proxy"
 	"context"
 	"encoding/base64"
@@ -55,13 +54,19 @@ func (a *App) browserProxyFetchClashByURL(rawURL string, proxyID string) (map[st
 		return nil, fmt.Errorf("仅支持 http/https URL")
 	}
 
-	client := &http.Client{Timeout: clashSubscriptionTimeout}
+	var client *http.Client
 	if proxyID != "" {
 		proxyClient, err := a.clashSubscriptionProxyClient(proxyID)
 		if err != nil {
 			return nil, err
 		}
 		client = proxyClient
+	} else {
+		connectorType := a.defaultProxyConnectorType()
+		client, err = proxy.BuildProxyHTTPClient("direct://", "", a.getLatestProxies(), a.xrayMgr, a.singboxMgr, a.clashMgr, connectorType, clashSubscriptionTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("建立直連訂閱客戶端失敗: %w", err)
+		}
 	}
 	content, payload, err := fetchClashSubscriptionWithFallback(client, parsedURL.String(), clashSubscriptionTimeout)
 	if err != nil {
@@ -100,7 +105,7 @@ func (a *App) clashSubscriptionProxyClient(proxyID string) (*http.Client, error)
 	if !found {
 		return nil, fmt.Errorf("拉取代理不存在或配置为空")
 	}
-	connectorType := config.NormalizeBrowserConnectorType(a.config.Browser.DefaultConnectorType)
+	connectorType := a.defaultProxyConnectorType()
 	return proxy.BuildProxyHTTPClient("", proxyID, proxies, a.xrayMgr, a.singboxMgr, a.clashMgr, connectorType, clashSubscriptionTimeout)
 }
 

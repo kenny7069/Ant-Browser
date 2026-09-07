@@ -1,6 +1,10 @@
 package proxy
 
-import "testing"
+import (
+	"testing"
+
+	"ant-chrome/backend/internal/config"
+)
 
 func TestVlessRealityURIUsesRealitySettings(t *testing.T) {
 	src := "vless://00000000-0000-0000-0000-000000000001@reality.example.com:443?security=reality&sni=sni.example.com&fp=chrome&pbk=public-key-1&sid=abcd&spx=%2F&type=tcp&flow=xtls-rprx-vision#Reality"
@@ -131,7 +135,7 @@ plugin-opts:
 	if RequiresBridge(src, nil, "") {
 		t.Fatalf("SS plugin node must not require Xray bridge")
 	}
-	ok, msg := ValidateProxyConfig(src, nil, "")
+	ok, msg := ValidateProxyConfigForConnector(src, nil, "", config.BrowserConnectorMihomo)
 	if !ok {
 		t.Fatalf("ValidateProxyConfig rejected SS plugin node: %s", msg)
 	}
@@ -160,7 +164,7 @@ public-key: public
 	if RequiresBridge(src, nil, "") {
 		t.Fatalf("WireGuard node must not require Xray bridge")
 	}
-	ok, msg := ValidateProxyConfig(src, nil, "")
+	ok, msg := ValidateProxyConfigForConnector(src, nil, "", config.BrowserConnectorMihomo)
 	if !ok {
 		t.Fatalf("ValidateProxyConfig rejected WireGuard node: %s", msg)
 	}
@@ -183,7 +187,7 @@ cipher: aes-128-gcm
 password: secret
 plugin: obfs
 `
-	diagnostic := BuildProxyDiagnostic(ssPlugin, nil, "", BuildDiagnosticOptions{})
+	diagnostic := BuildProxyDiagnostic(ssPlugin, nil, "", BuildDiagnosticOptions{ConnectorType: config.BrowserConnectorMihomo})
 	if !diagnostic.Ok {
 		t.Fatalf("SS plugin diagnostic failed: %+v", diagnostic)
 	}
@@ -203,7 +207,7 @@ ip: 172.16.0.2
 private-key: private
 public-key: public
 `
-	diagnostic = BuildProxyDiagnostic(wireGuard, nil, "", BuildDiagnosticOptions{})
+	diagnostic = BuildProxyDiagnostic(wireGuard, nil, "", BuildDiagnosticOptions{ConnectorType: config.BrowserConnectorMihomo})
 	if !diagnostic.Ok {
 		t.Fatalf("WireGuard diagnostic failed: %+v", diagnostic)
 	}

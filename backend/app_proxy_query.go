@@ -2,7 +2,6 @@ package backend
 
 import (
 	"ant-chrome/backend/internal/browser"
-	"ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/proxy"
 	"strings"
 	"sync"
@@ -26,7 +25,7 @@ func (a *App) BrowserProxyListByGroup(groupName string) []BrowserProxy {
 // ValidateProxyConfig 验证代理配置是否支持
 func (a *App) ValidateProxyConfig(proxyConfig string, proxyId string) ProxyValidationResult {
 	proxies := a.getLatestProxies()
-	supported, errorMsg := proxy.ValidateProxyConfig(proxyConfig, proxies, proxyId)
+	supported, errorMsg := proxy.ValidateProxyConfigForConnector(proxyConfig, proxies, proxyId, a.defaultProxyConnectorType())
 	return ProxyValidationResult{
 		Supported: supported,
 		ErrorMsg:  errorMsg,
@@ -36,7 +35,7 @@ func (a *App) ValidateProxyConfig(proxyConfig string, proxyId string) ProxyValid
 // TestProxyConnectivity 测试代理连通性
 func (a *App) TestProxyConnectivity(proxyId string, proxyConfig string) ProxyTestResult {
 	proxies := a.getLatestProxies()
-	result := proxy.TestConnectivity(proxyId, proxyConfig, proxies, nil)
+	result := proxy.TestConnectivityWithConnector(proxyId, proxyConfig, proxies, a.defaultProxyConnectorType())
 	if result.Engine == "" {
 		result.Engine = "tcp"
 	}
@@ -47,7 +46,7 @@ func (a *App) TestProxyConnectivity(proxyId string, proxyConfig string) ProxyTes
 // 参考 Clash URLTest 策略：多 URL fallback + 复用桥接 + TCP ping 降级
 func (a *App) TestProxyRealConnectivity(proxyId string) ProxyTestResult {
 	proxies := a.getLatestProxies()
-	connectorType := config.NormalizeBrowserConnectorType(a.config.Browser.DefaultConnectorType)
+	connectorType := a.defaultProxyConnectorType()
 	result := proxy.TestRealConnectivityWithRuntimeConfig(proxyId, proxies, a.xrayMgr, a.singboxMgr, a.clashMgr, connectorType, a.proxySpeedTestConfig())
 	return buildProxyTestResult(result)
 }
@@ -55,13 +54,13 @@ func (a *App) TestProxyRealConnectivity(proxyId string) ProxyTestResult {
 // BrowserProxyWarmupBridge 只预热本地代理桥接，不执行外网测速。
 func (a *App) BrowserProxyWarmupBridge(proxyId string) ProxyBridgeWarmupResult {
 	proxies := a.getLatestProxies()
-	return a.warmupProxyBridge(proxyId, "", proxies)
+	return a.warmupProxyBridge(proxyId, "", proxies, a.defaultProxyConnectorType())
 }
 
 // BrowserProxyWarmupBridgeWithConfig 预热指定代理配置，proxyConfig 仅本次预热生效。
 func (a *App) BrowserProxyWarmupBridgeWithConfig(proxyId string, proxyConfig string) ProxyBridgeWarmupResult {
 	proxies := a.getLatestProxies()
-	return a.warmupProxyBridge(proxyId, proxyConfig, proxies)
+	return a.warmupProxyBridge(proxyId, proxyConfig, proxies, a.defaultProxyConnectorType())
 }
 
 // BrowserProxyBatchWarmupBridge 批量预热代理桥接，concurrency 控制并发数（默认 5）。
@@ -89,7 +88,7 @@ func (a *App) BrowserProxyBatchWarmupBridge(proxyIds []string, concurrency int) 
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				results[job.idx] = a.warmupProxyBridge(job.proxyId, "", proxies)
+				results[job.idx] = a.warmupProxyBridge(job.proxyId, "", proxies, a.defaultProxyConnectorType())
 			}
 		}()
 	}
@@ -101,7 +100,7 @@ func (a *App) BrowserProxyBatchWarmupBridge(proxyIds []string, concurrency int) 
 	return results
 }
 
-func (a *App) warmupProxyBridge(proxyId string, proxyConfig string, proxies []BrowserProxy) ProxyBridgeWarmupResult {
+func (a *App) warmupProxyBridge(proxyId string, proxyConfig string, proxies []BrowserProxy, connectorType string) ProxyBridgeWarmupResult {
 	startedAt := time.Now()
 	proxyId = strings.TrimSpace(proxyId)
 	result := ProxyBridgeWarmupResult{ProxyId: proxyId}
@@ -111,7 +110,7 @@ func (a *App) warmupProxyBridge(proxyId string, proxyConfig string, proxies []Br
 		return result
 	}
 
-	resolution, err := proxy.ResolveProxyKernel(src, proxies, proxyId, "")
+	resolution, err := proxy.ResolveProxyKernelForConnector(src, proxies, proxyId, connectorType)
 	result.Engine = resolution.Kernel
 	if err != nil {
 		result.Error = err.Error()

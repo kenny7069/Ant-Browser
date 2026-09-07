@@ -911,12 +911,13 @@ func (s *BrowserRuntimeService) LocalProfileProxyBinding(profileID string) (Farm
 	if proxyConfig == "" || proxyConfig == "direct://" {
 		return FarmRuntimeProxyBinding{}, fmt.Errorf("local profile has no authenticated proxy")
 	}
-	connector := config.BrowserConnectorXray
+	connector := ""
 	if s.config != nil {
-		connector = config.NormalizeBrowserConnectorType(s.config.Browser.DefaultConnectorType)
+		connector = s.config.Browser.DefaultConnectorType
 	}
-	if connector != config.BrowserConnectorXray && connector != config.BrowserConnectorMihomo {
-		return FarmRuntimeProxyBinding{}, fmt.Errorf("local connector is not supported")
+	connector, err = proxy.RequireConnectorType(connector)
+	if err != nil {
+		return FarmRuntimeProxyBinding{}, err
 	}
 	resolution, err := proxy.ResolveProxyKernelForConnector(proxyConfig, proxies, proxyID, connector)
 	if err != nil || resolution.Kernel != proxy.ProxyKernelXray &&
@@ -978,14 +979,26 @@ func (s *BrowserRuntimeService) resolveStartProxy(input browserStartInput, profi
 			}
 		}
 	}
-	if supported, errorMsg := proxy.ValidateProxyConfig(resolvedProxyConfig, proxies, resolvedProxyID); !supported {
-		startErr := fmt.Errorf("实例启动失败：%s", errorMsg)
+	// An unselected profile has historically represented direct launch. Make
+	// that compatibility decision here so the operation resolver only ever
+	// receives the explicit literal direct:// exception.
+	if resolvedProxyID == "" && strings.TrimSpace(resolvedProxyConfig) == "" {
+		resolvedProxyConfig = "direct://"
+	}
+	connectorType := ""
+	if s.config != nil {
+		connectorType = s.config.Browser.DefaultConnectorType
+	}
+	connectorType, err := proxy.RequireConnectorType(connectorType)
+	if err != nil {
+		startErr := fmt.Errorf("实例启动失败：%s", err.Error())
 		profile.LastError = startErr.Error()
 		return "", profileProxyBridgeRef{}, false, startErr
 	}
-	connectorType := config.BrowserConnectorXray
-	if s.config != nil {
-		connectorType = config.NormalizeBrowserConnectorType(s.config.Browser.DefaultConnectorType)
+	if supported, errorMsg := proxy.ValidateProxyConfigForConnector(resolvedProxyConfig, proxies, resolvedProxyID, connectorType); !supported {
+		startErr := fmt.Errorf("实例启动失败：%s", errorMsg)
+		profile.LastError = startErr.Error()
+		return "", profileProxyBridgeRef{}, false, startErr
 	}
 	resolution, err := proxy.ResolveProxyKernelForConnector(resolvedProxyConfig, proxies, resolvedProxyID, connectorType)
 	if err != nil {

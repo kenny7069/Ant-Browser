@@ -289,7 +289,11 @@ func (a *App) BrowserCoreDownload(coreName, url, proxyConfig string) error {
 	if a.ctx == nil {
 		return fmt.Errorf("app context is nil")
 	}
-	go a.browserMgr.DownloadAndExtractCore(a.ctx, coreName, url, proxyConfig)
+	client, err := a.browserCoreDownloadHTTPClient(proxyConfig)
+	if err != nil {
+		return err
+	}
+	go a.browserMgr.DownloadAndExtractCore(a.ctx, coreName, url, client)
 	return nil
 }
 
@@ -298,6 +302,10 @@ func (a *App) BrowserCoreRedownload(coreId, url, proxyConfig string) error {
 	if a.ctx == nil {
 		return fmt.Errorf("app context is nil")
 	}
-	go a.browserMgr.RedownloadCore(a.ctx, coreId, url, proxyConfig)
+	client, err := a.browserCoreDownloadHTTPClient(proxyConfig)
+	if err != nil {
+		return err
+	}
+	go a.browserMgr.RedownloadCore(a.ctx, coreId, url, client)
 	return nil
 }

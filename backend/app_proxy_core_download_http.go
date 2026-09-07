@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	xproxy "golang.org/x/net/proxy"
+	"ant-chrome/backend/internal/proxy"
 )
 
 type githubRelease struct {
@@ -27,10 +26,25 @@ type githubReleaseAsset struct {
 	Size               int64  `json:"size"`
 }
 
-func proxyCoreHTTPClient(timeout time.Duration, proxyConfig string) (*http.Client, string, error) {
+func (a *App) browserCoreDownloadHTTPClient(proxyConfig string) (*http.Client, error) {
+	connectorType, err := a.resolveOperationConnector("")
+	if err != nil {
+		return nil, err
+	}
+	client, _, err := a.proxyCoreHTTPClient(0, proxyConfig, connectorType)
+	return client, err
+}
+
+func (a *App) proxyCoreHTTPClient(timeout time.Duration, proxyConfig string, connectorType string) (*http.Client, string, error) {
 	proxyConfig = strings.TrimSpace(proxyConfig)
-	if proxyConfig == "" || strings.EqualFold(proxyConfig, "direct://") {
-		return &http.Client{Timeout: timeout, Transport: proxyCoreDirectTransport()}, "直连", nil
+	if proxyConfig == "__direct__" {
+		proxyConfig = "direct://"
+	}
+	if proxyConfig == "__system__" {
+		return nil, "", fmt.Errorf("不允许使用系统代理，必须选择 direct:// 或明确 connector stack")
+	}
+	if proxyConfig == "" {
+		return nil, "", fmt.Errorf("代理配置为空；直连请明确使用 direct://")
 	}
 	u, err := url.Parse(proxyConfig)
 	if err != nil {
@@ -39,41 +53,23 @@ func proxyCoreHTTPClient(timeout time.Duration, proxyConfig string) (*http.Clien
 	if isBadLocalHTTPSProxy(u) {
 		return nil, "", fmt.Errorf("下载代理不能填 %s，127.0.0.1:443 通常不是本机代理端口；请改成真实代理端口，如 socks5://127.0.0.1:7890，或留空直连", u.Host)
 	}
-	scheme := strings.ToLower(u.Scheme)
-	switch scheme {
-	case "http", "https":
-		return &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: http.ProxyURL(u)}}, "指定代理", nil
-	case "socks5":
-		var auth *xproxy.Auth
-		if u.User != nil {
-			password, _ := u.User.Password()
-			auth = &xproxy.Auth{User: u.User.Username(), Password: password}
-		}
-		dialer, err := xproxy.SOCKS5("tcp", u.Host, auth, xproxy.Direct)
-		if err != nil {
-			return nil, "", fmt.Errorf("SOCKS5 dialer 创建失败: %w", err)
-		}
-		contextDialer, ok := dialer.(xproxy.ContextDialer)
-		if !ok {
-			return nil, "", fmt.Errorf("SOCKS5 dialer 不支持 ContextDialer")
-		}
-		return &http.Client{Timeout: timeout, Transport: &http.Transport{DialContext: contextDialer.DialContext}}, "指定代理", nil
-	default:
-		return nil, "", fmt.Errorf("仅支持 http://、https://、socks5:// 或 direct://")
+	connectorType, err = a.resolveOperationConnector(connectorType)
+	if err != nil {
+		return nil, "", err
 	}
-}
-
-func proxyCoreDirectTransport() *http.Transport {
-	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
-	return &http.Transport{
-		DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(address)
-			if err == nil && port == "443" && isLocalhostHost(host) {
-				return nil, fmt.Errorf("直连下载被解析到 %s：这通常是本机 hosts/DNS 污染或仍在运行旧版本。请重启应用；如果仍出现，请检查 hosts/DNS，或在下载代理中填写真实代理端口", address)
-			}
-			return dialer.DialContext(ctx, network, address)
-		},
+	var proxies []BrowserProxy
+	if a != nil && a.browserMgr != nil {
+		proxies = a.getLatestProxies()
 	}
+	client, err := proxy.BuildProxyHTTPClient(proxyConfig, "", proxies, a.xrayMgr, a.singboxMgr, a.clashMgr, connectorType, timeout)
+	if err != nil {
+		return nil, "", err
+	}
+	label := "指定代理（" + connectorType + "）"
+	if strings.EqualFold(proxyConfig, "direct://") {
+		label = "直连（" + connectorType + "）"
+	}
+	return client, label, nil
 }
 
 func isBadLocalHTTPSProxy(u *url.URL) bool {
