@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -249,10 +250,10 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 }
 
 // TestFarmRuntimeP114CrossRepoRealChromeCDPGateway is the opt-in production
-// topology proof: Python loopback gateway → authenticated Go Agent outbound
-// tunnel → owned browser-level Chrome CDP → real Playwright client.  It is
-// intentionally separate from P1.12 readiness and does not claim the later
-// Infrastructure example.com/cookies gate.
+// topology proof: isolated real Control DB leases → Python loopback gateway →
+// authenticated Go Agent outbound tunnel → owned browser-level Chrome CDP →
+// real Playwright against https://example.com. It is intentionally separate
+// from P1.12 readiness, but covers the P1.14 Infrastructure operation gate.
 func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 	if os.Getenv("P114_CROSS_REPO_REAL_CHROME") != "1" {
 		t.Skip("explicit P114_CROSS_REPO_REAL_CHROME=1 opt-in required")
@@ -274,9 +275,11 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 		t.Fatal(err)
 	}
 	const (
-		nodeUID    = "node-p114-cross"
-		providerID = "provider-p114-cross"
-		profileID  = "p114-cross-isolated"
+		nodeUID              = "node-p114-cross"
+		providerID           = "provider-p114-cross"
+		profileID            = "114001"
+		controllerID         = "controller-p114-cross"
+		controllerGeneration = uint64(1)
 	)
 	root := t.TempDir()
 	urlFile := filepath.Join(root, "control-wss.url")
@@ -289,6 +292,7 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 	publicKey := base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
 	serverCtx, stopServer := context.WithTimeout(context.Background(), 90*time.Second)
 	defer stopServer()
+	controlDBName := fmt.Sprintf("bf_p114_%x", time.Now().UnixNano())
 	serverCommand := exec.CommandContext(serverCtx, "python3", fixtureScript,
 		"--url-file", urlFile, "--gateway-file", gatewayFile,
 		"--reattach-request-file", reattachRequestFile,
@@ -297,6 +301,10 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 		"--ca-file", caFile, "--node-uid", nodeUID,
 		"--public-key", publicKey, "--profile-id", profileID,
 		"--provider-instance-id", providerID, "--fencing-epoch", "1")
+	serverCommand.Args = append(serverCommand.Args,
+		"--controller-id", controllerID,
+		"--controller-generation", fmt.Sprint(controllerGeneration))
+	serverCommand.Env = append(os.Environ(), "SCRAPER_CONTROL_DB_NAME="+controlDBName)
 	var serverOutput bytes.Buffer
 	serverCommand.Stdout = &serverOutput
 	serverCommand.Stderr = &serverOutput
@@ -355,6 +363,7 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 	farm, err := NewFarmRuntimeService(FarmRuntimeServiceConfig{
 		BrowserRuntimeService: service, NodeUID: nodeUID,
 		ProviderInstanceID: providerID, FencingEpoch: 1,
+		ControllerID: controllerID, ControllerGeneration: controllerGeneration,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -412,8 +421,11 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 		t.Fatalf("P1.14 Python fixture failed: %v output=%s", err, serverOutput.String())
 	}
 	var evidence struct {
-		Accepted   bool `json:"accepted"`
-		Playwright struct {
+		Accepted             bool `json:"accepted"`
+		AuthorityAcquired    bool `json:"authority_acquired"`
+		RuntimeLeaseReleased bool `json:"runtime_lease_released"`
+		ControlDBCleanup     bool `json:"control_db_cleanup"`
+		Playwright           struct {
 			Connected        bool   `json:"connected"`
 			BasicIO          bool   `json:"basic_io"`
 			Title            string `json:"title"`
@@ -437,7 +449,8 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 	if err := json.Unmarshal(raw, &evidence); err != nil {
 		t.Fatal(err)
 	}
-	if !evidence.Accepted {
+	if !evidence.Accepted || !evidence.AuthorityAcquired ||
+		!evidence.RuntimeLeaseReleased || !evidence.ControlDBCleanup {
 		t.Fatalf("P1.14 evidence not accepted: %s", raw)
 	}
 	if !evidence.Playwright.Connected ||

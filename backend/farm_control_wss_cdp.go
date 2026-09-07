@@ -23,21 +23,90 @@ import (
 const (
 	farmCDPControlTunnelPath = "/control/cdp-tunnel"
 	farmCDPMessageBytes      = 32 * 1024 * 1024
+	farmCDPWriteTimeout      = 2 * time.Second
+	farmCDPCleanupTimeout    = 3 * time.Second
 )
 
 type farmControlCDPSession struct {
-	browserConn *websocket.Conn
-	tunnelConn  *websocket.Conn
-	writeMu     sync.Mutex
+	browserConn    *websocket.Conn
+	tunnelConn     *websocket.Conn
+	browserWriteMu sync.Mutex
+	tunnelWriteMu  sync.Mutex
+	closeOnce      sync.Once
+	cleanupOnce    sync.Once
+	closed         chan struct{}
+	// writeHook is nil in production. Package tests use it only to model a
+	// destination that blocks or returns a write error, so cancellation and
+	// cleanup are verified without relying on kernel socket-buffer timing.
+	writeHook func(*websocket.Conn, int, []byte) error
+}
+
+func newFarmControlCDPSession(browserConn, tunnelConn *websocket.Conn) *farmControlCDPSession {
+	return &farmControlCDPSession{
+		browserConn: browserConn,
+		tunnelConn:  tunnelConn,
+		closed:      make(chan struct{}),
+	}
 }
 
 func (session *farmControlCDPSession) write(conn *websocket.Conn, messageType int, payload []byte) error {
 	if session == nil || conn == nil {
 		return ErrFarmControlWSSClosed
 	}
-	session.writeMu.Lock()
-	defer session.writeMu.Unlock()
-	return conn.WriteMessage(messageType, payload)
+	var writeMu *sync.Mutex
+	switch conn {
+	case session.browserConn:
+		writeMu = &session.browserWriteMu
+	case session.tunnelConn:
+		writeMu = &session.tunnelWriteMu
+	default:
+		return ErrFarmControlWSSClosed
+	}
+	select {
+	case <-session.closed:
+		return ErrFarmControlWSSClosed
+	default:
+	}
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	select {
+	case <-session.closed:
+		return ErrFarmControlWSSClosed
+	default:
+	}
+	if session.writeHook != nil {
+		return session.writeHook(conn, messageType, payload)
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(farmCDPWriteTimeout)); err != nil {
+		return err
+	}
+	err := conn.WriteMessage(messageType, payload)
+	if err == nil {
+		_ = conn.SetWriteDeadline(time.Time{})
+	}
+	return err
+}
+
+func (session *farmControlCDPSession) terminate(closeCode int, reason string) {
+	if session == nil {
+		return
+	}
+	session.closeOnce.Do(func() {
+		if session.closed == nil {
+			session.closed = make(chan struct{})
+		}
+		close(session.closed)
+		deadline := time.Now().Add(100 * time.Millisecond)
+		message := websocket.FormatCloseMessage(closeCode, reason)
+		if session.browserConn != nil {
+			_ = session.browserConn.WriteControl(websocket.CloseMessage, message, deadline)
+			_ = session.browserConn.Close()
+		}
+		if session.tunnelConn != nil {
+			_ = session.tunnelConn.WriteControl(websocket.CloseMessage, message, deadline)
+			_ = session.tunnelConn.Close()
+		}
+	})
 }
 
 func (c *FarmControlWSSClient) addCDPSession(sessionID string, session *farmControlCDPSession) {
@@ -60,22 +129,24 @@ func (c *FarmControlWSSClient) removeCDPSession(sessionID string, expected *farm
 
 func (c *FarmControlWSSClient) closeCDPSessions() {
 	c.cdpMu.Lock()
-	sessions := make([]*farmControlCDPSession, 0, len(c.cdpSessions))
+	type closedSession struct {
+		id      string
+		session *farmControlCDPSession
+	}
+	sessions := make([]closedSession, 0, len(c.cdpSessions))
 	for sessionID, session := range c.cdpSessions {
 		delete(c.cdpSessions, sessionID)
-		sessions = append(sessions, session)
+		sessions = append(sessions, closedSession{id: sessionID, session: session})
 	}
 	c.cdpMu.Unlock()
-	for _, session := range sessions {
+	for _, closed := range sessions {
+		session := closed.session
 		if session == nil {
 			continue
 		}
-		if session.browserConn != nil {
-			_ = session.browserConn.Close()
-		}
-		if session.tunnelConn != nil {
-			_ = session.tunnelConn.Close()
-		}
+		session.terminate(websocket.CloseNormalClosure, "Control WSS closed")
+		c.adapter.CloseCDPTunnel(closed.id, session.browserConn)
+		c.removeCDPSession(closed.id, session)
 	}
 }
 
@@ -216,7 +287,7 @@ func (c *FarmControlWSSClient) handleOpenCDPCommand(conn *websocket.Conn, comman
 		c.writeCDPResponse(conn, command, false, nil, ErrFarmControlWSSProtocol)
 		return
 	}
-	session := &farmControlCDPSession{browserConn: browserConn, tunnelConn: tunnelConn}
+	session := newFarmControlCDPSession(browserConn, tunnelConn)
 	c.addCDPSession(request.SessionID, session)
 	ready := FarmCDPTunnelReady{SessionID: request.SessionID, Ready: true}
 	if writeErr := c.writeJSON(conn, FarmRuntimeCommandResponse{
@@ -226,7 +297,7 @@ func (c *FarmControlWSSClient) handleOpenCDPCommand(conn *websocket.Conn, comman
 		OK:            true,
 		Payload:       ready,
 	}); writeErr != nil {
-		_ = tunnelConn.Close()
+		session.terminate(websocket.CloseInternalServerErr, "CDP command response failed")
 		c.adapter.CloseCDPTunnel(request.SessionID, browserConn)
 		c.removeCDPSession(request.SessionID, session)
 		c.shutdown(writeErr)
@@ -241,51 +312,30 @@ func (c *FarmControlWSSClient) relayCDP(sessionID string, session *farmControlCD
 	}
 	browserConn, tunnelConn := session.browserConn, session.tunnelConn
 	if browserConn == nil || tunnelConn == nil {
-		if browserConn != nil {
-			_ = browserConn.Close()
-		}
-		if tunnelConn != nil {
-			_ = tunnelConn.Close()
-		}
+		session.terminate(websocket.CloseInternalServerErr, "CDP tunnel incomplete")
+		c.adapter.CloseCDPTunnel(sessionID, browserConn)
+		c.removeCDPSession(sessionID, session)
 		return
 	}
-	browserConn.SetReadLimit(farmCDPMessageBytes)
-	tunnelConn.SetReadLimit(farmCDPMessageBytes)
 	done := make(chan error, 2)
-	go func() {
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	pump := func(source, destination *websocket.Conn) {
+		defer pumps.Done()
 		for {
-			messageType, payload, err := browserConn.ReadMessage()
+			messageType, payload, err := farmReadCDPMessage(source)
 			if err != nil {
 				done <- farmCDPRelayError(err)
 				return
 			}
-			if len(payload) > farmCDPMessageBytes {
-				done <- ErrFarmControlWSSMessageLimit
-				return
-			}
-			if err := session.write(tunnelConn, messageType, payload); err != nil {
+			if err := session.write(destination, messageType, payload); err != nil {
 				done <- err
 				return
 			}
 		}
-	}()
-	go func() {
-		for {
-			messageType, payload, err := tunnelConn.ReadMessage()
-			if err != nil {
-				done <- farmCDPRelayError(err)
-				return
-			}
-			if len(payload) > farmCDPMessageBytes {
-				done <- ErrFarmControlWSSMessageLimit
-				return
-			}
-			if err := session.write(browserConn, messageType, payload); err != nil {
-				done <- err
-				return
-			}
-		}
-	}()
+	}
+	go pump(browserConn, tunnelConn)
+	go pump(tunnelConn, browserConn)
 	firstErr := <-done
 	closeCode := websocket.CloseNormalClosure
 	closeReason := "CDP tunnel closed"
@@ -296,12 +346,46 @@ func (c *FarmControlWSSClient) relayCDP(sessionID string, session *farmControlCD
 		_ = session.write(browserConn, websocket.TextMessage, message)
 		_ = session.write(tunnelConn, websocket.TextMessage, message)
 	}
-	_ = browserConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(closeCode, closeReason), time.Now().Add(100*time.Millisecond))
-	_ = tunnelConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(closeCode, closeReason), time.Now().Add(100*time.Millisecond))
-	_ = browserConn.Close()
-	_ = tunnelConn.Close()
-	c.adapter.CloseCDPTunnel(sessionID, browserConn)
-	c.removeCDPSession(sessionID, session)
+	// The first terminal event closes both sockets immediately. This interrupts
+	// a blocked ReadMessage or a write waiting on the peer; write deadlines are
+	// an additional bound for a peer that stops consuming frames.
+	session.terminate(closeCode, closeReason)
+	waited := make(chan struct{})
+	go func() {
+		pumps.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(farmCDPCleanupTimeout):
+	}
+	session.cleanupOnce.Do(func() {
+		c.adapter.CloseCDPTunnel(sessionID, browserConn)
+		c.removeCDPSession(sessionID, session)
+	})
+}
+
+// farmReadCDPMessage keeps the relay's allocation bounded while retaining
+// enough of an oversized frame to emit the explicit protocol error before the
+// 1009 close. Using ReadMessage with an exact read limit lets Gorilla send its
+// own close immediately and leaves no opportunity for the error frame.
+func farmReadCDPMessage(conn *websocket.Conn) (int, []byte, error) {
+	if conn == nil {
+		return 0, nil, ErrFarmControlWSSClosed
+	}
+	conn.SetReadLimit(farmCDPMessageBytes + 1)
+	messageType, reader, err := conn.NextReader()
+	if err != nil {
+		return 0, nil, err
+	}
+	payload, err := io.ReadAll(io.LimitReader(reader, int64(farmCDPMessageBytes)+1))
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(payload) > farmCDPMessageBytes {
+		return 0, nil, ErrFarmControlWSSMessageLimit
+	}
+	return messageType, payload, nil
 }
 
 func farmCDPRelayError(err error) error {
