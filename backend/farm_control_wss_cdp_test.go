@@ -43,7 +43,7 @@ func newCDPRelaySocketPair(t *testing.T) (*websocket.Conn, *websocket.Conn, func
 	}
 }
 
-func assertCDPRelayClosed(t *testing.T, client *FarmControlWSSClient, sessionID string, session *farmControlCDPSession, expectOversize bool, peers ...*websocket.Conn) {
+func assertCDPRelayClosed(t *testing.T, client *FarmControlWSSClient, farm *FarmRuntimeService, sessionID string, session *farmControlCDPSession, expectOversize bool, peers ...*websocket.Conn) {
 	t.Helper()
 	select {
 	case <-session.closed:
@@ -55,6 +55,12 @@ func assertCDPRelayClosed(t *testing.T, client *FarmControlWSSClient, sessionID 
 	client.cdpMu.Unlock()
 	if active {
 		t.Fatal("terminal relay event left active session map entry")
+	}
+	farm.cdpSessionsMu.Lock()
+	_, farmActive := farm.cdpSessions[sessionID]
+	farm.cdpSessionsMu.Unlock()
+	if farmActive {
+		t.Fatal("terminal relay event left Farm runtime session map entry")
 	}
 	for _, peer := range peers {
 		if peer == nil {
@@ -135,80 +141,126 @@ func TestFarmControlCDPRelayCloseInterruptsBothDirectionsAndCleansSession(t *tes
 }
 
 func TestFarmControlCDPRelayTerminalEventsAreBoundedAndBidirectional(t *testing.T) {
-	for _, mode := range []string{"browser-close", "tunnel-close", "write-error", "blocked-write", "oversize"} {
-		t.Run(mode, func(t *testing.T) {
-			browserConn, browserPeer, closeBrowser := newCDPRelaySocketPair(t)
-			defer closeBrowser()
-			tunnelConn, tunnelPeer, closeTunnel := newCDPRelaySocketPair(t)
-			defer closeTunnel()
-			fixture := newFarmRuntimeTestFixture(t, "profile-1")
-			adapter, err := NewFarmRuntimeControlAdapter(fixture.farm)
-			if err != nil {
-				t.Fatal(err)
-			}
-			client := &FarmControlWSSClient{
-				adapter:     adapter,
-				cdpSessions: make(map[string]*farmControlCDPSession),
-			}
-			sessionID := "relay-terminal-" + mode
-			session := newFarmControlCDPSession(browserConn, tunnelConn)
-			var writeStarted chan struct{}
-			var writeOnce sync.Once
-			switch mode {
-			case "write-error":
-				session.writeHook = func(conn *websocket.Conn, _ int, _ []byte) error {
-					if conn == tunnelConn {
-						return errors.New("injected CDP destination write failure")
-					}
-					return nil
-				}
-			case "blocked-write":
-				writeStarted = make(chan struct{})
-				session.writeHook = func(conn *websocket.Conn, _ int, _ []byte) error {
-					if conn != tunnelConn {
-						return nil
-					}
-					writeOnce.Do(func() { close(writeStarted) })
-					<-session.closed
-					return ErrFarmControlWSSClosed
-				}
-			}
-			client.addCDPSession(sessionID, session)
-			relayDone := make(chan struct{})
-			go func() {
-				client.relayCDP(sessionID, session)
-				close(relayDone)
-			}()
-			switch mode {
-			case "browser-close":
-				_ = browserPeer.Close()
-			case "tunnel-close":
-				_ = tunnelPeer.Close()
-			case "write-error":
-				_ = browserPeer.WriteMessage(websocket.TextMessage, []byte("write-error"))
-			case "blocked-write":
-				if err := browserPeer.WriteMessage(websocket.TextMessage, []byte("blocked-write")); err != nil {
+	sources := []struct {
+		name       string
+		selectConn func(browserConn, tunnelConn, browserPeer, tunnelPeer *websocket.Conn) (*websocket.Conn, *websocket.Conn)
+	}{
+		{
+			name: "browser",
+			selectConn: func(browserConn, tunnelConn, browserPeer, tunnelPeer *websocket.Conn) (*websocket.Conn, *websocket.Conn) {
+				return browserConn, browserPeer
+			},
+		},
+		{
+			name: "tunnel",
+			selectConn: func(browserConn, tunnelConn, browserPeer, tunnelPeer *websocket.Conn) (*websocket.Conn, *websocket.Conn) {
+				return tunnelConn, tunnelPeer
+			},
+		},
+	}
+	terminals := []string{"close", "abrupt-eof", "read-error", "write-error", "blocked-write", "oversize"}
+	for _, source := range sources {
+		for _, terminal := range terminals {
+			mode := source.name + "-" + terminal
+			t.Run(mode, func(t *testing.T) {
+				browserConn, browserPeer, closeBrowser := newCDPRelaySocketPair(t)
+				defer closeBrowser()
+				tunnelConn, tunnelPeer, closeTunnel := newCDPRelaySocketPair(t)
+				defer closeTunnel()
+				fixture := newFarmRuntimeTestFixture(t, "profile-1")
+				adapter, err := NewFarmRuntimeControlAdapter(fixture.farm)
+				if err != nil {
 					t.Fatal(err)
 				}
-				select {
-				case <-writeStarted:
-				case <-time.After(time.Second):
-					t.Fatal("relay did not enter controllable blocked write")
+				client := &FarmControlWSSClient{
+					adapter:     adapter,
+					cdpSessions: make(map[string]*farmControlCDPSession),
 				}
-				// The opposite read error must interrupt the blocked destination
-				// write; waiting for its deadline would make cleanup unbounded.
-				_ = tunnelPeer.Close()
-			case "oversize":
-				payload := make([]byte, farmCDPMessageBytes+1)
-				_ = browserPeer.SetWriteDeadline(time.Now().Add(3 * time.Second))
-				_ = browserPeer.WriteMessage(websocket.BinaryMessage, payload)
-			}
-			select {
-			case <-relayDone:
-			case <-time.After(4 * time.Second):
-				t.Fatal("relay terminal cleanup exceeded bounded deadline")
-			}
-			assertCDPRelayClosed(t, client, sessionID, session, mode == "oversize", browserPeer, tunnelPeer)
-		})
+				sessionID := "relay-terminal-" + mode
+				session := newFarmControlCDPSession(browserConn, tunnelConn)
+				sourceConn, sourcePeer := source.selectConn(browserConn, tunnelConn, browserPeer, tunnelPeer)
+				var destinationConn *websocket.Conn
+				if sourceConn == browserConn {
+					destinationConn = tunnelConn
+				} else {
+					destinationConn = browserConn
+				}
+				var writeStarted chan struct{}
+				var writeOnce sync.Once
+				switch terminal {
+				case "read-error":
+					session.readHook = func(conn *websocket.Conn) (int, []byte, error) {
+						if conn == sourceConn {
+							return 0, nil, errors.New("injected CDP source read failure")
+						}
+						return farmReadCDPMessage(conn)
+					}
+				case "write-error":
+					session.writeHook = func(conn *websocket.Conn, _ int, _ []byte) error {
+						if conn == destinationConn {
+							return errors.New("injected CDP destination write failure")
+						}
+						return nil
+					}
+				case "blocked-write":
+					writeStarted = make(chan struct{})
+					session.writeHook = func(conn *websocket.Conn, _ int, _ []byte) error {
+						if conn != destinationConn {
+							return nil
+						}
+						writeOnce.Do(func() { close(writeStarted) })
+						<-session.closed
+						return ErrFarmControlWSSClosed
+					}
+				}
+				client.addCDPSession(sessionID, session)
+				fixture.farm.cdpSessionsMu.Lock()
+				fixture.farm.cdpSessions[sessionID] = &farmCDPSession{conn: browserConn}
+				fixture.farm.cdpSessionsMu.Unlock()
+				relayDone := make(chan struct{})
+				go func() {
+					client.relayCDP(sessionID, session)
+					close(relayDone)
+				}()
+				switch terminal {
+				case "close":
+					_ = sourcePeer.Close()
+				case "abrupt-eof":
+					_ = sourcePeer.UnderlyingConn().Close()
+				case "read-error":
+					// The source read hook injects the terminal event.
+				case "write-error":
+					if err := sourcePeer.WriteMessage(websocket.TextMessage, []byte("write-error")); err != nil {
+						t.Fatal(err)
+					}
+				case "blocked-write":
+					if err := sourcePeer.WriteMessage(websocket.TextMessage, []byte("blocked-write")); err != nil {
+						t.Fatal(err)
+					}
+					select {
+					case <-writeStarted:
+					case <-time.After(time.Second):
+						t.Fatal("relay did not enter controllable blocked write")
+					}
+					// The opposite read error must interrupt the blocked destination
+					// write; waiting for its deadline would make cleanup unbounded.
+					if destinationConn == browserConn {
+						_ = browserPeer.Close()
+					} else {
+						_ = tunnelPeer.Close()
+					}
+				case "oversize":
+					payload := make([]byte, farmCDPMessageBytes+1)
+					_ = sourcePeer.SetWriteDeadline(time.Now().Add(3 * time.Second))
+					_ = sourcePeer.WriteMessage(websocket.BinaryMessage, payload)
+				}
+				select {
+				case <-relayDone:
+				case <-time.After(4 * time.Second):
+					t.Fatal("relay terminal cleanup exceeded bounded deadline")
+				}
+				assertCDPRelayClosed(t, client, fixture.farm, sessionID, session, terminal == "oversize", browserPeer, tunnelPeer)
+			})
+		}
 	}
 }

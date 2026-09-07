@@ -39,6 +39,9 @@ type farmControlCDPSession struct {
 	// destination that blocks or returns a write error, so cancellation and
 	// cleanup are verified without relying on kernel socket-buffer timing.
 	writeHook func(*websocket.Conn, int, []byte) error
+	// readHook is nil in production. Package tests use it to inject a terminal
+	// read error independently of peer close/EOF timing.
+	readHook func(*websocket.Conn) (int, []byte, error)
 }
 
 func newFarmControlCDPSession(browserConn, tunnelConn *websocket.Conn) *farmControlCDPSession {
@@ -323,7 +326,11 @@ func (c *FarmControlWSSClient) relayCDP(sessionID string, session *farmControlCD
 	pump := func(source, destination *websocket.Conn) {
 		defer pumps.Done()
 		for {
-			messageType, payload, err := farmReadCDPMessage(source)
+			readMessage := farmReadCDPMessage
+			if session.readHook != nil {
+				readMessage = session.readHook
+			}
+			messageType, payload, err := readMessage(source)
 			if err != nil {
 				done <- farmCDPRelayError(err)
 				return

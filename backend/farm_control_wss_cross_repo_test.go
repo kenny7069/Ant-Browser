@@ -425,7 +425,13 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 		AuthorityAcquired    bool `json:"authority_acquired"`
 		RuntimeLeaseReleased bool `json:"runtime_lease_released"`
 		ControlDBCleanup     bool `json:"control_db_cleanup"`
-		Playwright           struct {
+		AuthorityNegative    []struct {
+			Case   string `json:"case"`
+			Status int    `json:"status"`
+			Error  string `json:"error"`
+			Body   string `json:"body"`
+		} `json:"authority_negative_matrix"`
+		Playwright struct {
 			Connected        bool   `json:"connected"`
 			BasicIO          bool   `json:"basic_io"`
 			Title            string `json:"title"`
@@ -452,6 +458,22 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 	if !evidence.Accepted || !evidence.AuthorityAcquired ||
 		!evidence.RuntimeLeaseReleased || !evidence.ControlDBCleanup {
 		t.Fatalf("P1.14 evidence not accepted: %s", raw)
+	}
+	wantNegativeCases := []string{
+		"forged-lease", "expired-lease", "released-lease",
+		"wrong-controller", "stale-fencing", "node-offline",
+	}
+	if len(evidence.AuthorityNegative) != len(wantNegativeCases) {
+		t.Fatalf("P1.14 authority negative matrix length = %d, want %d: %s", len(evidence.AuthorityNegative), len(wantNegativeCases), raw)
+	}
+	for index, negative := range evidence.AuthorityNegative {
+		wantError := "CDP_TUNNEL_UNAVAILABLE"
+		if negative.Case == "node-offline" {
+			wantError = "NODE_OFFLINE"
+		}
+		if negative.Case != wantNegativeCases[index] || negative.Status != 503 || negative.Error != wantError || negative.Body != wantError {
+			t.Fatalf("P1.14 authority negative %d = %+v, want case=%s/status=503/error=%s", index, negative, wantNegativeCases[index], wantError)
+		}
 	}
 	if !evidence.Playwright.Connected ||
 		!evidence.Playwright.BasicIO ||
