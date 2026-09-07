@@ -38,7 +38,8 @@ var DefaultSpeedTestConfig = SpeedTestConfig{
 
 // ─── 对外入口 ───
 
-// SpeedTest 按单个代理的内核决策执行轻量 HTTP 延迟测试。
+// SpeedTest is retained for source compatibility but cannot safely infer a
+// connector. Callers must use SpeedTestWithConnector.
 func SpeedTest(
 	proxyId string,
 	proxies []config.BrowserProxy,
@@ -46,7 +47,7 @@ func SpeedTest(
 	singboxMgr *SingBoxManager,
 	cfg *SpeedTestConfig,
 ) TestResult {
-	return SpeedTestWithConnector(proxyId, proxies, xrayMgr, singboxMgr, nil, config.BrowserConnectorXray, cfg)
+	return connectorRequiredTestResult(proxyId)
 }
 
 // SpeedTestWithConnector requires the operation's explicit connector policy.

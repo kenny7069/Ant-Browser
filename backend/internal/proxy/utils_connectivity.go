@@ -10,10 +10,10 @@ import (
 	"ant-chrome/backend/internal/config"
 )
 
-// TestConnectivity 保留旧调用方的显式 xray 兼容入口。生产 operation
-// boundary 应使用 TestConnectivityWithConnector，避免 TCP probe 绕过 stack policy。
+// TestConnectivity is retained for source compatibility but cannot safely
+// infer a connector. It deliberately performs no network operation.
 func TestConnectivity(proxyId string, proxyConfig string, proxies []config.BrowserProxy, _ interface{}) TestResult {
-	return TestConnectivityWithConnector(proxyId, proxyConfig, proxies, config.BrowserConnectorXray)
+	return connectorRequiredTestResult(proxyId)
 }
 
 // TestConnectivityWithConnector 通过 TCP 握手测试代理服务器的可达性和延迟。
@@ -52,26 +52,28 @@ func TestConnectivityWithConnector(proxyId string, proxyConfig string, proxies [
 	return TestResult{ProxyId: proxyId, Ok: true, LatencyMs: latency, Engine: "tcp"}
 }
 
-// TestRealConnectivity 通过显式 connector 的代理链路发起真实 HTTP 请求测量端到端延迟。
-// 非 direct:// 配置一律由选定 stack 建立 bridge/client；不会旁路到 native proxy。
+// TestRealConnectivity is a compatibility wrapper with no connector and is
+// deliberately fail-closed without starting a bridge or making a request.
 func TestRealConnectivity(
 	proxyId string,
 	proxies []config.BrowserProxy,
 	xrayMgr *XrayManager,
 ) TestResult {
-	return TestRealConnectivityWithSingBox(proxyId, proxies, xrayMgr, nil)
+	return connectorRequiredTestResult(proxyId)
 }
 
-// TestRealConnectivityWithSingBox 支持 sing-box 的真实连通性测试
+// TestRealConnectivityWithSingBox is retained for source compatibility only;
+// use TestRealConnectivityWithRuntimeConfig with an explicit connector.
 func TestRealConnectivityWithSingBox(
 	proxyId string,
 	proxies []config.BrowserProxy,
 	xrayMgr *XrayManager,
 	singboxMgr *SingBoxManager,
 ) TestResult {
-	return TestRealConnectivityWithConfig(proxyId, proxies, xrayMgr, singboxMgr, nil)
+	return connectorRequiredTestResult(proxyId)
 }
 
+// TestRealConnectivityWithConfig is retained for source compatibility only.
 func TestRealConnectivityWithConfig(
 	proxyId string,
 	proxies []config.BrowserProxy,
@@ -79,7 +81,11 @@ func TestRealConnectivityWithConfig(
 	singboxMgr *SingBoxManager,
 	cfg *SpeedTestConfig,
 ) TestResult {
-	return TestRealConnectivityWithRuntimeConfig(proxyId, proxies, xrayMgr, singboxMgr, nil, config.BrowserConnectorXray, cfg)
+	return connectorRequiredTestResult(proxyId)
+}
+
+func connectorRequiredTestResult(proxyId string) TestResult {
+	return TestResult{ProxyId: proxyId, Engine: "connector", Error: ErrConnectorTypeRequired.Error()}
 }
 
 func TestRealConnectivityWithRuntimeConfig(

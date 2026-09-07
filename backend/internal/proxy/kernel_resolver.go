@@ -1,11 +1,16 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"ant-chrome/backend/internal/config"
 )
+
+// ErrConnectorTypeRequired is returned by connectorless compatibility APIs
+// before they can start a bridge or perform network I/O.
+var ErrConnectorTypeRequired = errors.New("connector type is required")
 
 const (
 	ProxyKernelAuto    = "auto"
@@ -175,7 +180,7 @@ func RequireConnectorType(value string) (string, error) {
 	case config.BrowserConnectorMihomo:
 		return config.BrowserConnectorMihomo, nil
 	case "":
-		return "", fmt.Errorf("connector type is required")
+		return "", ErrConnectorTypeRequired
 	default:
 		return "", fmt.Errorf("未知连接栈: %s", strings.TrimSpace(value))
 	}

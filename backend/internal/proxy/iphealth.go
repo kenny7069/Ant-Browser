@@ -21,15 +21,15 @@ type IPHealthConfig struct {
 	Timeout time.Duration
 }
 
-// FetchDefaultIPHealthInfo 使用传入的检测目标查询出口 IP 健康信息。
-// 返回值为第三方接口原始 JSON（map 形式），不做本地评分计算。
+// FetchDefaultIPHealthInfo is retained for source compatibility only. An IP
+// health operation must carry an explicit connector through FetchIPHealthInfo.
 func FetchDefaultIPHealthInfo(
 	proxyId string,
 	proxies []config.BrowserProxy,
 	xrayMgr *XrayManager,
 	singboxMgr *SingBoxManager,
 ) (map[string]interface{}, error) {
-	return FetchIPHealthInfo(proxyId, proxies, xrayMgr, singboxMgr, nil, config.BrowserConnectorXray, nil)
+	return map[string]interface{}{"error": ErrConnectorTypeRequired.Error()}, ErrConnectorTypeRequired
 }
 
 func FetchIPHealthInfo(

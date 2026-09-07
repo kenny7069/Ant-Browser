@@ -54,7 +54,7 @@ func (m *XrayManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) {
 // ValidateProxyConfig is retained for source compatibility and deliberately
 // fails closed because validation without an operation connector is unsafe.
 func ValidateProxyConfig(proxyConfig string, proxies []config.BrowserProxy, proxyId string) (bool, string) {
-	return ValidateProxyConfigForConnector(proxyConfig, proxies, proxyId, "")
+	return false, ErrConnectorTypeRequired.Error()
 }
 
 // ValidateProxyConfigForConnector validates a proxy against the same explicit

@@ -1,6 +1,7 @@
 package browser
 
 import (
+	appconfig "ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/logger"
 	"path/filepath"
 	"strings"
@@ -53,7 +54,12 @@ func (m *Manager) MigrateConfig() bool {
 		m.Config.Browser.ChromeBinaryPath = ""
 		m.Config.Browser.CoreRoot = ""
 		m.Config.Browser.DefaultCoreId = ""
-		m.Config.Browser.DefaultConnectorType = ""
+		// The legacy environment format had no connector field. Persist the
+		// canonical default during this explicit migration only when no connector
+		// was configured; preserve an existing canonical user choice.
+		if strings.TrimSpace(m.Config.Browser.DefaultConnectorType) == "" {
+			m.Config.Browser.DefaultConnectorType = appconfig.BrowserConnectorXray
+		}
 
 		if err := m.Config.Save(m.ResolveRelativePath("config.yaml")); err != nil {
 			log.Error("配置迁移保存失败", logger.F("error", err.Error()))

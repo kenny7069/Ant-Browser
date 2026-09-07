@@ -206,7 +206,7 @@ func (a *App) startupInitSpeedScheduler() {
 	a.speedScheduler = browser.NewProxySpeedScheduler(
 		a.browserMgr.ProxyDAO,
 		func(proxyId string) (bool, int64, string) {
-			connectorType := config.NormalizeBrowserConnectorType(a.config.Browser.DefaultConnectorType)
+			connectorType := a.defaultProxyConnectorType()
 			r := a.testProxySpeedWithConnector(proxyId, a.getLatestProxies(), connectorType)
 			return r.Ok, r.LatencyMs, r.Error
 		},

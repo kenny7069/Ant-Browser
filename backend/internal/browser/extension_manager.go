@@ -67,6 +67,9 @@ func (m *Manager) LookupExtension(query string) (ExtensionLookupResult, error) {
 }
 
 func (m *Manager) LookupExtensionWithHTTPClient(query string, client *http.Client) (ExtensionLookupResult, error) {
+	if client == nil {
+		return ExtensionLookupResult{}, fmt.Errorf("extension lookup requires an explicit HTTP client")
+	}
 	extensionID := NormalizeExtensionID(query)
 	if extensionID == "" {
 		return ExtensionLookupResult{}, fmt.Errorf("请输入 Chrome 插件 ID 或 Chrome Web Store 链接")
@@ -120,6 +123,9 @@ func (m *Manager) InstallExtensionFromWebStore(ctx context.Context, query string
 }
 
 func (m *Manager) InstallExtensionFromWebStoreWithHTTPClient(ctx context.Context, query string, client *http.Client) (Extension, error) {
+	if client == nil {
+		return Extension{}, fmt.Errorf("extension install requires an explicit HTTP client")
+	}
 	extensionID := NormalizeExtensionID(query)
 	if extensionID == "" {
 		return Extension{}, fmt.Errorf("请输入 Chrome 插件 ID 或 Chrome Web Store 链接")

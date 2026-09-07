@@ -2,7 +2,6 @@ package backend
 
 import (
 	"ant-chrome/backend/internal/browser"
-	"ant-chrome/backend/internal/config"
 	"os/exec"
 )
 
@@ -72,7 +71,7 @@ func (a *App) backupReloadAfterMutation() error {
 		a.speedScheduler = browser.NewProxySpeedScheduler(
 			a.browserMgr.ProxyDAO,
 			func(proxyID string) (bool, int64, string) {
-				connectorType := config.NormalizeBrowserConnectorType(a.config.Browser.DefaultConnectorType)
+				connectorType := a.defaultProxyConnectorType()
 				r := a.testProxySpeedWithConnector(proxyID, a.getLatestProxies(), connectorType)
 				return r.Ok, r.LatencyMs, r.Error
 			},
