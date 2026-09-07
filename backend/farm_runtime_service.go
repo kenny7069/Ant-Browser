@@ -35,16 +35,18 @@ var (
 	ErrFarmRuntimeConfigMismatch = errors.New("farm runtime config token mismatch")
 	ErrFarmRuntimeStale          = errors.New("farm runtime identity is stale")
 	ErrFarmRuntimeCommand        = errors.New("invalid farm runtime command")
-	ErrFarmRuntimeLaunchMode     = errors.New("farm runtime launch mode must be direct_no_proxy")
+	ErrFarmRuntimeLaunchMode     = errors.New("farm runtime launch mode is invalid")
 )
 
 const (
 	maxFarmRuntimeEnvelopeBytes = 64 * 1024
 	maxFarmRuntimeCorrelationID = 128
-	// FarmRuntimeLaunchModeDirectNoProxy is the only launch mode admitted by
-	// BF-P1.12. Authenticated proxy configuration is a later gate and must not
-	// be smuggled through this command boundary.
+	// FarmRuntimeLaunchModeDirectNoProxy is the explicit no-proxy path.
 	FarmRuntimeLaunchModeDirectNoProxy = "direct_no_proxy"
+	// FarmRuntimeLaunchModeProfileProxy starts the existing local profile
+	// connector. Its wire binding is deliberately secret-free: the Agent reads
+	// raw proxy material only from its existing local profile/config store.
+	FarmRuntimeLaunchModeProfileProxy = "profile_proxy"
 )
 
 // FarmRuntimeIdentity is the strict, node-safe identity of one runtime
@@ -202,14 +204,26 @@ type FarmRuntimeServiceFactoryConfig struct {
 // checked and can never cause a different runtime to be adopted. ConfigHash
 // is an optional opaque server token; it is stored/compared byte-for-byte.
 type FarmRuntimeEnsureRequest struct {
-	NodeUID            string `json:"node_uid,omitempty"`
-	ProfileID          string `json:"profile_id"`
-	RuntimeUID         string `json:"runtime_uid,omitempty"`
-	ProviderInstanceID string `json:"provider_instance_id,omitempty"`
-	FencingEpoch       uint64 `json:"fencing_epoch,omitempty"`
-	ConfigHash         string `json:"config_hash,omitempty"`
-	Generation         uint64 `json:"generation,omitempty"`
-	LaunchMode         string `json:"launch_mode,omitempty"`
+	NodeUID            string                   `json:"node_uid,omitempty"`
+	ProfileID          string                   `json:"profile_id"`
+	RuntimeUID         string                   `json:"runtime_uid,omitempty"`
+	ProviderInstanceID string                   `json:"provider_instance_id,omitempty"`
+	FencingEpoch       uint64                   `json:"fencing_epoch,omitempty"`
+	ConfigHash         string                   `json:"config_hash,omitempty"`
+	Generation         uint64                   `json:"generation,omitempty"`
+	LaunchMode         string                   `json:"launch_mode,omitempty"`
+	Proxy              *FarmRuntimeProxyBinding `json:"proxy,omitempty"`
+}
+
+// FarmRuntimeProxyBinding is the closed, secret-free Server→Agent assertion
+// for a profile-owned authenticated proxy. It is never a proxy locator or a
+// credential transport: raw URI, username, password, config path and Chrome
+// args have no representation here.
+type FarmRuntimeProxyBinding struct {
+	Enabled            bool   `json:"enabled"`
+	ConnectorType      string `json:"connector_type"`
+	CredentialRevision string `json:"credential_revision"`
+	ConfigRevision     string `json:"config_revision"`
 }
 
 // FarmRuntimeStatusRequest is a read-only selector. Supplying identity fields
@@ -322,6 +336,7 @@ type farmRuntimeRecord struct {
 	runtime            FarmRuntime
 	profileIncarnation string
 	launchMode         string
+	proxyBinding       *FarmRuntimeProxyBinding
 }
 
 type farmRuntimeProfileGate struct {
@@ -543,10 +558,50 @@ func normalizeFarmRuntimeLaunchMode(value string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
-	if value != FarmRuntimeLaunchModeDirectNoProxy {
+	if value != FarmRuntimeLaunchModeDirectNoProxy && value != FarmRuntimeLaunchModeProfileProxy {
 		return "", fmt.Errorf("%w: %q", ErrFarmRuntimeLaunchMode, value)
 	}
 	return value, nil
+}
+
+func cloneFarmRuntimeProxyBinding(value *FarmRuntimeProxyBinding) *FarmRuntimeProxyBinding {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func equalFarmRuntimeProxyBinding(left, right *FarmRuntimeProxyBinding) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
+}
+
+func validateFarmRuntimeProxyBinding(value *FarmRuntimeProxyBinding, required bool) error {
+	if value == nil {
+		if required {
+			return fmt.Errorf("%w: proxy binding is required", ErrFarmRuntimeLaunchMode)
+		}
+		return nil
+	}
+	if !value.Enabled {
+		return fmt.Errorf("%w: proxy binding must be enabled", ErrFarmRuntimeLaunchMode)
+	}
+	connector := strings.TrimSpace(value.ConnectorType)
+	if connector != "xray" && connector != "mihomo" {
+		return fmt.Errorf("%w: proxy connector", ErrFarmRuntimeLaunchMode)
+	}
+	if strings.TrimSpace(value.CredentialRevision) == "" || strings.TrimSpace(value.ConfigRevision) == "" {
+		return fmt.Errorf("%w: proxy revision", ErrFarmRuntimeLaunchMode)
+	}
+	for _, token := range []string{value.ConnectorType, value.CredentialRevision, value.ConfigRevision} {
+		if err := validateAttestationToken(token, true); err != nil {
+			return fmt.Errorf("%w: proxy binding", ErrFarmRuntimeLaunchMode)
+		}
+	}
+	return nil
 }
 
 func farmRuntimeProfileTelemetry(profile *BrowserProfile) *FarmRuntimeProfile {
@@ -673,6 +728,12 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	if err != nil {
 		return FarmRuntime{}, err
 	}
+	if err := validateFarmRuntimeProxyBinding(request.Proxy, launchMode == FarmRuntimeLaunchModeProfileProxy); err != nil {
+		return FarmRuntime{}, err
+	}
+	if launchMode == FarmRuntimeLaunchModeDirectNoProxy && request.Proxy != nil {
+		return FarmRuntime{}, fmt.Errorf("%w: direct mode cannot carry proxy binding", ErrFarmRuntimeLaunchMode)
+	}
 	release, err := s.acquire(profileID)
 	if err != nil {
 		return FarmRuntime{}, err
@@ -713,6 +774,10 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		if launchMode != "" && record.launchMode != launchMode &&
 			(record.runtime.State == FarmRuntimeStateIdle || record.runtime.State == FarmRuntimeStateStarting) {
 			return FarmRuntime{}, fmt.Errorf("%w: owned runtime launch mode", ErrFarmRuntimeLaunchMode)
+		}
+		if !equalFarmRuntimeProxyBinding(record.proxyBinding, request.Proxy) &&
+			(record.runtime.State == FarmRuntimeStateIdle || record.runtime.State == FarmRuntimeStateStarting) {
+			return FarmRuntime{}, fmt.Errorf("%w: owned runtime proxy binding", ErrFarmRuntimeConfigMismatch)
 		}
 		observed, observeErr := s.snapshot(profileID)
 		if observeErr != nil {
@@ -793,7 +858,7 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		LaunchMode: launchMode,
 	}
 	runtime = farmRuntimeFromSnapshot(farmRuntimeRecord{runtime: runtime}, observed)
-	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, launchMode: launchMode})
+	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, launchMode: launchMode, proxyBinding: cloneFarmRuntimeProxyBinding(request.Proxy)})
 	if startErr != nil {
 		return runtime, startErr
 	}
@@ -1304,11 +1369,10 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
 			return FarmRuntimeCommandResponse{}, err
 		}
-		// The command surface is the Control WSS boundary for BF-P1.12. Keep
-		// the older in-process EnsureRuntime compatibility API permissive, but
-		// never allow a remote command to launch with an inherited/profile
-		// proxy or an omitted network policy.
-		if request.LaunchMode != FarmRuntimeLaunchModeDirectNoProxy {
+		// The command surface is the Control WSS boundary. It accepts only an
+		// explicit direct mode or an explicit secret-free binding to the local
+		// profile connector; raw proxy material has no decodable field.
+		if request.LaunchMode != FarmRuntimeLaunchModeDirectNoProxy && request.LaunchMode != FarmRuntimeLaunchModeProfileProxy {
 			err := fmt.Errorf("%w: command ensure requires explicit mode", ErrFarmRuntimeLaunchMode)
 			response.Error = farmRuntimeWireError(err)
 			return response, nil
