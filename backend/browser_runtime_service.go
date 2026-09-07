@@ -5,6 +5,9 @@ import (
 	"ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/logger"
 	"ant-chrome/backend/internal/proxy"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -431,6 +434,10 @@ type BrowserRuntimeServiceConfig struct {
 	FingerprintLaunchArgs func(string, string, []string) []string
 	RuntimeBookmarks      func(string, []string, *BrowserProfile, []BrowserBookmark) ([]BrowserBookmark, string, error)
 	ResolveStartURLs      func(string, []string, *BrowserProfile, []string) []string
+	// OwnsConnectorManagers is true only for the Wails-free public factory.
+	// App-owned services share their connector managers and must never stop
+	// them as a side effect of a Farm runtime stop.
+	OwnsConnectorManagers bool
 }
 
 type browserRuntimeProfileGate struct {
@@ -478,6 +485,7 @@ type BrowserRuntimeService struct {
 	fingerprintLaunchArgs func(string, string, []string) []string
 	runtimeBookmarks      func(string, []string, *BrowserProfile, []BrowserBookmark) ([]BrowserBookmark, string, error)
 	resolveStartURLs      func(string, []string, *BrowserProfile, []string) []string
+	ownsConnectorManagers bool
 
 	gatesMu sync.Mutex
 	gates   map[string]*browserRuntimeProfileGate
@@ -548,6 +556,7 @@ func NewBrowserRuntimeService(config ...BrowserRuntimeServiceConfig) *BrowserRun
 		fingerprintLaunchArgs: cfg.FingerprintLaunchArgs,
 		runtimeBookmarks:      cfg.RuntimeBookmarks,
 		resolveStartURLs:      cfg.ResolveStartURLs,
+		ownsConnectorManagers: cfg.OwnsConnectorManagers,
 		gates:                 make(map[string]*browserRuntimeProfileGate),
 		nextGen:               make(map[string]uint64),
 		active:                make(map[string]browserRuntimeIdentity),
@@ -875,6 +884,73 @@ func (s *BrowserRuntimeService) latestProxies() []BrowserProxy {
 		configured = s.config.Browser.Proxies
 	}
 	return browser.LatestProxiesWithFallback(manager.ProxyDAO, configured)
+}
+
+// LocalProfileProxyBinding returns a secret-free binding derived from the
+// already-persisted local profile/connector record.  It is intentionally the
+// only Farm entry point that reads ProxyConfig: callers receive revisions, not
+// URI credentials.  A changed password changes both opaque revisions, so an
+// old Server assertion fails before Chrome lifecycle work begins.
+func (s *BrowserRuntimeService) LocalProfileProxyBinding(profileID string) (FarmRuntimeProxyBinding, error) {
+	profile, err := s.profileSnapshot(profileID)
+	if err != nil {
+		return FarmRuntimeProxyBinding{}, err
+	}
+	proxies := s.latestProxies()
+	proxyID := strings.TrimSpace(profile.ProxyId)
+	proxyConfig := strings.TrimSpace(profile.ProxyConfig)
+	if proxyID != "" {
+		for _, item := range proxies {
+			if strings.EqualFold(item.ProxyId, proxyID) {
+				proxyID = strings.TrimSpace(item.ProxyId)
+				proxyConfig = strings.TrimSpace(item.ProxyConfig)
+				break
+			}
+		}
+	}
+	if proxyConfig == "" || proxyConfig == "direct://" {
+		return FarmRuntimeProxyBinding{}, fmt.Errorf("local profile has no authenticated proxy")
+	}
+	connector := config.BrowserConnectorXray
+	if s.config != nil {
+		connector = config.NormalizeBrowserConnectorType(s.config.Browser.DefaultConnectorType)
+	}
+	if connector != config.BrowserConnectorXray && connector != config.BrowserConnectorMihomo {
+		return FarmRuntimeProxyBinding{}, fmt.Errorf("local connector is not supported")
+	}
+	resolution, err := proxy.ResolveProxyKernelForConnector(proxyConfig, proxies, proxyID, connector)
+	if err != nil || resolution.Kernel != proxy.ProxyKernelXray && resolution.Kernel != proxy.ProxyKernelMihomo {
+		return FarmRuntimeProxyBinding{}, fmt.Errorf("local connector resolution rejected")
+	}
+	return FarmRuntimeProxyBinding{
+		Enabled:            true,
+		ConnectorType:      connector,
+		CredentialRevision: localFarmProxyRevision("credential", connector, proxyID, proxyConfig),
+		ConfigRevision:     localFarmProxyRevision("config", connector, profile.ProxyBindUpdatedAt, proxyID, proxyConfig),
+	}, nil
+}
+
+// VerifyLocalProfileProxyBinding is the production Farm verifier. It performs
+// constant-time equality over local opaque revisions and never copies local
+// URI/user/password data into a command error or response.
+func (s *BrowserRuntimeService) VerifyLocalProfileProxyBinding(profileID string, binding FarmRuntimeProxyBinding) error {
+	local, err := s.LocalProfileProxyBinding(profileID)
+	if err != nil || !binding.Enabled || local.ConnectorType != binding.ConnectorType ||
+		subtle.ConstantTimeCompare([]byte(local.CredentialRevision), []byte(binding.CredentialRevision)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(local.ConfigRevision), []byte(binding.ConfigRevision)) != 1 {
+		return fmt.Errorf("local profile proxy binding mismatch")
+	}
+	return nil
+}
+
+func localFarmProxyRevision(kind string, parts ...string) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("bf-p113/local-profile-proxy/" + kind + "\x00"))
+	for _, part := range parts {
+		_, _ = hash.Write([]byte(part))
+		_, _ = hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func (s *BrowserRuntimeService) resolveStartProxy(input browserStartInput, profile *BrowserProfile) (string, profileProxyBridgeRef, bool, error) {
@@ -1721,6 +1797,19 @@ func (s *BrowserRuntimeService) StopIfGeneration(profileID string, generation ui
 		}
 		return s.stopLocked(host, profileID)
 	})
+}
+
+// CleanupOwnedProxyRuntimes is the Wails-free Farm cleanup hook. It is a
+// no-op for App-owned services so a Farm stop can never tear down connector
+// state owned by another Wails session. The public factory owns its managers
+// and may synchronously request cleanup of released bridge credentials.
+func (s *BrowserRuntimeService) CleanupOwnedProxyRuntimes() {
+	if s == nil || !s.ownsConnectorManagers {
+		return
+	}
+	if s.xrayMgr != nil {
+		s.xrayMgr.StopReleasedBridges()
+	}
 }
 
 // markStaleRuntimeStoppedIfCurrent commits the fail-closed transition used when

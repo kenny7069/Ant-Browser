@@ -3,6 +3,7 @@ package backend
 import (
 	"encoding/json"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -29,7 +30,7 @@ func p113EnsureCommand(profile string) FarmRuntimeCommand {
 
 func p113EnableLocalBinding(farm *FarmRuntimeService) {
 	farm.proxyBindingVerifier = func(profileID string, binding FarmRuntimeProxyBinding) error {
-		if profileID != "profile-1" || binding != *p113ProxyBinding() {
+		if profileID != "profile-1" || !binding.Enabled || binding.ConnectorType != "xray" {
 			return errors.New("unexpected local proxy binding")
 		}
 		return nil
@@ -102,10 +103,47 @@ func TestFarmRuntimeP113RequiresLocalProxyBindingVerifier(t *testing.T) {
 		ProfileID: "profile-1", ConfigHash: "p113-config-1",
 		LaunchMode: FarmRuntimeLaunchModeProfileProxy, Proxy: p113ProxyBinding(),
 	})
-	if !errors.Is(err, ErrFarmRuntimeConfigMismatch) {
-		t.Fatalf("missing verifier = %v, want config mismatch", err)
+	if !errors.Is(err, ErrFarmRuntimeLocalProxyBinding) {
+		t.Fatalf("missing verifier = %v, want local proxy binding refusal", err)
 	}
 	if fixture.detectCalls.Load() != 0 || fixture.startCalls.Load() != 0 {
 		t.Fatalf("missing verifier touched lifecycle: detect=%d start=%d", fixture.detectCalls.Load(), fixture.startCalls.Load())
+	}
+}
+
+func TestFarmRuntimeP113ProductionFactoryUsesLocalProfileBindingBeforeLifecycle(t *testing.T) {
+	started := 0
+	cfg := DefaultConfig()
+	cfg.Browser.DefaultConnectorType = "xray"
+	profile := BrowserProfile{ProfileId: "profile-local", CoreId: "chrome", ProxyConfig: "socks5://local-user:local-password@127.0.0.1:19081", RestoreLastSession: "never"}
+	farm, err := NewFarmRuntimeServiceForHost(FarmRuntimeServiceFactoryConfig{
+		NodeUID: "node-test", ProviderInstanceID: "agent-test", FencingEpoch: 1,
+		BrowserRuntimeFactory: BrowserRuntimeServiceFactoryConfig{
+			AppRoot: t.TempDir(), Config: cfg, Profiles: []BrowserProfile{profile},
+			Host: BrowserRuntimeHost{
+				StartProcess: func(*BrowserRuntimeLaunchPlan) (*BrowserRuntimeProcess, error) {
+					started++
+					return nil, errors.New("must not start")
+				},
+				StopProcess: func(*exec.Cmd) error { return nil },
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The public factory must create the existing production connector manager;
+	// a direct-only host would leave this nil and the real bridge cannot start.
+	if farm.runtimeService.xrayMgr == nil {
+		t.Fatal("production Farm factory did not wire XrayManager")
+	}
+	local, err := farm.runtimeService.LocalProfileProxyBinding(profile.ProfileId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local.CredentialRevision = "different-local-revision"
+	_, err = farm.EnsureRuntime(FarmRuntimeEnsureRequest{ProfileID: profile.ProfileId, ConfigHash: "server-hash", LaunchMode: FarmRuntimeLaunchModeProfileProxy, Proxy: &local})
+	if !errors.Is(err, ErrFarmRuntimeLocalProxyBinding) || started != 0 {
+		t.Fatalf("production local binding mismatch = %v, started=%d", err, started)
 	}
 }

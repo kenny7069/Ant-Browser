@@ -2,6 +2,7 @@ package backend
 
 import (
 	"ant-chrome/backend/internal/browser"
+	"ant-chrome/backend/internal/proxy"
 	"fmt"
 	"strings"
 )
@@ -53,8 +54,12 @@ func NewBrowserRuntimeServiceForHost(options BrowserRuntimeServiceFactoryConfig)
 	}
 
 	return NewBrowserRuntimeService(BrowserRuntimeServiceConfig{
-		Manager: manager,
-		Config:  cfg,
-		Host:    options.Host,
+		Manager:               manager,
+		Config:                cfg,
+		XrayMgr:               proxy.NewXrayManager(cfg, appRoot),
+		ClashMgr:              proxy.NewClashManager(cfg, appRoot),
+		SingBoxMgr:            proxy.NewSingBoxManager(cfg, appRoot),
+		Host:                  options.Host,
+		OwnsConnectorManagers: true,
 	}), nil
 }

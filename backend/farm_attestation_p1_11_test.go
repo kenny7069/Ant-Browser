@@ -28,7 +28,6 @@ func p111AttestationFixture() (FarmAttestationRequest, FarmAttestationLaunchStat
 			ConnectorType:      "xray",
 			CredentialRevision: "credential-rev-7",
 			ConfigRevision:     "config-rev-7",
-			CredentialToken:    "opaque-credential-token",
 		},
 	}
 	request := FarmAttestationRequest{
@@ -89,6 +88,9 @@ func TestFarmAttestationP111OrdinaryAndOpaqueTokens(t *testing.T) {
 	}
 	if strings.Contains(string(wire), "password") || strings.Contains(string(wire), "socks5://") || strings.Contains(string(wire), "CANARY") {
 		t.Fatalf("secret-bearing field reached attestation wire: %s", wire)
+	}
+	if strings.Contains(string(wire), "credential_token") {
+		t.Fatalf("local credential token reached attestation wire: %s", wire)
 	}
 	if got, ok := agent.Snapshot(request.RuntimeIdentity.RuntimeUID); !ok || VerifyFarmAttestationResponse(request, got) != nil {
 		t.Fatal("saved attestation snapshot was not verifiable")
@@ -311,7 +313,6 @@ func TestFarmRuntimeServiceP111AttestationUsesOwnedReadyRuntime(t *testing.T) {
 			ConnectorType:      "",
 			CredentialRevision: "",
 			ConfigRevision:     "",
-			CredentialToken:    "",
 		},
 	}
 	request := FarmAttestationRequest{

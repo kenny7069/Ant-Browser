@@ -33,9 +33,13 @@ var (
 	// ErrFarmRuntimeConfigMismatch is reserved for an opaque server-issued
 	// config hash/token mismatch. The Agent never computes or interprets it.
 	ErrFarmRuntimeConfigMismatch = errors.New("farm runtime config token mismatch")
-	ErrFarmRuntimeStale          = errors.New("farm runtime identity is stale")
-	ErrFarmRuntimeCommand        = errors.New("invalid farm runtime command")
-	ErrFarmRuntimeLaunchMode     = errors.New("farm runtime launch mode is invalid")
+	// ErrFarmRuntimeLocalProxyBinding is a local connector-store refusal, not a
+	// Server config mismatch.  In particular it must never trigger a Server
+	// controlled-restart of an already-owned runtime.
+	ErrFarmRuntimeLocalProxyBinding = errors.New("farm runtime local proxy binding rejected")
+	ErrFarmRuntimeStale             = errors.New("farm runtime identity is stale")
+	ErrFarmRuntimeCommand           = errors.New("invalid farm runtime command")
+	ErrFarmRuntimeLaunchMode        = errors.New("farm runtime launch mode is invalid")
 )
 
 const (
@@ -187,6 +191,9 @@ type FarmRuntimeServiceConfig struct {
 	// existing local binding before lifecycle work starts. A nil verifier makes
 	// authenticated proxy mode fail closed.
 	ProxyBindingVerifier func(profileID string, binding FarmRuntimeProxyBinding) error
+	// ProxyRuntimeCleanup is only supplied by the Wails-free factory that owns
+	// the connector managers. It must be a no-op for App-shared services.
+	ProxyRuntimeCleanup func()
 }
 
 // FarmRuntimeServiceFactoryConfig is the public, Wails-free factory boundary.
@@ -202,6 +209,7 @@ type FarmRuntimeServiceFactoryConfig struct {
 	FencingEpoch             uint64
 	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 	ProxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
+	ProxyRuntimeCleanup      func()
 }
 
 // FarmRuntimeEnsureRequest identifies the profile and, when supplied, the
@@ -364,6 +372,7 @@ type FarmRuntimeService struct {
 	fencingEpoch             uint64
 	attestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 	proxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
+	proxyRuntimeCleanup      func()
 
 	recordsMu sync.RWMutex
 	records   map[string]farmRuntimeRecord
@@ -407,6 +416,7 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 		attestation:              NewFarmAttestationAgent(),
 		attestationStateProvider: options.AttestationStateProvider,
 		proxyBindingVerifier:     options.ProxyBindingVerifier,
+		proxyRuntimeCleanup:      options.ProxyRuntimeCleanup,
 	}, nil
 }
 
@@ -427,6 +437,13 @@ func NewFarmRuntimeServiceForHost(options FarmRuntimeServiceFactoryConfig) (*Far
 			return nil, err
 		}
 	}
+	verifier := options.ProxyBindingVerifier
+	if verifier == nil {
+		// The Wails-free production host owns no second connector path: it
+		// verifies through the same shared BrowserRuntimeService resolver that
+		// will later acquire the Xray/Mihomo bridge for Chrome.
+		verifier = runtimeService.VerifyLocalProfileProxyBinding
+	}
 	return NewFarmRuntimeService(FarmRuntimeServiceConfig{
 		BrowserRuntimeService:    runtimeService,
 		NodeUID:                  options.NodeUID,
@@ -434,7 +451,8 @@ func NewFarmRuntimeServiceForHost(options FarmRuntimeServiceFactoryConfig) (*Far
 		ProviderInstanceID:       options.ProviderInstanceID,
 		FencingEpoch:             options.FencingEpoch,
 		AttestationStateProvider: options.AttestationStateProvider,
-		ProxyBindingVerifier:     options.ProxyBindingVerifier,
+		ProxyBindingVerifier:     verifier,
+		ProxyRuntimeCleanup:      runtimeService.CleanupOwnedProxyRuntimes,
 	})
 }
 
@@ -525,6 +543,20 @@ func (s *FarmRuntimeService) deleteRecord(profileID string) {
 	s.recordsMu.Lock()
 	delete(s.records, profileID)
 	s.recordsMu.Unlock()
+}
+
+func (s *FarmRuntimeService) hasActiveRecord() bool {
+	if s == nil {
+		return false
+	}
+	s.recordsMu.RLock()
+	defer s.recordsMu.RUnlock()
+	for _, record := range s.records {
+		if record.runtime.State == FarmRuntimeStateIdle || record.runtime.State == FarmRuntimeStateStarting {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *FarmRuntimeService) snapshot(profileID string) (*BrowserRuntimeServiceSnapshot, error) {
@@ -745,12 +777,12 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	}
 	if launchMode == FarmRuntimeLaunchModeProfileProxy {
 		if s.proxyBindingVerifier == nil {
-			return FarmRuntime{}, fmt.Errorf("%w: local proxy binding verifier unavailable", ErrFarmRuntimeConfigMismatch)
+			return FarmRuntime{}, ErrFarmRuntimeLocalProxyBinding
 		}
 		if err := s.proxyBindingVerifier(profileID, *cloneFarmRuntimeProxyBinding(request.Proxy)); err != nil {
 			// Local verifier errors may include a path or a credential-bearing
 			// connector error. Do not return them to the command boundary.
-			return FarmRuntime{}, ErrFarmRuntimeConfigMismatch
+			return FarmRuntime{}, ErrFarmRuntimeLocalProxyBinding
 		}
 	}
 	release, err := s.acquire(profileID)
@@ -1080,6 +1112,9 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 	record.runtime = farmRuntimeFromSnapshot(record, finalSnapshot)
 	record.runtime.State = FarmRuntimeStateStopped
 	s.setRecord(profileID, record)
+	if s.proxyRuntimeCleanup != nil && !s.hasActiveRecord() {
+		s.proxyRuntimeCleanup()
+	}
 	return record.runtime, nil
 }
 
@@ -1348,6 +1383,8 @@ func farmRuntimeWireError(err error) string {
 		return ErrFarmRuntimeStale.Error()
 	case errors.Is(err, ErrFarmRuntimeLaunchMode):
 		return ErrFarmRuntimeLaunchMode.Error()
+	case errors.Is(err, ErrFarmRuntimeLocalProxyBinding):
+		return ErrFarmRuntimeLocalProxyBinding.Error()
 	case errors.Is(err, ErrFarmRuntimeConfigMismatch):
 		return ErrFarmRuntimeConfigMismatch.Error()
 	case errors.Is(err, ErrFarmRuntimeServiceUnavailable):

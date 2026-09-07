@@ -44,14 +44,13 @@ type FarmAttestationPolicy struct {
 }
 
 // FarmAttestationProxy is the only proxy state allowed in an attestation.
-// CredentialToken and the two revisions are opaque values supplied by the
-// Server.  The Agent never interprets or derives them.
+// The revisions are public, opaque binding labels. Credentials and credential
+// tokens are local connector-store material and cannot cross Control WSS.
 type FarmAttestationProxy struct {
 	Enabled            bool   `json:"enabled"`
 	ConnectorType      string `json:"connector_type"`
 	CredentialRevision string `json:"credential_revision"`
 	ConfigRevision     string `json:"config_revision"`
-	CredentialToken    string `json:"credential_token"`
 }
 
 // FarmAttestationRuntime is both the safe runtime config request and the
@@ -209,7 +208,6 @@ func validateAttestationProxy(proxy FarmAttestationProxy) error {
 	for name, value := range map[string]string{
 		"proxy.credential_revision": proxy.CredentialRevision,
 		"proxy.config_revision":     proxy.ConfigRevision,
-		"proxy.credential_token":    proxy.CredentialToken,
 	} {
 		if err := validateAttestationToken(value, false); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
@@ -253,8 +251,7 @@ func equalAttestationProxy(left, right FarmAttestationProxy) bool {
 	return left.Enabled == right.Enabled &&
 		left.ConnectorType == right.ConnectorType &&
 		left.CredentialRevision == right.CredentialRevision &&
-		left.ConfigRevision == right.ConfigRevision &&
-		left.CredentialToken == right.CredentialToken
+		left.ConfigRevision == right.ConfigRevision
 }
 
 func equalAttestationRuntime(left, right FarmAttestationRuntime) bool {
@@ -666,14 +663,14 @@ func validateFarmAttestationWireShape(raw []byte, response bool) error {
 	if err != nil {
 		return err
 	}
-	proxyKeys := attestationKeySet("enabled", "connector_type", "credential_revision", "config_revision", "credential_token")
+	proxyKeys := attestationKeySet("enabled", "connector_type", "credential_revision", "config_revision")
 	if err := validateAttestationObjectKeys(proxy, proxyKeys, proxyKeys, runtimeKey+".proxy"); err != nil {
 		return err
 	}
 	if err := validateAttestationJSONKind(proxy["enabled"], 'b', runtimeKey+".proxy.enabled"); err != nil {
 		return err
 	}
-	for _, key := range []string{"connector_type", "credential_revision", "config_revision", "credential_token"} {
+	for _, key := range []string{"connector_type", "credential_revision", "config_revision"} {
 		if err := validateAttestationJSONKind(proxy[key], '"', runtimeKey+".proxy."+key); err != nil {
 			return err
 		}
