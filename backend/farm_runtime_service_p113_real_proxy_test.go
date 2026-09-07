@@ -34,8 +34,8 @@ func TestFarmRuntimeP113RealXrayProxyChrome(t *testing.T) {
 	var upstreamHits atomic.Int64
 	var probeBaseline atomic.Int64
 	target := httptestP113Target(t, &upstreamHits)
-	upstreamAddress, stopUpstream := startP113AuthenticatedXray(t, xrayPath)
-	defer stopUpstream()
+	upstream := startP113AuthenticatedXrayWithAccessLog(t, xrayPath)
+	defer upstream.stop()
 
 	cfg := DefaultConfig()
 	cfg.Browser.XrayBinaryPath = xrayPath
@@ -49,7 +49,7 @@ func TestFarmRuntimeP113RealXrayProxyChrome(t *testing.T) {
 	profileID := "p113-real-proxy"
 	// This is local profile-store material.  It is intentionally not included
 	// in a Farm request, attestation, assertion, or t.Log output.
-	profile := BrowserProfile{ProfileId: profileID, ProfileName: "P1.13 isolated", CoreId: "chrome", UserDataDir: filepath.Join(t.TempDir(), "profile"), RestoreLastSession: "never", ProxyConfig: "socks5://p113-user:p113-password@" + upstreamAddress, LaunchArgs: []string{"--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--proxy-bypass-list=<-loopback>"}}
+	profile := BrowserProfile{ProfileId: profileID, ProfileName: "P1.13 isolated", CoreId: "chrome", UserDataDir: filepath.Join(t.TempDir(), "profile"), RestoreLastSession: "never", ProxyConfig: "socks5://p113-user:p113-password@" + upstream.address, LaunchArgs: []string{"--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--proxy-bypass-list=<-loopback>"}}
 
 	var mu sync.Mutex
 	var launch *BrowserRuntimeLaunchSpec
@@ -71,7 +71,7 @@ func TestFarmRuntimeP113RealXrayProxyChrome(t *testing.T) {
 			CanConnect:  canConnectDebugPort, TryCloseCDP: tryCloseBrowserViaCDP, CreateTarget: createBrowserStartTarget,
 		}},
 		AttestationStateProvider: func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error) {
-			if upstreamHits.Load() <= probeBaseline.Load() {
+			if upstreamHits.Load() <= probeBaseline.Load() || !p113XrayAccessedTarget(upstream.accessLog, target) {
 				return FarmAttestationLaunchState{}, ErrFarmAttestationNotReady
 			}
 			binding, bindingErr := farm.runtimeService.LocalProfileProxyBinding(profileID)
@@ -176,7 +176,19 @@ func httptestP113Target(t *testing.T, hits *atomic.Int64) p113HTTPServer {
 	return p113HTTPServer{server: server, url: "http://" + listener.Addr().String()}
 }
 
+type p113XrayUpstream struct {
+	address   string
+	accessLog string
+	stop      func()
+}
+
 func startP113AuthenticatedXray(t *testing.T, binary string) (string, func()) {
+	t.Helper()
+	upstream := startP113AuthenticatedXrayWithAccessLog(t, binary)
+	return upstream.address, upstream.stop
+}
+
+func startP113AuthenticatedXrayWithAccessLog(t *testing.T, binary string) p113XrayUpstream {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -192,7 +204,9 @@ func startP113AuthenticatedXray(t *testing.T, binary string) (string, func()) {
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	config := map[string]any{"log": map[string]any{"loglevel": "warning"}, "inbounds": []any{map[string]any{"listen": host, "port": mustP113Port(t, port), "protocol": "socks", "settings": map[string]any{"auth": "password", "accounts": []any{map[string]any{"user": "p113-user", "pass": "p113-password"}}}}}, "outbounds": []any{map[string]any{"protocol": "freedom", "tag": "direct"}}}
+	accessLog := filepath.Join(dir, "access.log")
+	errorLog := filepath.Join(dir, "error.log")
+	config := map[string]any{"log": map[string]any{"access": accessLog, "error": errorLog, "loglevel": "warning"}, "inbounds": []any{map[string]any{"listen": host, "port": mustP113Port(t, port), "protocol": "socks", "settings": map[string]any{"auth": "password", "accounts": []any{map[string]any{"user": "p113-user", "pass": "p113-password"}}}}}, "outbounds": []any{map[string]any{"protocol": "freedom", "tag": "direct"}}}
 	raw, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
@@ -216,12 +230,12 @@ func startP113AuthenticatedXray(t *testing.T, binary string) (string, func()) {
 		_ = cmd.Process.Kill()
 		t.Fatal("authenticated upstream did not start")
 	}
-	return addr, func() {
+	return p113XrayUpstream{address: addr, accessLog: accessLog, stop: func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
 		_ = cmd.Wait()
-	}
+	}}
 }
 
 func mustP113Port(t *testing.T, value string) int {
@@ -263,15 +277,44 @@ func p113SameRoots(left, right map[string]struct{}) bool {
 	return true
 }
 
+func p113XrayAccessedTarget(logPath string, target p113HTTPServer) bool {
+	return p113XrayAccessedTargetAfter(logPath, target, 0)
+}
+
+func p113XrayAccessLogSize(logPath string) int64 {
+	info, err := os.Stat(logPath)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func p113XrayAccessedTargetAfter(logPath string, target p113HTTPServer, offset int64) bool {
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		return false
+	}
+	if offset < 0 || offset > int64(len(raw)) {
+		offset = 0
+	}
+	return strings.Contains(string(raw[offset:]), strings.TrimPrefix(target.url, "http://"))
+}
+
 func assertP113SecureRoots(t *testing.T, initial map[string]struct{}) {
 	t.Helper()
+	if err := p113SecureRootsError(initial); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func p113SecureRootsError(initial map[string]struct{}) error {
 	for root := range p113XrayRoots() {
 		if _, existed := initial[root]; existed {
 			continue
 		}
 		info, err := os.Stat(root)
 		if err != nil || info.Mode().Perm() != 0700 {
-			t.Fatal("Xray temporary root does not satisfy Unix private-directory contract")
+			return fmt.Errorf("Xray temporary root does not satisfy Unix private-directory contract")
 		}
 		err = filepath.Walk(root, func(_ string, entry os.FileInfo, walkErr error) error {
 			if walkErr != nil {
@@ -283,9 +326,9 @@ func assertP113SecureRoots(t *testing.T, initial map[string]struct{}) {
 			return nil
 		})
 		if err != nil {
-			t.Fatal("Xray temporary config permission audit failed")
+			return fmt.Errorf("Xray temporary config permission audit failed")
 		}
-		return
+		return nil
 	}
-	t.Fatal("production Xray bridge did not create an isolated temporary config root")
+	return fmt.Errorf("production Xray bridge did not create an isolated temporary config root")
 }

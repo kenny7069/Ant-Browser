@@ -85,8 +85,50 @@ func ResolveProxyKernel(proxyConfig string, proxies []config.BrowserProxy, proxy
 
 func ResolveProxyKernelForConnector(proxyConfig string, proxies []config.BrowserProxy, proxyId string, connectorType string) (ProxyKernelResolution, error) {
 	src := strings.TrimSpace(resolveProxyConfig(proxyConfig, proxies, proxyId))
-	preferredKernel := preferredKernelForConnector(src, proxies, proxyId, connectorType)
-	return ResolveProxyKernel(src, proxies, proxyId, preferredKernel)
+	connector, err := normalizeConnectorBoundary(connectorType)
+	if err != nil {
+		return ProxyKernelResolution{}, err
+	}
+	protocol := DetectProxyProtocol(src)
+	supported := SupportedKernelsForProtocol(protocol, src, proxies, proxyId)
+	resolution := ProxyKernelResolution{
+		Protocol:         protocol,
+		PreferredKernel:  ProxyKernelAuto,
+		SupportedKernels: supported,
+	}
+	if len(supported) == 0 {
+		return resolution, fmt.Errorf("不支持的代理协议: %s", protocol)
+	}
+	if preferred := explicitPreferredKernel(proxies, proxyId); preferred != "" {
+		resolution.PreferredKernel = preferred
+		if !containsKernel(supported, preferred) {
+			return resolution, fmt.Errorf("协议 %s 不支持指定内核 %s", protocol, preferred)
+		}
+		if protocol == "direct" {
+			resolution.Kernel = ProxyKernelNative
+			resolution.Reason = "直连无需代理内核"
+			return resolution, nil
+		}
+		if !connectorAllowsKernel(connector, preferred) {
+			return resolution, fmt.Errorf("connector %s 不允许指定内核 %s", connector, preferred)
+		}
+		resolution.Kernel = preferred
+		resolution.Reason = "使用代理指定内核"
+		return resolution, nil
+	}
+	if protocol == "direct" {
+		resolution.Kernel = ProxyKernelNative
+		resolution.Reason = "直连无需代理内核"
+		return resolution, nil
+	}
+	for _, candidate := range connectorKernelPriority(connector) {
+		if containsKernel(supported, candidate) {
+			resolution.Kernel = candidate
+			resolution.Reason = "按连接栈策略选择内核"
+			return resolution, nil
+		}
+	}
+	return resolution, fmt.Errorf("connector %s 不支持代理协议 %s", connector, protocol)
 }
 
 func DetectProxyProtocol(proxyConfig string) string {
@@ -198,4 +240,41 @@ func proxyHasExplicitPreferredKernel(proxies []config.BrowserProxy, proxyId stri
 		}
 	}
 	return false
+}
+
+func normalizeConnectorBoundary(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", config.BrowserConnectorXray, "sing-box", "singbox", "sing_box":
+		return config.BrowserConnectorXray, nil
+	case config.BrowserConnectorMihomo, "clash", "clash-meta":
+		return config.BrowserConnectorMihomo, nil
+	default:
+		return "", fmt.Errorf("未知连接栈: %s", strings.TrimSpace(value))
+	}
+}
+
+func explicitPreferredKernel(proxies []config.BrowserProxy, proxyId string) string {
+	proxyId = strings.TrimSpace(proxyId)
+	if proxyId == "" {
+		return ""
+	}
+	for _, item := range proxies {
+		if strings.EqualFold(strings.TrimSpace(item.ProxyId), proxyId) {
+			return NormalizePreferredKernel(item.PreferredKernel)
+		}
+	}
+	return ""
+}
+
+func connectorKernelPriority(connector string) []string {
+	switch connector {
+	case config.BrowserConnectorMihomo:
+		return []string{ProxyKernelMihomo, ProxyKernelNative}
+	default:
+		return []string{ProxyKernelXray, ProxyKernelSingBox, ProxyKernelNative}
+	}
+}
+
+func connectorAllowsKernel(connector string, kernel string) bool {
+	return containsKernel(connectorKernelPriority(connector), kernel)
 }

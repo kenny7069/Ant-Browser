@@ -85,11 +85,11 @@ func TestMieruSpeedTestRequiresMihomoConnector(t *testing.T) {
 	if result.Ok {
 		t.Fatalf("speed test should fail without mihomo connector, got success: %+v", result)
 	}
-	if result.Engine != config.BrowserConnectorMihomo {
-		t.Fatalf("engine = %q, want mihomo; result=%+v", result.Engine, result)
+	if result.Engine != config.BrowserConnectorXray {
+		t.Fatalf("engine = %q, want xray fail-closed boundary; result=%+v", result.Engine, result)
 	}
-	if !strings.Contains(result.Error, "Mihomo") {
-		t.Fatalf("error = %q, want Mihomo guidance", result.Error)
+	if !strings.Contains(result.Error, "connector xray") {
+		t.Fatalf("error = %q, want xray connector policy refusal", result.Error)
 	}
 }
 

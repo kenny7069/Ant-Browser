@@ -919,7 +919,9 @@ func (s *BrowserRuntimeService) LocalProfileProxyBinding(profileID string) (Farm
 		return FarmRuntimeProxyBinding{}, fmt.Errorf("local connector is not supported")
 	}
 	resolution, err := proxy.ResolveProxyKernelForConnector(proxyConfig, proxies, proxyID, connector)
-	if err != nil || resolution.Kernel != proxy.ProxyKernelXray && resolution.Kernel != proxy.ProxyKernelMihomo {
+	if err != nil || resolution.Kernel != proxy.ProxyKernelXray &&
+		resolution.Kernel != proxy.ProxyKernelSingBox &&
+		resolution.Kernel != proxy.ProxyKernelMihomo {
 		return FarmRuntimeProxyBinding{}, fmt.Errorf("local connector resolution rejected")
 	}
 	return FarmRuntimeProxyBinding{

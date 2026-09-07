@@ -73,18 +73,48 @@ func TestResolveProxyKernelForConnectorKeepsSingBoxOnlyProtocols(t *testing.T) {
 	}
 }
 
-func TestResolveProxyKernelForConnectorExplicitPreferenceWins(t *testing.T) {
+func TestResolveProxyKernelForConnectorRejectsCrossStackPreference(t *testing.T) {
 	proxyID := "p1"
 	proxies := []config.BrowserProxy{{
 		ProxyId:         proxyID,
 		ProxyConfig:     "vless://00000000-0000-0000-0000-000000000000@example.com:443",
 		PreferredKernel: ProxyKernelXray,
 	}}
-	got, err := ResolveProxyKernelForConnector("", proxies, proxyID, config.BrowserConnectorMihomo)
-	if err != nil {
-		t.Fatalf("ResolveProxyKernelForConnector returned error: %v", err)
+	resolution, err := ResolveProxyKernelForConnector("", proxies, proxyID, config.BrowserConnectorMihomo)
+	if err == nil {
+		t.Fatalf("cross-stack preferred kernel was accepted: %+v", resolution)
 	}
-	if got.Kernel != ProxyKernelXray {
-		t.Fatalf("kernel = %q, want explicit %q; resolution=%+v", got.Kernel, ProxyKernelXray, got)
+}
+
+func TestResolveProxyKernelForConnectorRejectsMihomoOnlyProtocolOnXrayStack(t *testing.T) {
+	resolution, err := ResolveProxyKernelForConnector(mieruClashNode, nil, "", config.BrowserConnectorXray)
+	if err == nil {
+		t.Fatalf("xray connector selected mihomo-only protocol: %+v", resolution)
+	}
+	if resolution.Kernel != "" {
+		t.Fatalf("kernel = %q, want none on cross-stack rejection; resolution=%+v", resolution.Kernel, resolution)
+	}
+}
+
+func TestResolveProxyKernelForConnectorRejectsUnknownConnector(t *testing.T) {
+	resolution, err := ResolveProxyKernelForConnector("socks5://user:pass@127.0.0.1:1080", nil, "", "surprise")
+	if err == nil {
+		t.Fatalf("unknown connector was accepted: %+v", resolution)
+	}
+}
+
+func TestResolveProxyKernelForConnectorValidatesDirectPreferredKernel(t *testing.T) {
+	proxyID := "direct-profile"
+	proxies := []config.BrowserProxy{{
+		ProxyId:         proxyID,
+		ProxyConfig:     "direct://",
+		PreferredKernel: ProxyKernelXray,
+	}}
+	resolution, err := ResolveProxyKernelForConnector("", proxies, proxyID, config.BrowserConnectorXray)
+	if err == nil {
+		t.Fatalf("direct proxy accepted incompatible preferred kernel: %+v", resolution)
+	}
+	if resolution.Protocol != "direct" || resolution.PreferredKernel != ProxyKernelXray {
+		t.Fatalf("direct resolution lost explicit preference: %+v", resolution)
 	}
 }
