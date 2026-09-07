@@ -167,6 +167,13 @@ func farmRuntimeWirePayload(payload any) (any, error) {
 			return nil, nil
 		}
 		return typed, nil
+	case FarmCDPTunnelReady:
+		return typed, nil
+	case *FarmCDPTunnelReady:
+		if typed == nil {
+			return nil, nil
+		}
+		return typed, nil
 	default:
 		return nil, fmt.Errorf("%w: response payload type is not allowlisted", ErrFarmRuntimeCommand)
 	}
@@ -312,6 +319,11 @@ func farmRuntimeStableErrorMessage(message string) string {
 		ErrFarmAttestationIdentityMismatch.Error(),
 		ErrFarmAttestationUnownedRestart.Error():
 		return message
+	case ErrFarmCDPRequestInvalid.Error(),
+		ErrFarmCDPReplay.Error(),
+		ErrFarmCDPIdentity.Error(),
+		ErrFarmCDPNotReady.Error():
+		return message
 	default:
 		return ErrFarmRuntimeCommand.Error()
 	}
@@ -381,6 +393,9 @@ type FarmRuntimeService struct {
 
 	gatesMu sync.Mutex
 	gates   map[string]*farmRuntimeProfileGate
+
+	cdpSessionsMu sync.Mutex
+	cdpSessions   map[string]*farmCDPSession
 }
 
 // NewFarmRuntimeService constructs the Wails-free Farm lifecycle layer.
@@ -413,6 +428,7 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 		fencingEpoch:             options.FencingEpoch,
 		records:                  make(map[string]farmRuntimeRecord),
 		gates:                    make(map[string]*farmRuntimeProfileGate),
+		cdpSessions:              make(map[string]*farmCDPSession),
 		attestation:              NewFarmAttestationAgent(),
 		attestationStateProvider: options.AttestationStateProvider,
 		proxyBindingVerifier:     options.ProxyBindingVerifier,
@@ -1092,6 +1108,10 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 		s.setRecord(profileID, record)
 		return FarmRuntime{}, fmt.Errorf("%w: runtime is no longer running", ErrFarmRuntimeStale)
 	}
+	// An explicit strict stop owns the whole runtime lifecycle. Close any
+	// browser-level CDP sessions first so relay goroutines cannot keep a
+	// stopped Chrome target alive or retain a replayable session identity.
+	s.closeCDPSessionsForRuntime(profileID, record.runtime.Generation)
 	if _, err := s.runtimeService.StopIfGeneration(profileID, record.runtime.Generation); err != nil {
 		if errors.Is(err, ErrBrowserRuntimeGenerationMismatch) {
 			record.runtime.State = FarmRuntimeStateStale

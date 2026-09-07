@@ -248,6 +248,240 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 	t.Logf("cross-repo TLS WSS / Ed25519 / real Chrome / verified readiness / strict stop evidence: %s", raw)
 }
 
+// TestFarmRuntimeP114CrossRepoRealChromeCDPGateway is the opt-in production
+// topology proof: Python loopback gateway → authenticated Go Agent outbound
+// tunnel → owned browser-level Chrome CDP → real Playwright client.  It is
+// intentionally separate from P1.12 readiness and does not claim the later
+// Infrastructure example.com/cookies gate.
+func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
+	if os.Getenv("P114_CROSS_REPO_REAL_CHROME") != "1" {
+		t.Skip("explicit P114_CROSS_REPO_REAL_CHROME=1 opt-in required")
+	}
+	serverRepo := os.Getenv("P114_SERVER_REPO")
+	if serverRepo == "" {
+		serverRepo = "/Users/bot/Desktop/p18-acceptance-docs"
+	}
+	fixtureScript := filepath.Join(serverRepo, "輔助程式", "p1_14_cdp_gateway_fixture.py")
+	playwrightScript := filepath.Join(serverRepo, "輔助程式", "p1_14_playwright_client.py")
+	if _, err := os.Stat(fixtureScript); err != nil {
+		t.Fatalf("requested P1.14 fixture is unavailable: %v", err)
+	}
+	if _, err := os.Stat(playwrightScript); err != nil {
+		t.Fatalf("requested P1.14 Playwright client is unavailable: %v", err)
+	}
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		nodeUID    = "node-p114-cross"
+		providerID = "provider-p114-cross"
+		profileID  = "p114-cross-isolated"
+	)
+	root := t.TempDir()
+	urlFile := filepath.Join(root, "control-wss.url")
+	gatewayFile := filepath.Join(root, "gateway.url")
+	reattachRequestFile := filepath.Join(root, "reattach.request")
+	reattachGatewayFile := filepath.Join(root, "reattach.gateway.url")
+	doneFile := filepath.Join(root, "playwright.done.json")
+	evidenceFile := filepath.Join(root, "p114-evidence.json")
+	caFile := filepath.Join(root, "p114-ca.pem")
+	publicKey := base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
+	serverCtx, stopServer := context.WithTimeout(context.Background(), 90*time.Second)
+	defer stopServer()
+	serverCommand := exec.CommandContext(serverCtx, "python3", fixtureScript,
+		"--url-file", urlFile, "--gateway-file", gatewayFile,
+		"--reattach-request-file", reattachRequestFile,
+		"--reattach-gateway-file", reattachGatewayFile,
+		"--done-file", doneFile, "--evidence-file", evidenceFile,
+		"--ca-file", caFile, "--node-uid", nodeUID,
+		"--public-key", publicKey, "--profile-id", profileID,
+		"--provider-instance-id", providerID, "--fencing-epoch", "1")
+	var serverOutput bytes.Buffer
+	serverCommand.Stdout = &serverOutput
+	serverCommand.Stderr = &serverOutput
+	if err := serverCommand.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if serverCommand.Process != nil {
+			_ = serverCommand.Process.Kill()
+		}
+	}()
+	var controlURL string
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw, readErr := os.ReadFile(urlFile); readErr == nil && strings.TrimSpace(string(raw)) != "" {
+			controlURL = strings.TrimSpace(string(raw))
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if controlURL == "" {
+		_ = serverCommand.Process.Kill()
+		_ = serverCommand.Wait()
+		t.Fatalf("P1.14 Control WSS fixture did not publish URL: %s", serverOutput.String())
+	}
+
+	cfg := DefaultConfig()
+	cfg.Browser.UserDataRoot = filepath.Join(root, "profiles")
+	cfg.Browser.StartReadyTimeoutMs = 15000
+	cfg.Browser.StartStableWindowMs = 100
+	cfg.Browser.DefaultStartURLs = []string{}
+	coreRoot := os.Getenv("P114_REAL_CHROME_CORE")
+	if coreRoot == "" {
+		coreRoot = "/Applications"
+	}
+	cfg.Browser.Cores = []browser.Core{{CoreId: "chrome", CorePath: coreRoot, IsDefault: true}}
+	profile := BrowserProfile{
+		ProfileId: profileID, ProfileName: "P1.14 cross-repo isolated", CoreId: "chrome",
+		UserDataDir: filepath.Join(root, "chrome-profile"), RestoreLastSession: "never",
+		LaunchArgs: []string{"--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-background-networking"},
+	}
+	service, err := NewBrowserRuntimeServiceForHost(BrowserRuntimeServiceFactoryConfig{
+		AppRoot: root, Config: cfg, Profiles: []BrowserProfile{profile}, Host: BrowserRuntimeHost{
+			StartProcess: func(plan *BrowserRuntimeLaunchPlan) (*BrowserRuntimeProcess, error) {
+				return NewBrowserRuntimeLocalProcess(plan.Spec)
+			},
+			StopProcess: func(cmd *exec.Cmd) error { return stopBrowserProcessCommand(cmd) },
+			CanConnect:  canConnectDebugPort, TryCloseCDP: tryCloseBrowserViaCDP,
+			CreateTarget: createBrowserStartTarget,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Shutdown()
+	farm, err := NewFarmRuntimeService(FarmRuntimeServiceConfig{
+		BrowserRuntimeService: service, NodeUID: nodeUID,
+		ProviderInstanceID: providerID, FencingEpoch: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewFarmRuntimeControlAdapter(farm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caRaw, err := os.ReadFile(caFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caRaw) {
+		t.Fatal("invalid P1.14 test TLS CA")
+	}
+	client, err := NewFarmControlWSSClient(FarmControlWSSClientConfig{
+		URL: controlURL, NodeUID: nodeUID, PrivateKey: privateKey,
+		HandshakeTimeout: 5 * time.Second, CommandTimeout: 12 * time.Second,
+		HeartbeatInterval: 200 * time.Millisecond,
+		Dialer:            &websocket.Dialer{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}},
+	}, adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Connect(nil); err != nil {
+		t.Fatalf("real Go Agent authenticated connect: %v", err)
+	}
+	defer client.Close()
+	deadline = time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw, readErr := os.ReadFile(gatewayFile); readErr == nil && strings.TrimSpace(string(raw)) != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if raw, err := os.ReadFile(gatewayFile); err != nil || strings.TrimSpace(string(raw)) == "" {
+		t.Fatalf("P1.14 gateway did not publish endpoint: %v output=%s", err, serverOutput.String())
+	}
+	playwrightCtx, cancelPlaywright := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelPlaywright()
+	playwright := exec.CommandContext(playwrightCtx, "python3", playwrightScript,
+		"--gateway-file", gatewayFile,
+		"--reattach-request-file", reattachRequestFile,
+		"--reattach-gateway-file", reattachGatewayFile,
+		"--done-file", doneFile)
+	var playwrightOutput bytes.Buffer
+	playwright.Stdout = &playwrightOutput
+	playwright.Stderr = &playwrightOutput
+	if err := playwright.Run(); err != nil {
+		raw, _ := os.ReadFile(doneFile)
+		t.Fatalf("real Playwright.connect_over_cdp failed: %v done=%s output=%s", err, raw, playwrightOutput.String())
+	}
+	if err := serverCommand.Wait(); err != nil {
+		t.Fatalf("P1.14 Python fixture failed: %v output=%s", err, serverOutput.String())
+	}
+	var evidence struct {
+		Accepted   bool `json:"accepted"`
+		Playwright struct {
+			Connected        bool   `json:"connected"`
+			BasicIO          bool   `json:"basic_io"`
+			Title            string `json:"title"`
+			Evaluate         int    `json:"evaluate"`
+			NewPage          bool   `json:"new_page"`
+			Cookies          bool   `json:"cookies"`
+			ClearPermissions bool   `json:"clear_permissions"`
+			Disconnected     bool   `json:"disconnected"`
+			Reattached       bool   `json:"reattached"`
+		} `json:"playwright"`
+		Commands []struct {
+			Command string         `json:"command"`
+			OK      bool           `json:"ok"`
+			Payload map[string]any `json:"payload"`
+		} `json:"commands"`
+	}
+	raw, err := os.ReadFile(evidenceFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if !evidence.Accepted {
+		t.Fatalf("P1.14 evidence not accepted: %s", raw)
+	}
+	if !evidence.Playwright.Connected ||
+		!evidence.Playwright.BasicIO ||
+		evidence.Playwright.Title != "Example Domain" ||
+		evidence.Playwright.Evaluate != 42 ||
+		!evidence.Playwright.NewPage ||
+		!evidence.Playwright.Cookies ||
+		!evidence.Playwright.ClearPermissions ||
+		!evidence.Playwright.Disconnected ||
+		!evidence.Playwright.Reattached {
+		t.Fatalf("P1.14 Playwright infrastructure evidence incomplete: %+v", evidence.Playwright)
+	}
+	want := []string{"ensure_runtime", "open_cdp_tunnel", "open_cdp_tunnel", "stop_runtime"}
+	if len(evidence.Commands) != len(want) {
+		t.Fatalf("P1.14 command count = %d, want %d: %s", len(evidence.Commands), len(want), raw)
+	}
+	for index, command := range evidence.Commands {
+		if command.Command != want[index] || !command.OK {
+			t.Fatalf("P1.14 command %d = %+v", index, command)
+		}
+	}
+	ensurePayload := evidence.Commands[0].Payload
+	initialDebugPort, ok := ensurePayload["debug_port"].(float64)
+	if !ok || initialDebugPort <= 0 {
+		t.Fatalf("P1.14 ensure evidence debug_port = %#v", ensurePayload["debug_port"])
+	}
+	stopPayload := evidence.Commands[len(evidence.Commands)-1].Payload
+	if debugPort, ok := stopPayload["debug_port"].(float64); !ok || debugPort != 0 {
+		t.Fatalf("P1.14 stop evidence debug_port = %#v, want 0", stopPayload["debug_port"])
+	}
+	if debugReady, ok := stopPayload["debug_ready"].(bool); !ok || debugReady {
+		t.Fatalf("P1.14 stop evidence debug_ready = %#v, want false", stopPayload["debug_ready"])
+	}
+	closedDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(closedDeadline) && canConnectDebugPort(int(initialDebugPort), 100*time.Millisecond) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if canConnectDebugPort(int(initialDebugPort), 100*time.Millisecond) {
+		t.Fatalf("P1.14 browser debug port %d remained reachable after strict stop", int(initialDebugPort))
+	}
+	t.Logf("P1.14 deferred loopback gateway / outbound Agent tunnel / real Chrome / Playwright basic I/O evidence: %s", raw)
+}
+
 // TestFarmRuntimeP113CrossRepoRealXrayProxyChrome is the P1.13 production
 // chain evidence path. It reuses the Python ControlWSServer fixture and the
 // Go FarmControlWSSClient, then proves the authenticated profile proxy through

@@ -68,6 +68,8 @@ type FarmControlWSSClient struct {
 	cancel           context.CancelFunc
 	writeMu          sync.Mutex
 	commandSlots     chan struct{}
+	cdpMu            sync.Mutex
+	cdpSessions      map[string]*farmControlCDPSession
 	lastHeartbeatAck time.Time
 }
 
@@ -121,6 +123,7 @@ func NewFarmControlWSSClient(config FarmControlWSSClientConfig, adapter *FarmRun
 	return &FarmControlWSSClient{
 		config: config, adapter: adapter, private: privateKey,
 		done: make(chan struct{}), ctx: ctx, cancel: cancel, commandSlots: make(chan struct{}, 16),
+		cdpSessions: make(map[string]*farmControlCDPSession),
 	}, nil
 }
 
@@ -334,6 +337,7 @@ func (c *FarmControlWSSClient) shutdown(err error) {
 		c.closed, c.closeErr = true, err
 		conn := c.conn
 		c.mu.Unlock()
+		c.closeCDPSessions()
 		c.cancel()
 		if conn != nil {
 			code := websocket.CloseNormalClosure
@@ -404,6 +408,14 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn) {
 			}
 			go func(command FarmRuntimeCommand) {
 				defer func() { <-c.commandSlots }()
+				if command.Command == "open_cdp_tunnel" {
+					// CDP is a separate WebSocket message relay.  It must be
+					// opened only after the shared runtime service proves current
+					// ownership; the helper sends the compact command response
+					// after the outbound tunnel receives its ready handshake.
+					c.handleOpenCDPCommand(conn, command)
+					return
+				}
 				// Runtime calls retain their existing service ownership/bounds.
 				// Cancel the transport wait and discard late results; disconnect
 				// must preserve persistent Chrome for subsequent reconciliation.
