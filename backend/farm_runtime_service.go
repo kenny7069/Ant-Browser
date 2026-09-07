@@ -212,6 +212,10 @@ type FarmRuntimeServiceConfig struct {
 	// ProxyRuntimeCleanup is only supplied by the Wails-free factory that owns
 	// the connector managers. It must be a no-op for App-shared services.
 	ProxyRuntimeCleanup func()
+	// ResourceTelemetryHooks contains only host-local measurement callbacks.
+	// The wire projection is built by FarmRuntimeService and never carries the
+	// callback or arbitrary host errors.
+	ResourceTelemetryHooks *FarmResourceTelemetryHooks
 }
 
 // FarmRuntimeServiceFactoryConfig is the public, Wails-free factory boundary.
@@ -231,6 +235,7 @@ type FarmRuntimeServiceFactoryConfig struct {
 	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 	ProxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
 	ProxyRuntimeCleanup      func()
+	ResourceTelemetryHooks   *FarmResourceTelemetryHooks
 }
 
 // FarmRuntimeEnsureRequest identifies the profile and, when supplied, the
@@ -402,6 +407,7 @@ type FarmRuntimeService struct {
 	attestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 	proxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
 	proxyRuntimeCleanup      func()
+	resourceTelemetryHooks   *FarmResourceTelemetryHooks
 
 	recordsMu sync.RWMutex
 	records   map[string]farmRuntimeRecord
@@ -461,6 +467,7 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 		attestationStateProvider: options.AttestationStateProvider,
 		proxyBindingVerifier:     options.ProxyBindingVerifier,
 		proxyRuntimeCleanup:      options.ProxyRuntimeCleanup,
+		resourceTelemetryHooks:   options.ResourceTelemetryHooks,
 	}, nil
 }
 
@@ -500,6 +507,7 @@ func NewFarmRuntimeServiceForHost(options FarmRuntimeServiceFactoryConfig) (*Far
 		AttestationStateProvider: options.AttestationStateProvider,
 		ProxyBindingVerifier:     verifier,
 		ProxyRuntimeCleanup:      runtimeService.CleanupOwnedProxyRuntimes,
+		ResourceTelemetryHooks:   options.ResourceTelemetryHooks,
 	})
 }
 
@@ -1573,6 +1581,16 @@ func (adapter *FarmRuntimeControlAdapter) DispatchCommand(command FarmRuntimeCom
 		return FarmRuntimeCommandResponse{Type: "command_response", Error: farmRuntimeWireError(ErrFarmRuntimeServiceUnavailable)}
 	}
 	return adapter.service.DispatchCommand(command)
+}
+
+// ResourceTelemetry is the authenticated heartbeat projection used by the
+// Control WSS transport. It does not dispatch through the command surface and
+// therefore cannot be confused with a lifecycle response or locator payload.
+func (adapter *FarmRuntimeControlAdapter) ResourceTelemetry(controlRTTMS float64) (FarmResourceTelemetry, error) {
+	if adapter == nil || adapter.service == nil {
+		return FarmResourceTelemetry{}, ErrFarmRuntimeServiceUnavailable
+	}
+	return adapter.service.ResourceTelemetry(controlRTTMS)
 }
 
 // HandleCommandEnvelope is the explicit envelope-named entry point for a

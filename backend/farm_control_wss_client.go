@@ -18,7 +18,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -71,6 +73,9 @@ type FarmControlWSSClient struct {
 	cdpMu            sync.Mutex
 	cdpSessions      map[string]*farmControlCDPSession
 	lastHeartbeatAck time.Time
+	heartbeatSent    map[string]time.Time
+	lastControlRTT   time.Duration
+	heartbeatSeq     uint64
 }
 
 // NewFarmControlWSSClient constructs the production agent transport without
@@ -123,7 +128,8 @@ func NewFarmControlWSSClient(config FarmControlWSSClientConfig, adapter *FarmRun
 	return &FarmControlWSSClient{
 		config: config, adapter: adapter, private: privateKey,
 		done: make(chan struct{}), ctx: ctx, cancel: cancel, commandSlots: make(chan struct{}, 16),
-		cdpSessions: make(map[string]*farmControlCDPSession),
+		cdpSessions:   make(map[string]*farmControlCDPSession),
+		heartbeatSent: make(map[string]time.Time),
 	}, nil
 }
 
@@ -152,6 +158,17 @@ type farmControlAuthProve struct {
 type farmControlAuthenticated struct {
 	Type    string `json:"type"`
 	NodeUID string `json:"node_uid"`
+}
+
+type farmControlHeartbeat struct {
+	Type        string                 `json:"type"`
+	HeartbeatID string                 `json:"heartbeat_id"`
+	Telemetry   *FarmResourceTelemetry `json:"telemetry,omitempty"`
+}
+
+type farmControlHeartbeatAck struct {
+	Type        string `json:"type"`
+	HeartbeatID string `json:"heartbeat_id,omitempty"`
 }
 
 func strictFarmControlDecode(raw []byte, target any, max int) error {
@@ -323,6 +340,8 @@ func (c *FarmControlWSSClient) Connect(ctx context.Context) error {
 	}
 	c.conn = conn
 	c.lastHeartbeatAck = time.Now()
+	c.lastControlRTT = 0
+	c.heartbeatSent = make(map[string]time.Time)
 	c.mu.Unlock()
 	go c.readLoop(conn)
 	go c.heartbeatLoop(conn)
@@ -381,15 +400,22 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn) {
 		}
 		switch envelope.Type {
 		case "heartbeat_ack":
-			var ack struct {
-				Type string `json:"type"`
-			}
+			var ack farmControlHeartbeatAck
 			if strictFarmControlDecode(raw, &ack, c.config.MaxMessageBytes) != nil {
 				c.shutdown(ErrFarmControlWSSProtocol)
 				return
 			}
+			now := time.Now()
 			c.mu.Lock()
-			c.lastHeartbeatAck = time.Now()
+			c.lastHeartbeatAck = now
+			if ack.HeartbeatID != "" {
+				if sent, ok := c.heartbeatSent[ack.HeartbeatID]; ok {
+					if rtt := now.Sub(sent); rtt >= 0 {
+						c.lastControlRTT = rtt
+					}
+					delete(c.heartbeatSent, ack.HeartbeatID)
+				}
+			}
 			c.mu.Unlock()
 			continue
 		case "command":
@@ -453,14 +479,30 @@ func (c *FarmControlWSSClient) heartbeatLoop(conn *websocket.Conn) {
 		case <-ticker.C:
 			c.mu.Lock()
 			lastAck := c.lastHeartbeatAck
+			lastRTT := c.lastControlRTT
 			c.mu.Unlock()
 			if !lastAck.IsZero() && time.Since(lastAck) > 2*c.config.HeartbeatInterval {
 				c.shutdown(ErrFarmControlWSSClosed)
 				return
 			}
-			if err := c.writeJSON(conn, struct {
-				Type string `json:"type"`
-			}{Type: "heartbeat"}); err != nil {
+			heartbeatID := strconv.FormatInt(time.Now().UnixNano(), 10) + "-" + strconv.FormatUint(atomic.AddUint64(&c.heartbeatSeq, 1), 10)
+			var telemetry *FarmResourceTelemetry
+			if value, err := c.adapter.ResourceTelemetry(durationMilliseconds(lastRTT)); err == nil {
+				telemetry = &value
+			}
+			sentAt := time.Now()
+			c.mu.Lock()
+			if len(c.heartbeatSent) >= 64 {
+				for id := range c.heartbeatSent {
+					delete(c.heartbeatSent, id)
+					break
+				}
+			}
+			c.heartbeatSent[heartbeatID] = sentAt
+			c.mu.Unlock()
+			if err := c.writeJSON(conn, farmControlHeartbeat{
+				Type: "heartbeat", HeartbeatID: heartbeatID, Telemetry: telemetry,
+			}); err != nil {
 				c.shutdown(err)
 				return
 			}
@@ -468,6 +510,25 @@ func (c *FarmControlWSSClient) heartbeatLoop(conn *websocket.Conn) {
 			return
 		}
 	}
+}
+
+func durationMilliseconds(value time.Duration) float64 {
+	if value <= 0 {
+		return -1
+	}
+	return float64(value) / float64(time.Millisecond)
+}
+
+// ControlRTTMilliseconds returns the latest measured authenticated heartbeat
+// round trip. A negative value means no matching heartbeat acknowledgement has
+// been observed yet.
+func (c *FarmControlWSSClient) ControlRTTMilliseconds() float64 {
+	if c == nil {
+		return -1
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return durationMilliseconds(c.lastControlRTT)
 }
 
 // Done closes when the authenticated connection has terminated. Closing the
