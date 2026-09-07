@@ -26,6 +26,7 @@ const (
 var (
 	ErrFarmCDPRequestInvalid = errors.New("farm CDP tunnel request invalid")
 	ErrFarmCDPReplay         = errors.New("farm CDP tunnel session replay")
+	ErrFarmCDPCapacity       = errors.New("farm CDP tunnel replay tombstone capacity reached")
 	ErrFarmCDPIdentity       = errors.New("farm CDP tunnel identity mismatch")
 	ErrFarmCDPNotReady       = errors.New("farm CDP runtime is not ready")
 )
@@ -189,6 +190,11 @@ func (s *FarmRuntimeService) claimCDPSession(request FarmCDPTunnelRequest) error
 	if _, exists := s.cdpTokenTombstones[tokenHash]; exists {
 		return ErrFarmCDPReplay
 	}
+	if len(s.cdpTombstones) >= farmCDPMaxTombstones {
+		// Never evict a live one-time ticket to make room for a new claim.
+		// Refusing the new claim preserves replay safety until TTL pruning.
+		return ErrFarmCDPCapacity
+	}
 	tombstone := farmCDPTombstone{
 		tokenHash: tokenHash,
 		identity:  request.RuntimeIdentity,
@@ -198,7 +204,6 @@ func (s *FarmRuntimeService) claimCDPSession(request FarmCDPTunnelRequest) error
 	// dial therefore consumes the one-time ticket just like a successful one.
 	s.cdpTombstones[request.SessionID] = tombstone
 	s.cdpTokenTombstones[tokenHash] = tombstone
-	s.pruneCDPTombstonesLocked(now)
 	return nil
 }
 
@@ -218,21 +223,6 @@ func (s *FarmRuntimeService) pruneCDPTombstonesLocked(now time.Time) {
 				}
 			}
 		}
-	}
-	for len(s.cdpTombstones) > farmCDPMaxTombstones {
-		var oldestID string
-		var oldest time.Time
-		for sessionID, tombstone := range s.cdpTombstones {
-			if oldestID == "" || tombstone.expiresAt.Before(oldest) {
-				oldestID, oldest = sessionID, tombstone.expiresAt
-			}
-		}
-		if oldestID == "" {
-			break
-		}
-		tokenHash := s.cdpTombstones[oldestID].tokenHash
-		delete(s.cdpTombstones, oldestID)
-		delete(s.cdpTokenTombstones, tokenHash)
 	}
 }
 

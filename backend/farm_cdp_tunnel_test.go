@@ -192,7 +192,8 @@ func TestFarmCDPTombstonesRemainBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; index < farmCDPMaxTombstones+32; index++ {
+	requests := make([]FarmCDPTunnelRequest, 0, farmCDPMaxTombstones)
+	for index := 0; index < farmCDPMaxTombstones; index++ {
 		request := FarmCDPTunnelRequest{
 			SessionID:       fmt.Sprintf("bounded-session-%d", index),
 			TunnelToken:     fmt.Sprintf("bounded-token-%d", index),
@@ -201,13 +202,25 @@ func TestFarmCDPTombstonesRemainBounded(t *testing.T) {
 		if err := fixture.farm.claimCDPSession(request); err != nil {
 			t.Fatal(err)
 		}
+		requests = append(requests, request)
+	}
+	extra := FarmCDPTunnelRequest{
+		SessionID:       "bounded-session-extra",
+		TunnelToken:     "bounded-token-extra",
+		RuntimeIdentity: runtime.FarmRuntimeIdentity,
+	}
+	if err := fixture.farm.claimCDPSession(extra); !errors.Is(err, ErrFarmCDPCapacity) {
+		t.Fatalf("full live tombstone set accepted new claim: %v", err)
+	}
+	if _, err := fixture.farm.OpenCDPTunnel(requests[0]); !errors.Is(err, ErrFarmCDPReplay) {
+		t.Fatalf("full live tombstone set evicted first ticket: %v", err)
 	}
 	fixture.farm.cdpSessionsMu.Lock()
 	sessions := len(fixture.farm.cdpTombstones)
 	tokens := len(fixture.farm.cdpTokenTombstones)
 	fixture.farm.cdpSessionsMu.Unlock()
-	if sessions > farmCDPMaxTombstones || tokens > farmCDPMaxTombstones {
-		t.Fatalf("tombstones grew unbounded: sessions=%d tokens=%d", sessions, tokens)
+	if sessions != farmCDPMaxTombstones || tokens != farmCDPMaxTombstones {
+		t.Fatalf("full live tombstone set changed: sessions=%d tokens=%d", sessions, tokens)
 	}
 }
 
