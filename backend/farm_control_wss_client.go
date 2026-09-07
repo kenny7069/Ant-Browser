@@ -481,7 +481,14 @@ func (c *FarmControlWSSClient) heartbeatLoop(conn *websocket.Conn) {
 			lastAck := c.lastHeartbeatAck
 			lastRTT := c.lastControlRTT
 			c.mu.Unlock()
-			if !lastAck.IsZero() && time.Since(lastAck) > 2*c.config.HeartbeatInterval {
+			// RTT policy explicitly supports sustained samples above 200ms.  Do
+			// not self-disconnect before such a sample can be observed; retain a
+			// bounded liveness deadline independent from the sampling cadence.
+			ackDeadline := 4 * c.config.HeartbeatInterval
+			if ackDeadline < 300*time.Millisecond {
+				ackDeadline = 300 * time.Millisecond
+			}
+			if !lastAck.IsZero() && time.Since(lastAck) > ackDeadline {
 				c.shutdown(ErrFarmControlWSSClosed)
 				return
 			}

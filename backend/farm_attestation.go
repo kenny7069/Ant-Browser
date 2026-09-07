@@ -763,13 +763,15 @@ func ControlledRestartSelector(identity FarmRuntimeIdentity, owned bool) (FarmRu
 		return FarmRuntimeStopRequest{}, err
 	}
 	return FarmRuntimeStopRequest{
-		NodeUID:            identity.NodeUID,
-		ProfileID:          identity.ProfileID,
-		RuntimeUID:         identity.RuntimeUID,
-		ProviderInstanceID: identity.ProviderInstanceID,
-		FencingEpoch:       identity.FencingEpoch,
-		ConfigHash:         identity.ConfigHash,
-		Generation:         identity.Generation,
+		NodeUID:              identity.NodeUID,
+		ProfileID:            identity.ProfileID,
+		RuntimeUID:           identity.RuntimeUID,
+		ProviderInstanceID:   identity.ProviderInstanceID,
+		FencingEpoch:         identity.FencingEpoch,
+		ConfigHash:           identity.ConfigHash,
+		Generation:           identity.Generation,
+		ControllerID:         identity.ControllerID,
+		ControllerGeneration: identity.ControllerGeneration,
 	}, nil
 }
 

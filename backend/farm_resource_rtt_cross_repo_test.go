@@ -36,26 +36,58 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 	}
 
 	const (
-		nodeUID    = "node-p117-cross"
-		providerID = "provider-p117-cross"
-		profileID  = "profile-p117-cross"
+		nodeUID      = "node-p117-cross"
+		providerID   = "provider-p117-cross"
+		profileID    = "profile-p117-cross"
+		controllerID = "controller-p117-cross"
 	)
 	fixture := newFarmRuntimeTestFixture(t, profileID)
 	runtime, err := fixture.farm.EnsureRuntime(FarmRuntimeEnsureRequest{ProfileID: profileID})
 	if err != nil {
 		t.Fatalf("ensure isolated runtime: %v", err)
 	}
+	child := exec.Command("sh", "-c", "sleep 30 & wait")
+	if err := child.Start(); err != nil {
+		t.Fatalf("start real Agent-owned process tree: %v", err)
+	}
+	owner, err := NewBrowserRuntimeCmdOwner(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedProcess, err := NewBrowserRuntimeProcess(child, owner, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.runtime.identityMu.Lock()
+	active := fixture.runtime.active[profileID]
+	active.pid = child.Process.Pid
+	active.cmd = child
+	fixture.runtime.active[profileID] = active
+	fixture.runtime.identityMu.Unlock()
+	fixture.manager.Mutex.Lock()
+	fixture.manager.Profiles[profileID].Pid = child.Process.Pid
+	fixture.manager.Mutex.Unlock()
+	fixture.runtime.trackProcess(profileID, ownedProcess, active)
+	fixture.runtime.mu.Lock()
+	fixture.runtime.host.StopProcess = func(cmd *exec.Cmd) error { return cmd.Process.Kill() }
+	fixture.runtime.mu.Unlock()
+	defer func() { _ = child.Process.Kill() }()
 	// The helper fixture uses a deterministic recovered runtime; telemetry
 	// hooks make the E2E independent from host process discovery while keeping
 	// the real WSS/Go/Server wire and strict stop path.
 	fixture.farm.nodeUID = nodeUID
 	fixture.farm.providerInstance = providerID
 	fixture.farm.fencingEpoch = 7
+	fixture.farm.controllerID = controllerID
+	fixture.farm.controllerGeneration = 3
 	fixture.farm.recordsMu.Lock()
 	record := fixture.farm.records[profileID]
 	record.runtime.NodeUID = nodeUID
 	record.runtime.ProviderInstanceID = providerID
 	record.runtime.FencingEpoch = 7
+	record.runtime.PID = child.Process.Pid
+	record.runtime.ControllerID = controllerID
+	record.runtime.ControllerGeneration = 3
 	fixture.farm.records[profileID] = record
 	fixture.farm.recordsMu.Unlock()
 	// Keep BrowserRuntime identity and Agent service identity aligned after the
@@ -65,7 +97,6 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 		NodeMemory: func() (FarmNodeMemoryTelemetry, error) {
 			return FarmNodeMemoryTelemetry{TotalMB: 8192, AvailableMB: 4096, UsedPercent: 50, Health: "healthy"}, nil
 		},
-		ProcessRSS: func(pid int) (int64, error) { return 321, nil },
 	}
 
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
@@ -83,6 +114,7 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 		"--node-uid", nodeUID, "--public-key", publicKey, "--profile-id", profileID,
 		"--runtime-uid", runtime.RuntimeUID, "--provider-instance-id", providerID,
 		"--fencing-epoch", "7", "--generation", strconv.FormatUint(runtime.Generation, 10))
+	serverCommand.Args = append(serverCommand.Args, "--controller-id", controllerID, "--controller-generation", "3")
 	if err := serverCommand.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -137,9 +169,11 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 		t.Fatal("Agent connection did not close after remote recycle")
 	}
 	var evidence struct {
-		TelemetrySeen bool           `json:"telemetry_seen"`
-		Recycled      bool           `json:"recycled"`
-		Resource      map[string]any `json:"resource"`
+		TelemetrySeen    bool           `json:"telemetry_seen"`
+		PlacementBlocked bool           `json:"placement_blocked"`
+		SoftDraining     bool           `json:"soft_draining"`
+		Recycled         bool           `json:"recycled"`
+		Resource         map[string]any `json:"resource"`
 	}
 	raw, err := os.ReadFile(evidenceFile)
 	if err != nil {
@@ -148,10 +182,23 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 	if err := json.Unmarshal(raw, &evidence); err != nil {
 		t.Fatal(err)
 	}
-	if !evidence.TelemetrySeen || !evidence.Recycled {
+	if !evidence.TelemetrySeen || !evidence.PlacementBlocked || !evidence.SoftDraining || !evidence.Recycled {
 		t.Fatalf("resource/RTT evidence not accepted: %s", raw)
 	}
 	if evidence.Resource["provider"] != "farm" || strings.Contains(string(raw), "password") || strings.Contains(string(raw), "proxy") {
 		t.Fatalf("invalid provider or secret-bearing telemetry evidence: %s", raw)
+	}
+	runtimeRows, ok := evidence.Resource["runtimes"].([]any)
+	if !ok || len(runtimeRows) != 1 {
+		t.Fatalf("missing real runtime telemetry: %s", raw)
+	}
+	runtimeRow, ok := runtimeRows[0].(map[string]any)
+	if !ok || runtimeRow["pid"] != float64(child.Process.Pid) || runtimeRow["rss_valid"] != true || runtimeRow["rss_mb"].(float64) <= 0 {
+		t.Fatalf("invalid real PID/RSS overlay: %s", raw)
+	}
+	select {
+	case <-owner.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("remote recycle did not exit/reap real Agent process tree")
 	}
 }

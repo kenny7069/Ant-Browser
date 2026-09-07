@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,32 +49,40 @@ type FarmNodeMemoryTelemetry struct {
 // FarmRuntimeResourceTelemetry is bound to one strict Farm runtime identity.
 // RSS is the Agent-observed process tree RSS, not a Server-side PID lookup.
 type FarmRuntimeResourceTelemetry struct {
-	NodeUID            string `json:"node_uid"`
-	ProfileID          string `json:"profile_id"`
-	RuntimeUID         string `json:"runtime_uid"`
-	Provider           string `json:"provider"`
-	ProviderInstanceID string `json:"provider_instance_id"`
-	FencingEpoch       uint64 `json:"fencing_epoch"`
-	Generation         uint64 `json:"generation"`
-	RSSMB              int64  `json:"rss_mb,omitempty"`
-	Health             string `json:"health"`
-	ObservedAt         string `json:"observed_at"`
+	NodeUID              string `json:"node_uid"`
+	ProfileID            string `json:"profile_id"`
+	RuntimeUID           string `json:"runtime_uid"`
+	Provider             string `json:"provider"`
+	ProviderInstanceID   string `json:"provider_instance_id"`
+	FencingEpoch         uint64 `json:"fencing_epoch"`
+	Generation           uint64 `json:"generation"`
+	ControllerID         string `json:"controller_id"`
+	ControllerGeneration uint64 `json:"controller_generation"`
+	PID                  int    `json:"pid"`
+	RSSMB                int64  `json:"rss_mb,omitempty"`
+	RSSValid             bool   `json:"rss_valid"`
+	State                string `json:"state"`
+	Health               string `json:"health"`
+	ObservedAt           string `json:"observed_at"`
 }
 
 // FarmResourceTelemetry is sent nested inside an authenticated heartbeat.
 // The Server accepts only this projection and treats the WSS session identity
 // as the authority for node_uid/device ownership.
 type FarmResourceTelemetry struct {
-	Version            int                            `json:"version"`
-	NodeUID            string                         `json:"node_uid"`
-	Provider           string                         `json:"provider"`
-	ProviderInstanceID string                         `json:"provider_instance_id"`
-	FencingEpoch       uint64                         `json:"fencing_epoch"`
-	ObservedAt         string                         `json:"observed_at"`
-	ControlRTTMS       float64                        `json:"control_rtt_ms,omitempty"`
-	RTTClass           string                         `json:"rtt_class"`
-	NodeMemory         FarmNodeMemoryTelemetry        `json:"node_memory"`
-	Runtimes           []FarmRuntimeResourceTelemetry `json:"runtimes,omitempty"`
+	Version              int                            `json:"version"`
+	NodeUID              string                         `json:"node_uid"`
+	Provider             string                         `json:"provider"`
+	ProviderInstanceID   string                         `json:"provider_instance_id"`
+	FencingEpoch         uint64                         `json:"fencing_epoch"`
+	ControllerID         string                         `json:"controller_id"`
+	ControllerGeneration uint64                         `json:"controller_generation"`
+	SampleSequence       uint64                         `json:"sample_sequence"`
+	ObservedAt           string                         `json:"observed_at"`
+	ControlRTTMS         float64                        `json:"control_rtt_ms,omitempty"`
+	RTTClass             string                         `json:"rtt_class"`
+	NodeMemory           FarmNodeMemoryTelemetry        `json:"node_memory"`
+	Runtimes             []FarmRuntimeResourceTelemetry `json:"runtimes,omitempty"`
 }
 
 // FarmResourceTelemetryHooks are test seams and host overrides.  Production
@@ -334,31 +343,47 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 			continue
 		}
 		pid := record.runtime.PID
-		if snapshot, err := s.snapshot(profileID); err == nil && snapshot != nil && snapshot.Profile != nil && snapshot.Profile.Pid > 0 {
+		observedGeneration := record.runtime.Generation
+		if snapshot, err := s.snapshot(profileID); err == nil && snapshot != nil && snapshot.Profile != nil && snapshot.Profile.Pid > 0 && snapshot.Generation == record.runtime.Generation {
 			pid = snapshot.Profile.Pid
+			observedGeneration = snapshot.Generation
+		} else if s.runtimeService != nil {
+			return FarmResourceTelemetry{}, ErrFarmResourceTelemetryInvalid
 		}
 		rss := int64(0)
+		rssValid := false
 		if pid > 0 {
 			reader := defaultProcessTreeRSS
 			if s.resourceTelemetryHooks != nil && s.resourceTelemetryHooks.ProcessRSS != nil {
 				reader = s.resourceTelemetryHooks.ProcessRSS
 			}
-			if value, err := reader(pid); err == nil && value >= 0 {
-				rss = value
+			if value, err := reader(pid); err == nil && value > 0 {
+				if s.runtimeService == nil {
+					rss = value
+					rssValid = true
+				} else if after, afterErr := s.snapshot(profileID); afterErr == nil && after != nil && after.Profile != nil && after.Profile.Pid == pid && after.Generation == observedGeneration {
+					rss = value
+					rssValid = true
+				}
 			}
 		}
 		runtimes = append(runtimes, FarmRuntimeResourceTelemetry{
 			NodeUID: s.nodeUID, ProfileID: record.runtime.ProfileID,
 			RuntimeUID: record.runtime.RuntimeUID, Provider: "farm",
 			ProviderInstanceID: s.providerInstance, FencingEpoch: s.fencingEpoch,
-			Generation: record.runtime.Generation, RSSMB: rss,
+			Generation:   record.runtime.Generation,
+			ControllerID: s.controllerID, ControllerGeneration: s.controllerGeneration,
+			PID: pid, RSSMB: rss, RSSValid: rssValid, State: record.runtime.State,
 			Health: memory.Health, ObservedAt: now.Format(time.RFC3339Nano),
 		})
 	}
+	sequence := atomic.AddUint64(&s.resourceTelemetrySequence, 1)
 	telemetry := FarmResourceTelemetry{
 		Version: FarmResourceTelemetryVersion, NodeUID: s.nodeUID,
 		Provider: "farm", ProviderInstanceID: s.providerInstance,
-		FencingEpoch: s.fencingEpoch, ObservedAt: now.Format(time.RFC3339Nano),
+		FencingEpoch: s.fencingEpoch, ControllerID: s.controllerID,
+		ControllerGeneration: s.controllerGeneration, SampleSequence: sequence,
+		ObservedAt:   now.Format(time.RFC3339Nano),
 		ControlRTTMS: 0, RTTClass: FarmRTTUnknownClass,
 		NodeMemory: memory, Runtimes: runtimes,
 	}
@@ -370,7 +395,7 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 }
 
 func ValidateFarmResourceTelemetry(value FarmResourceTelemetry) error {
-	if value.Version != FarmResourceTelemetryVersion || strings.TrimSpace(value.NodeUID) == "" || value.Provider != "farm" || strings.TrimSpace(value.ProviderInstanceID) == "" || value.FencingEpoch == 0 {
+	if value.Version != FarmResourceTelemetryVersion || strings.TrimSpace(value.NodeUID) == "" || value.Provider != "farm" || strings.TrimSpace(value.ProviderInstanceID) == "" || value.FencingEpoch == 0 || strings.TrimSpace(value.ControllerID) == "" || value.ControllerGeneration == 0 || value.SampleSequence == 0 {
 		return ErrFarmResourceTelemetryInvalid
 	}
 	if _, err := time.Parse(time.RFC3339Nano, value.ObservedAt); err != nil {
@@ -392,10 +417,10 @@ func ValidateFarmResourceTelemetry(value FarmResourceTelemetry) error {
 		return ErrFarmResourceTelemetryInvalid
 	}
 	for _, runtimeTelemetry := range value.Runtimes {
-		if runtimeTelemetry.NodeUID != value.NodeUID || runtimeTelemetry.Provider != "farm" || runtimeTelemetry.ProviderInstanceID != value.ProviderInstanceID || runtimeTelemetry.FencingEpoch != value.FencingEpoch || strings.TrimSpace(runtimeTelemetry.ProfileID) == "" || strings.TrimSpace(runtimeTelemetry.RuntimeUID) == "" || runtimeTelemetry.Generation == 0 {
+		if runtimeTelemetry.NodeUID != value.NodeUID || runtimeTelemetry.Provider != "farm" || runtimeTelemetry.ProviderInstanceID != value.ProviderInstanceID || runtimeTelemetry.FencingEpoch != value.FencingEpoch || runtimeTelemetry.ControllerID != value.ControllerID || runtimeTelemetry.ControllerGeneration != value.ControllerGeneration || strings.TrimSpace(runtimeTelemetry.ProfileID) == "" || strings.TrimSpace(runtimeTelemetry.RuntimeUID) == "" || runtimeTelemetry.Generation == 0 || runtimeTelemetry.PID <= 0 {
 			return ErrFarmResourceTelemetryInvalid
 		}
-		if runtimeTelemetry.RSSMB < 0 || !validResourceHealth(runtimeTelemetry.Health) {
+		if !runtimeTelemetry.RSSValid || runtimeTelemetry.RSSMB <= 0 || !validResourceHealth(runtimeTelemetry.Health) || !validRuntimeTelemetryState(runtimeTelemetry.State) {
 			return ErrFarmResourceTelemetryInvalid
 		}
 		if _, err := time.Parse(time.RFC3339Nano, runtimeTelemetry.ObservedAt); err != nil {
@@ -403,6 +428,15 @@ func ValidateFarmResourceTelemetry(value FarmResourceTelemetry) error {
 		}
 	}
 	return nil
+}
+
+func validRuntimeTelemetryState(value string) bool {
+	switch value {
+	case FarmRuntimeStateStarting, FarmRuntimeStateIdle:
+		return true
+	default:
+		return false
+	}
 }
 
 func validResourceHealth(value string) bool {

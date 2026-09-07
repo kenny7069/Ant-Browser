@@ -3,10 +3,41 @@ package backend
 import (
 	"encoding/json"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestDefaultProcessTreeRSSUsesRealChildAndFailsClosedAfterExit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real OS process proof")
+	}
+	cmd := exec.Command("sh", "-c", "sleep 30 & wait")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
+	deadline := time.Now().Add(3 * time.Second)
+	var rss int64
+	var err error
+	for time.Now().Before(deadline) {
+		rss, err = defaultProcessTreeRSS(pid)
+		if err == nil && rss > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || rss <= 0 {
+		t.Fatalf("real process tree RSS pid=%d rss=%d err=%v", pid, rss, err)
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+	if _, err := defaultProcessTreeRSS(pid); err == nil {
+		t.Fatal("exited/PID-missing process produced valid RSS")
+	}
+}
 
 func TestFarmResourceTelemetryRTTBoundaries(t *testing.T) {
 	tests := []struct {
@@ -36,6 +67,7 @@ func TestFarmResourceTelemetryUsesAgentHooksAndClosedWireProjection(t *testing.T
 		nodeUID:          "node-a",
 		providerInstance: "farm-a",
 		fencingEpoch:     7,
+		controllerID:     "controller-a", controllerGeneration: 3,
 		records: map[string]farmRuntimeRecord{
 			"profile-a": {
 				runtime: FarmRuntime{
@@ -85,6 +117,7 @@ func TestFarmResourceTelemetryUsesAgentHooksAndClosedWireProjection(t *testing.T
 func TestFarmResourceTelemetryUnknownRTTDoesNotClaimHealthy(t *testing.T) {
 	service := &FarmRuntimeService{
 		nodeUID: "node-a", providerInstance: "farm-a", fencingEpoch: 7,
+		controllerID: "controller-a", controllerGeneration: 3,
 	}
 	telemetry, err := service.ResourceTelemetry(-1)
 	if err != nil {
@@ -98,11 +131,14 @@ func TestFarmResourceTelemetryUnknownRTTDoesNotClaimHealthy(t *testing.T) {
 func TestFarmResourceTelemetryRejectsMutatedIdentity(t *testing.T) {
 	value := FarmResourceTelemetry{
 		Version: 1, NodeUID: "node-a", Provider: "farm", ProviderInstanceID: "farm-a",
+		ControllerID: "controller-a", ControllerGeneration: 3, SampleSequence: 1,
 		FencingEpoch: 7, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		RTTClass: FarmRTTHealthyClass, NodeMemory: FarmNodeMemoryTelemetry{Health: "healthy"},
 		Runtimes: []FarmRuntimeResourceTelemetry{{
 			NodeUID: "node-b", ProfileID: "profile-a", RuntimeUID: "runtime-a", Provider: "farm",
 			ProviderInstanceID: "farm-a", FencingEpoch: 7, Generation: 2,
+			ControllerID: "controller-a", ControllerGeneration: 3, PID: 42,
+			RSSMB: 1, RSSValid: true, State: FarmRuntimeStateIdle,
 			ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Health: "healthy",
 		}},
 	}
