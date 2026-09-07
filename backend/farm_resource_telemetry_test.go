@@ -70,6 +70,7 @@ func TestFarmResourceTelemetryUsesAgentHooksAndClosedWireProjection(t *testing.T
 		controllerID:     "controller-a", controllerGeneration: 3,
 		records: map[string]farmRuntimeRecord{
 			"profile-a": {
+				processStartIdentity: "start-1234",
 				runtime: FarmRuntime{
 					FarmRuntimeIdentity: FarmRuntimeIdentity{
 						NodeUID: "node-a", ProfileID: "profile-a", RuntimeUID: "runtime-a",
@@ -134,7 +135,7 @@ func TestFarmResourceTelemetryPIDReuseFailsClosed(t *testing.T) {
 	service := &FarmRuntimeService{
 		nodeUID: "node-a", providerInstance: "farm-a", fencingEpoch: 7,
 		controllerID: "controller-a", controllerGeneration: 3,
-		records: map[string]farmRuntimeRecord{"profile-a": {runtime: FarmRuntime{
+		records: map[string]farmRuntimeRecord{"profile-a": {processStartIdentity: "old-start", runtime: FarmRuntime{
 			FarmRuntimeIdentity: FarmRuntimeIdentity{NodeUID: "node-a", ProfileID: "profile-a", RuntimeUID: "runtime-a", ProviderInstanceID: "farm-a", FencingEpoch: 7, Generation: 1},
 			State:               FarmRuntimeStateIdle, PID: 1234,
 		}}},
@@ -152,6 +153,54 @@ func TestFarmResourceTelemetryPIDReuseFailsClosed(t *testing.T) {
 	}
 	if _, err := service.ResourceTelemetry(10); !errors.Is(err, ErrFarmResourceTelemetryInvalid) {
 		t.Fatalf("PID reuse telemetry err=%v", err)
+	}
+}
+
+func TestFarmResourceTelemetryRejectsPIDReusedBeforeSamplingAgainstLaunchBaseline(t *testing.T) {
+	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	fixture.farm.controllerID = "controller-a"
+	fixture.farm.controllerGeneration = 3
+	identity := "linux-starttime:1000000001"
+	rssCalls := 0
+	fixture.farm.resourceTelemetryHooks = &FarmResourceTelemetryHooks{
+		NodeMemory: func() (FarmNodeMemoryTelemetry, error) {
+			return FarmNodeMemoryTelemetry{TotalMB: 8192, AvailableMB: 4096, UsedPercent: 50, Health: "healthy"}, nil
+		},
+		ProcessRSS: func(int) (int64, error) {
+			rssCalls++
+			return 512, nil
+		},
+		ProcessIdentity: func(int) (string, error) { return identity, nil },
+	}
+	runtime, err := fixture.farm.EnsureRuntime(FarmRuntimeEnsureRequest{ProfileID: "profile-1"})
+	if err != nil {
+		t.Fatalf("EnsureRuntime: %v", err)
+	}
+	record, ok := fixture.farm.currentRecord("profile-1")
+	if !ok || record.processStartIdentity != identity || runtime.PID != 7001 {
+		t.Fatalf("launch identity was not retained: record=%#v runtime=%#v", record, runtime)
+	}
+	identity = "linux-starttime:1000000002" // same PID, later process incarnation
+	if _, err := fixture.farm.ResourceTelemetry(10); !errors.Is(err, ErrFarmResourceTelemetryInvalid) {
+		t.Fatalf("pre-sampling PID reuse err=%v", err)
+	}
+	if rssCalls != 0 {
+		t.Fatalf("RSS read occurred after launch identity mismatch: %d", rssCalls)
+	}
+}
+
+func TestFarmEnsureFailsClosedWhenLaunchIdentityUnavailable(t *testing.T) {
+	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	fixture.farm.controllerID = "controller-a"
+	fixture.farm.controllerGeneration = 3
+	fixture.farm.resourceTelemetryHooks = &FarmResourceTelemetryHooks{
+		ProcessIdentity: func(int) (string, error) { return "", errors.New("unavailable") },
+	}
+	if _, err := fixture.farm.EnsureRuntime(FarmRuntimeEnsureRequest{ProfileID: "profile-1"}); !errors.Is(err, ErrFarmRuntimeServiceUnavailable) {
+		t.Fatalf("missing launch identity err=%v", err)
+	}
+	if _, ok := fixture.farm.currentRecord("profile-1"); ok {
+		t.Fatal("runtime entered Farm inventory without authenticated launch identity")
 	}
 }
 

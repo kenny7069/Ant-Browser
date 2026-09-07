@@ -101,6 +101,20 @@ type secureRuntimeProcessIdentity struct {
 	Start string `json:"start"`
 }
 
+// ProcessStartIdentityForPID exposes only the high-resolution, platform
+// native process creation identity. It contains no command line or path and
+// is safe for lifecycle incarnation fencing outside the proxy package.
+func ProcessStartIdentityForPID(pid int) (string, error) {
+	identity, err := secureRuntimeProcessIdentityForPID(pid)
+	if err != nil {
+		return "", err
+	}
+	if !identity.valid() {
+		return "", fmt.Errorf("process start identity unavailable")
+	}
+	return identity.Start, nil
+}
+
 type secureRuntimeProcessState uint8
 
 const (

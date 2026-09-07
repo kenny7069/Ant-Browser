@@ -383,10 +383,11 @@ func (response FarmRuntimeCommandResponse) MarshalJSON() ([]byte, error) {
 }
 
 type farmRuntimeRecord struct {
-	runtime            FarmRuntime
-	profileIncarnation string
-	launchMode         string
-	proxyBinding       *FarmRuntimeProxyBinding
+	runtime              FarmRuntime
+	profileIncarnation   string
+	processStartIdentity string
+	launchMode           string
+	proxyBinding         *FarmRuntimeProxyBinding
 }
 
 type farmRuntimeProfileGate struct {
@@ -975,7 +976,14 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		LaunchMode: launchMode,
 	}
 	runtime = farmRuntimeFromSnapshot(farmRuntimeRecord{runtime: runtime}, observed)
-	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, launchMode: launchMode, proxyBinding: cloneFarmRuntimeProxyBinding(request.Proxy)})
+	processStartIdentity := ""
+	if s.controllerID != "" {
+		processStartIdentity, err = s.readProcessStartIdentity(observed.Profile.Pid)
+		if err != nil || processStartIdentity == "" {
+			return FarmRuntime{}, fmt.Errorf("%w: process start identity", ErrFarmRuntimeServiceUnavailable)
+		}
+	}
+	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, processStartIdentity: processStartIdentity, launchMode: launchMode, proxyBinding: cloneFarmRuntimeProxyBinding(request.Proxy)})
 	if startErr != nil {
 		return runtime, startErr
 	}

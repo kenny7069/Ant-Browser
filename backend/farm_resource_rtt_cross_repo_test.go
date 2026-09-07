@@ -88,6 +88,10 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 	record.runtime.PID = child.Process.Pid
 	record.runtime.ControllerID = controllerID
 	record.runtime.ControllerGeneration = 3
+	record.processStartIdentity, err = defaultProcessStartIdentity(child.Process.Pid)
+	if err != nil {
+		t.Fatalf("capture launch process identity: %v", err)
+	}
 	fixture.farm.records[profileID] = record
 	fixture.farm.recordsMu.Unlock()
 	// Keep BrowserRuntime identity and Agent service identity aligned after the

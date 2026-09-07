@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	proxyinternal "ant-chrome/backend/internal/proxy"
 )
 
 const (
@@ -309,18 +311,15 @@ func defaultProcessTreeRSS(pid int) (int64, error) {
 }
 
 func defaultProcessStartIdentity(pid int) (string, error) {
-	if pid <= 0 || runtime.GOOS == "windows" {
-		return "", fmt.Errorf("process start identity unsupported")
+	return proxyinternal.ProcessStartIdentityForPID(pid)
+}
+
+func (s *FarmRuntimeService) readProcessStartIdentity(pid int) (string, error) {
+	reader := defaultProcessStartIdentity
+	if s != nil && s.resourceTelemetryHooks != nil && s.resourceTelemetryHooks.ProcessIdentity != nil {
+		reader = s.resourceTelemetryHooks.ProcessIdentity
 	}
-	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
-	if err != nil {
-		return "", err
-	}
-	identity := strings.TrimSpace(string(output))
-	if identity == "" || len(identity) > 128 {
-		return "", fmt.Errorf("process start identity unavailable")
-	}
-	return identity, nil
+	return reader(pid)
 }
 
 func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResourceTelemetry, error) {
@@ -378,23 +377,22 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 			if s.resourceTelemetryHooks != nil && s.resourceTelemetryHooks.ProcessRSS != nil {
 				reader = s.resourceTelemetryHooks.ProcessRSS
 			}
-			identityReader := defaultProcessStartIdentity
-			if s.resourceTelemetryHooks != nil && s.resourceTelemetryHooks.ProcessIdentity != nil {
-				identityReader = s.resourceTelemetryHooks.ProcessIdentity
-			}
-			beforeIdentity, identityErr := identityReader(pid)
-			if value, err := reader(pid); err == nil && value > 0 && identityErr == nil && beforeIdentity != "" {
-				afterIdentity, afterIdentityErr := identityReader(pid)
-				if s.runtimeService == nil {
-					if afterIdentityErr == nil && afterIdentity == beforeIdentity {
+			beforeIdentity, identityErr := s.readProcessStartIdentity(pid)
+			if identityErr == nil && beforeIdentity != "" && record.processStartIdentity != "" && beforeIdentity == record.processStartIdentity {
+				value, rssErr := reader(pid)
+				if rssErr == nil && value > 0 {
+					afterIdentity, afterIdentityErr := s.readProcessStartIdentity(pid)
+					if s.runtimeService == nil {
+						if afterIdentityErr == nil && afterIdentity == beforeIdentity {
+							rss = value
+							rssValid = true
+							processStartIdentity = beforeIdentity
+						}
+					} else if after, afterErr := s.snapshot(profileID); afterErr == nil && after != nil && after.Profile != nil && after.Profile.Pid == pid && after.Generation == observedGeneration && after.ProfileIncarnation == profileIncarnation && profileIncarnation != "" && afterIdentityErr == nil && afterIdentity == beforeIdentity {
 						rss = value
 						rssValid = true
 						processStartIdentity = beforeIdentity
 					}
-				} else if after, afterErr := s.snapshot(profileID); afterErr == nil && after != nil && after.Profile != nil && after.Profile.Pid == pid && after.Generation == observedGeneration && after.ProfileIncarnation == profileIncarnation && profileIncarnation != "" && afterIdentityErr == nil && afterIdentity == beforeIdentity {
-					rss = value
-					rssValid = true
-					processStartIdentity = beforeIdentity
 				}
 			}
 		}
