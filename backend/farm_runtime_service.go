@@ -182,6 +182,11 @@ type FarmRuntimeServiceConfig struct {
 	// AttestationStateProvider is a local Agent/host callback. A nil callback
 	// makes the attestation command fail closed as not-ready.
 	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
+	// ProxyBindingVerifier is the local profile/connector fence for
+	// profile_proxy. It receives no secret from the wire and must inspect the
+	// existing local binding before lifecycle work starts. A nil verifier makes
+	// authenticated proxy mode fail closed.
+	ProxyBindingVerifier func(profileID string, binding FarmRuntimeProxyBinding) error
 }
 
 // FarmRuntimeServiceFactoryConfig is the public, Wails-free factory boundary.
@@ -196,6 +201,7 @@ type FarmRuntimeServiceFactoryConfig struct {
 	ProviderInstanceID       string
 	FencingEpoch             uint64
 	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
+	ProxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
 }
 
 // FarmRuntimeEnsureRequest identifies the profile and, when supplied, the
@@ -357,6 +363,7 @@ type FarmRuntimeService struct {
 	providerInstance         string
 	fencingEpoch             uint64
 	attestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
+	proxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
 
 	recordsMu sync.RWMutex
 	records   map[string]farmRuntimeRecord
@@ -399,6 +406,7 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 		gates:                    make(map[string]*farmRuntimeProfileGate),
 		attestation:              NewFarmAttestationAgent(),
 		attestationStateProvider: options.AttestationStateProvider,
+		proxyBindingVerifier:     options.ProxyBindingVerifier,
 	}, nil
 }
 
@@ -426,6 +434,7 @@ func NewFarmRuntimeServiceForHost(options FarmRuntimeServiceFactoryConfig) (*Far
 		ProviderInstanceID:       options.ProviderInstanceID,
 		FencingEpoch:             options.FencingEpoch,
 		AttestationStateProvider: options.AttestationStateProvider,
+		ProxyBindingVerifier:     options.ProxyBindingVerifier,
 	})
 }
 
@@ -733,6 +742,16 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	}
 	if launchMode == FarmRuntimeLaunchModeDirectNoProxy && request.Proxy != nil {
 		return FarmRuntime{}, fmt.Errorf("%w: direct mode cannot carry proxy binding", ErrFarmRuntimeLaunchMode)
+	}
+	if launchMode == FarmRuntimeLaunchModeProfileProxy {
+		if s.proxyBindingVerifier == nil {
+			return FarmRuntime{}, fmt.Errorf("%w: local proxy binding verifier unavailable", ErrFarmRuntimeConfigMismatch)
+		}
+		if err := s.proxyBindingVerifier(profileID, *cloneFarmRuntimeProxyBinding(request.Proxy)); err != nil {
+			// Local verifier errors may include a path or a credential-bearing
+			// connector error. Do not return them to the command boundary.
+			return FarmRuntime{}, ErrFarmRuntimeConfigMismatch
+		}
 	}
 	release, err := s.acquire(profileID)
 	if err != nil {

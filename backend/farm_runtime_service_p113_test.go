@@ -27,8 +27,18 @@ func p113EnsureCommand(profile string) FarmRuntimeCommand {
 	}
 }
 
+func p113EnableLocalBinding(farm *FarmRuntimeService) {
+	farm.proxyBindingVerifier = func(profileID string, binding FarmRuntimeProxyBinding) error {
+		if profileID != "profile-1" || binding != *p113ProxyBinding() {
+			return errors.New("unexpected local proxy binding")
+		}
+		return nil
+	}
+}
+
 func TestFarmRuntimeP113ProfileProxyCommandUsesClosedSecretFreeBinding(t *testing.T) {
 	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	p113EnableLocalBinding(fixture.farm)
 	adapter, err := NewFarmRuntimeControlAdapter(fixture.farm)
 	if err != nil {
 		t.Fatal(err)
@@ -54,6 +64,7 @@ func TestFarmRuntimeP113ProfileProxyCommandUsesClosedSecretFreeBinding(t *testin
 
 func TestFarmRuntimeP113RejectsRawProxyFieldsBeforeLifecycle(t *testing.T) {
 	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	p113EnableLocalBinding(fixture.farm)
 	raw := []byte(`{"type":"command","node_uid":"node-test","correlation_id":"p113-raw","command":"ensure_runtime","payload":{"profile_id":"profile-1","launch_mode":"profile_proxy","config_hash":"p113-config-1","proxy":{"enabled":true,"connector_type":"xray","credential_revision":"cred-rev-1","config_revision":"config-rev-1","proxy_url":"http://user:password@127.0.0.1:18080"}}}`)
 	response, err := fixture.farm.HandleCommandEnvelope(raw)
 	if err == nil || response.OK || !errors.Is(err, ErrFarmRuntimeCommand) {
@@ -66,6 +77,7 @@ func TestFarmRuntimeP113RejectsRawProxyFieldsBeforeLifecycle(t *testing.T) {
 
 func TestFarmRuntimeP113RevisionMutationFailsClosedForOwnedRuntime(t *testing.T) {
 	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	p113EnableLocalBinding(fixture.farm)
 	first, err := fixture.farm.EnsureRuntime(FarmRuntimeEnsureRequest{
 		ProfileID: "profile-1", ConfigHash: "p113-config-1",
 		LaunchMode: FarmRuntimeLaunchModeProfileProxy, Proxy: p113ProxyBinding(),
@@ -81,5 +93,19 @@ func TestFarmRuntimeP113RevisionMutationFailsClosedForOwnedRuntime(t *testing.T)
 	})
 	if !errors.Is(err, ErrFarmRuntimeConfigMismatch) {
 		t.Fatalf("credential revision mutation = %v, want config mismatch", err)
+	}
+}
+
+func TestFarmRuntimeP113RequiresLocalProxyBindingVerifier(t *testing.T) {
+	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	_, err := fixture.farm.EnsureRuntime(FarmRuntimeEnsureRequest{
+		ProfileID: "profile-1", ConfigHash: "p113-config-1",
+		LaunchMode: FarmRuntimeLaunchModeProfileProxy, Proxy: p113ProxyBinding(),
+	})
+	if !errors.Is(err, ErrFarmRuntimeConfigMismatch) {
+		t.Fatalf("missing verifier = %v, want config mismatch", err)
+	}
+	if fixture.detectCalls.Load() != 0 || fixture.startCalls.Load() != 0 {
+		t.Fatalf("missing verifier touched lifecycle: detect=%d start=%d", fixture.detectCalls.Load(), fixture.startCalls.Load())
 	}
 }
