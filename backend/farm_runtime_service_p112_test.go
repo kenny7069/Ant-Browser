@@ -76,10 +76,17 @@ func TestFarmRuntimeP112DirectModeOverridesProfileProxyInSharedLaunchPlan(t *tes
 	if plan.Spec.EffectiveProxy != "direct://" {
 		t.Fatalf("effective proxy = %q, want direct://", plan.Spec.EffectiveProxy)
 	}
+	noProxy := false
 	for _, arg := range plan.Spec.Args {
+		if arg == "--no-proxy-server" {
+			noProxy = true
+		}
 		if strings.Contains(arg, "proxy-server=") || strings.Contains(arg, "password") {
 			t.Fatalf("launch args retained profile proxy: %q", arg)
 		}
+	}
+	if !noProxy {
+		t.Fatal("shared direct launch plan did not disable system proxy")
 	}
 }
 
