@@ -59,6 +59,8 @@ type FarmRuntimeResourceTelemetry struct {
 	ControllerID         string `json:"controller_id"`
 	ControllerGeneration uint64 `json:"controller_generation"`
 	PID                  int    `json:"pid"`
+	ProcessStartIdentity string `json:"process_start_identity"`
+	ProfileIncarnation   string `json:"profile_incarnation"`
 	RSSMB                int64  `json:"rss_mb,omitempty"`
 	RSSValid             bool   `json:"rss_valid"`
 	State                string `json:"state"`
@@ -90,9 +92,10 @@ type FarmResourceTelemetry struct {
 // report an error; ResourceTelemetry then emits an explicit unknown health
 // rather than putting an error string on the wire.
 type FarmResourceTelemetryHooks struct {
-	Now        func() time.Time
-	NodeMemory func() (FarmNodeMemoryTelemetry, error)
-	ProcessRSS func(pid int) (int64, error)
+	Now             func() time.Time
+	NodeMemory      func() (FarmNodeMemoryTelemetry, error)
+	ProcessRSS      func(pid int) (int64, error)
+	ProcessIdentity func(pid int) (string, error)
 }
 
 func ClassifyFarmRTT(rttMS float64) string {
@@ -305,6 +308,21 @@ func defaultProcessTreeRSS(pid int) (int64, error) {
 	return totalKB / 1024, nil
 }
 
+func defaultProcessStartIdentity(pid int) (string, error) {
+	if pid <= 0 || runtime.GOOS == "windows" {
+		return "", fmt.Errorf("process start identity unsupported")
+	}
+	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	if err != nil {
+		return "", err
+	}
+	identity := strings.TrimSpace(string(output))
+	if identity == "" || len(identity) > 128 {
+		return "", fmt.Errorf("process start identity unavailable")
+	}
+	return identity, nil
+}
+
 func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResourceTelemetry, error) {
 	if s == nil {
 		return FarmResourceTelemetry{}, ErrFarmRuntimeServiceUnavailable
@@ -344,26 +362,39 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 		}
 		pid := record.runtime.PID
 		observedGeneration := record.runtime.Generation
+		profileIncarnation := ""
 		if snapshot, err := s.snapshot(profileID); err == nil && snapshot != nil && snapshot.Profile != nil && snapshot.Profile.Pid > 0 && snapshot.Generation == record.runtime.Generation {
 			pid = snapshot.Profile.Pid
 			observedGeneration = snapshot.Generation
+			profileIncarnation = snapshot.ProfileIncarnation
 		} else if s.runtimeService != nil {
 			return FarmResourceTelemetry{}, ErrFarmResourceTelemetryInvalid
 		}
 		rss := int64(0)
 		rssValid := false
+		processStartIdentity := ""
 		if pid > 0 {
 			reader := defaultProcessTreeRSS
 			if s.resourceTelemetryHooks != nil && s.resourceTelemetryHooks.ProcessRSS != nil {
 				reader = s.resourceTelemetryHooks.ProcessRSS
 			}
-			if value, err := reader(pid); err == nil && value > 0 {
+			identityReader := defaultProcessStartIdentity
+			if s.resourceTelemetryHooks != nil && s.resourceTelemetryHooks.ProcessIdentity != nil {
+				identityReader = s.resourceTelemetryHooks.ProcessIdentity
+			}
+			beforeIdentity, identityErr := identityReader(pid)
+			if value, err := reader(pid); err == nil && value > 0 && identityErr == nil && beforeIdentity != "" {
+				afterIdentity, afterIdentityErr := identityReader(pid)
 				if s.runtimeService == nil {
+					if afterIdentityErr == nil && afterIdentity == beforeIdentity {
+						rss = value
+						rssValid = true
+						processStartIdentity = beforeIdentity
+					}
+				} else if after, afterErr := s.snapshot(profileID); afterErr == nil && after != nil && after.Profile != nil && after.Profile.Pid == pid && after.Generation == observedGeneration && after.ProfileIncarnation == profileIncarnation && profileIncarnation != "" && afterIdentityErr == nil && afterIdentity == beforeIdentity {
 					rss = value
 					rssValid = true
-				} else if after, afterErr := s.snapshot(profileID); afterErr == nil && after != nil && after.Profile != nil && after.Profile.Pid == pid && after.Generation == observedGeneration {
-					rss = value
-					rssValid = true
+					processStartIdentity = beforeIdentity
 				}
 			}
 		}
@@ -373,7 +404,8 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 			ProviderInstanceID: s.providerInstance, FencingEpoch: s.fencingEpoch,
 			Generation:   record.runtime.Generation,
 			ControllerID: s.controllerID, ControllerGeneration: s.controllerGeneration,
-			PID: pid, RSSMB: rss, RSSValid: rssValid, State: record.runtime.State,
+			PID: pid, ProcessStartIdentity: processStartIdentity, ProfileIncarnation: profileIncarnation,
+			RSSMB: rss, RSSValid: rssValid, State: record.runtime.State,
 			Health: memory.Health, ObservedAt: now.Format(time.RFC3339Nano),
 		})
 	}
@@ -391,7 +423,22 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 		telemetry.ControlRTTMS = controlRTTMS
 		telemetry.RTTClass = ClassifyFarmRTT(controlRTTMS)
 	}
-	return telemetry, ValidateFarmResourceTelemetry(telemetry)
+	if err := ValidateFarmResourceTelemetry(telemetry); err != nil {
+		return FarmResourceTelemetry{}, err
+	}
+	return telemetry, nil
+}
+
+func (adapter *FarmRuntimeControlAdapter) AcknowledgeResourceTelemetry(sequence uint64, observedAt string) {
+	if adapter == nil || adapter.service == nil || sequence == 0 || observedAt == "" {
+		return
+	}
+	adapter.service.resourceTelemetryMu.Lock()
+	if sequence > adapter.service.latestResourceSequence {
+		adapter.service.latestResourceSequence = sequence
+		adapter.service.latestResourceObservedAt = observedAt
+	}
+	adapter.service.resourceTelemetryMu.Unlock()
 }
 
 func ValidateFarmResourceTelemetry(value FarmResourceTelemetry) error {
@@ -417,7 +464,7 @@ func ValidateFarmResourceTelemetry(value FarmResourceTelemetry) error {
 		return ErrFarmResourceTelemetryInvalid
 	}
 	for _, runtimeTelemetry := range value.Runtimes {
-		if runtimeTelemetry.NodeUID != value.NodeUID || runtimeTelemetry.Provider != "farm" || runtimeTelemetry.ProviderInstanceID != value.ProviderInstanceID || runtimeTelemetry.FencingEpoch != value.FencingEpoch || runtimeTelemetry.ControllerID != value.ControllerID || runtimeTelemetry.ControllerGeneration != value.ControllerGeneration || strings.TrimSpace(runtimeTelemetry.ProfileID) == "" || strings.TrimSpace(runtimeTelemetry.RuntimeUID) == "" || runtimeTelemetry.Generation == 0 || runtimeTelemetry.PID <= 0 {
+		if runtimeTelemetry.NodeUID != value.NodeUID || runtimeTelemetry.Provider != "farm" || runtimeTelemetry.ProviderInstanceID != value.ProviderInstanceID || runtimeTelemetry.FencingEpoch != value.FencingEpoch || runtimeTelemetry.ControllerID != value.ControllerID || runtimeTelemetry.ControllerGeneration != value.ControllerGeneration || strings.TrimSpace(runtimeTelemetry.ProfileID) == "" || strings.TrimSpace(runtimeTelemetry.RuntimeUID) == "" || runtimeTelemetry.Generation == 0 || runtimeTelemetry.PID <= 0 || strings.TrimSpace(runtimeTelemetry.ProcessStartIdentity) == "" {
 			return ErrFarmResourceTelemetryInvalid
 		}
 		if !runtimeTelemetry.RSSValid || runtimeTelemetry.RSSMB <= 0 || !validResourceHealth(runtimeTelemetry.Health) || !validRuntimeTelemetryState(runtimeTelemetry.State) {

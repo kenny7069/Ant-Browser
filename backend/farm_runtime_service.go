@@ -287,6 +287,7 @@ type FarmRuntimeSelector = FarmRuntimeStatusRequest
 // stale command cannot terminate a replacement runtime. ConfigHash is
 // optional and, when present on both sides, is compared opaquely.
 type FarmRuntimeStopRequest struct {
+	Provider             string `json:"provider"`
 	NodeUID              string `json:"node_uid,omitempty"`
 	ProfileID            string `json:"profile_id"`
 	RuntimeUID           string `json:"runtime_uid"`
@@ -296,6 +297,8 @@ type FarmRuntimeStopRequest struct {
 	Generation           uint64 `json:"generation"`
 	ControllerID         string `json:"controller_id"`
 	ControllerGeneration uint64 `json:"controller_generation"`
+	TelemetrySequence    uint64 `json:"telemetry_sequence"`
+	TelemetryObservedAt  string `json:"telemetry_observed_at"`
 }
 
 // FarmRuntimeCommand is transport-agnostic and mirrors the command portion
@@ -411,6 +414,9 @@ type FarmRuntimeService struct {
 	proxyRuntimeCleanup       func()
 	resourceTelemetryHooks    *FarmResourceTelemetryHooks
 	resourceTelemetrySequence uint64
+	resourceTelemetryMu       sync.Mutex
+	latestResourceSequence    uint64
+	latestResourceObservedAt  string
 
 	recordsMu sync.RWMutex
 	records   map[string]farmRuntimeRecord
@@ -1112,8 +1118,16 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 	if strings.TrimSpace(request.NodeUID) == "" || profileID == "" || strings.TrimSpace(request.RuntimeUID) == "" || strings.TrimSpace(request.ProviderInstanceID) == "" || request.FencingEpoch == 0 || request.Generation == 0 {
 		return FarmRuntime{}, ErrFarmRuntimeIdentityRequired
 	}
-	if s.controllerID != "" && (request.ControllerID != s.controllerID || request.ControllerGeneration != s.controllerGeneration) {
+	if s.controllerID != "" && (request.Provider != "farm" || request.ControllerID != s.controllerID || request.ControllerGeneration != s.controllerGeneration) {
 		return FarmRuntime{}, fmt.Errorf("%w: controller generation", ErrFarmRuntimeStale)
+	}
+	if s.controllerID != "" {
+		s.resourceTelemetryMu.Lock()
+		latestSequence, latestObserved := s.latestResourceSequence, s.latestResourceObservedAt
+		s.resourceTelemetryMu.Unlock()
+		if request.TelemetrySequence == 0 || request.TelemetrySequence != latestSequence || request.TelemetryObservedAt == "" || request.TelemetryObservedAt != latestObserved {
+			return FarmRuntime{}, fmt.Errorf("%w: telemetry sample", ErrFarmRuntimeStale)
+		}
 	}
 	if err := s.validateControllerIdentity(request.NodeUID, request.ProviderInstanceID, request.FencingEpoch); err != nil {
 		return FarmRuntime{}, err

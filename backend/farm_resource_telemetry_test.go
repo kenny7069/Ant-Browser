@@ -90,6 +90,7 @@ func TestFarmResourceTelemetryUsesAgentHooksAndClosedWireProjection(t *testing.T
 				}
 				return 512, nil
 			},
+			ProcessIdentity: func(pid int) (string, error) { return "start-1234", nil },
 		},
 	}
 	telemetry, err := service.ResourceTelemetry(101)
@@ -128,6 +129,49 @@ func TestFarmResourceTelemetryUnknownRTTDoesNotClaimHealthy(t *testing.T) {
 	}
 }
 
+func TestFarmResourceTelemetryPIDReuseFailsClosed(t *testing.T) {
+	identityCalls := 0
+	service := &FarmRuntimeService{
+		nodeUID: "node-a", providerInstance: "farm-a", fencingEpoch: 7,
+		controllerID: "controller-a", controllerGeneration: 3,
+		records: map[string]farmRuntimeRecord{"profile-a": {runtime: FarmRuntime{
+			FarmRuntimeIdentity: FarmRuntimeIdentity{NodeUID: "node-a", ProfileID: "profile-a", RuntimeUID: "runtime-a", ProviderInstanceID: "farm-a", FencingEpoch: 7, Generation: 1},
+			State:               FarmRuntimeStateIdle, PID: 1234,
+		}}},
+		resourceTelemetryHooks: &FarmResourceTelemetryHooks{
+			NodeMemory: func() (FarmNodeMemoryTelemetry, error) { return FarmNodeMemoryTelemetry{Health: "healthy"}, nil },
+			ProcessRSS: func(int) (int64, error) { return 10, nil },
+			ProcessIdentity: func(int) (string, error) {
+				identityCalls++
+				if identityCalls == 1 {
+					return "old-start", nil
+				}
+				return "reused-start", nil
+			},
+		},
+	}
+	if _, err := service.ResourceTelemetry(10); !errors.Is(err, ErrFarmResourceTelemetryInvalid) {
+		t.Fatalf("PID reuse telemetry err=%v", err)
+	}
+}
+
+func TestFarmStopRejectsStaleTelemetrySampleBeforeLookup(t *testing.T) {
+	service := &FarmRuntimeService{
+		nodeUID: "node-a", providerInstance: "farm-a", fencingEpoch: 7,
+		controllerID: "controller-a", controllerGeneration: 3,
+		latestResourceSequence: 9, latestResourceObservedAt: "2026-09-08T00:00:09Z",
+	}
+	_, err := service.StopRuntime(FarmRuntimeStopRequest{
+		NodeUID: "node-a", ProfileID: "profile-a", RuntimeUID: "runtime-a",
+		ProviderInstanceID: "farm-a", FencingEpoch: 7, Generation: 1,
+		ControllerID: "controller-a", ControllerGeneration: 3,
+		TelemetrySequence: 8, TelemetryObservedAt: "2026-09-08T00:00:08Z",
+	})
+	if !errors.Is(err, ErrFarmRuntimeStale) {
+		t.Fatalf("stale telemetry stop err=%v", err)
+	}
+}
+
 func TestFarmResourceTelemetryRejectsMutatedIdentity(t *testing.T) {
 	value := FarmResourceTelemetry{
 		Version: 1, NodeUID: "node-a", Provider: "farm", ProviderInstanceID: "farm-a",
@@ -137,7 +181,7 @@ func TestFarmResourceTelemetryRejectsMutatedIdentity(t *testing.T) {
 		Runtimes: []FarmRuntimeResourceTelemetry{{
 			NodeUID: "node-b", ProfileID: "profile-a", RuntimeUID: "runtime-a", Provider: "farm",
 			ProviderInstanceID: "farm-a", FencingEpoch: 7, Generation: 2,
-			ControllerID: "controller-a", ControllerGeneration: 3, PID: 42,
+			ControllerID: "controller-a", ControllerGeneration: 3, PID: 42, ProcessStartIdentity: "start-42",
 			RSSMB: 1, RSSValid: true, State: FarmRuntimeStateIdle,
 			ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Health: "healthy",
 		}},

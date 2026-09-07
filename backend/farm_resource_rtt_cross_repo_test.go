@@ -115,6 +115,8 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 		"--runtime-uid", runtime.RuntimeUID, "--provider-instance-id", providerID,
 		"--fencing-epoch", "7", "--generation", strconv.FormatUint(runtime.Generation, 10))
 	serverCommand.Args = append(serverCommand.Args, "--controller-id", controllerID, "--controller-generation", "3")
+	serverCommand.Stdout = os.Stdout
+	serverCommand.Stderr = os.Stderr
 	if err := serverCommand.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +152,7 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 	client, err := NewFarmControlWSSClient(FarmControlWSSClientConfig{
 		URL: controlURL, NodeUID: nodeUID, PrivateKey: privateKey,
 		HandshakeTimeout: 5 * time.Second, CommandTimeout: 8 * time.Second,
-		HeartbeatInterval: 100 * time.Millisecond,
+		HeartbeatInterval: 500 * time.Millisecond,
 		Dialer:            &websocket.Dialer{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}},
 	}, adapter)
 	if err != nil {

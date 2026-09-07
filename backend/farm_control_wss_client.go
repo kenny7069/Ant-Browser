@@ -59,23 +59,24 @@ type FarmControlWSSClient struct {
 	adapter *FarmRuntimeControlAdapter
 	private ed25519.PrivateKey
 
-	mu               sync.Mutex
-	conn             *websocket.Conn
-	closed           bool
-	connecting       bool
-	closeErr         error
-	closeOnce        sync.Once
-	done             chan struct{}
-	ctx              context.Context
-	cancel           context.CancelFunc
-	writeMu          sync.Mutex
-	commandSlots     chan struct{}
-	cdpMu            sync.Mutex
-	cdpSessions      map[string]*farmControlCDPSession
-	lastHeartbeatAck time.Time
-	heartbeatSent    map[string]time.Time
-	lastControlRTT   time.Duration
-	heartbeatSeq     uint64
+	mu                 sync.Mutex
+	conn               *websocket.Conn
+	closed             bool
+	connecting         bool
+	closeErr           error
+	closeOnce          sync.Once
+	done               chan struct{}
+	ctx                context.Context
+	cancel             context.CancelFunc
+	writeMu            sync.Mutex
+	commandSlots       chan struct{}
+	cdpMu              sync.Mutex
+	cdpSessions        map[string]*farmControlCDPSession
+	lastHeartbeatAck   time.Time
+	heartbeatSent      map[string]time.Time
+	heartbeatTelemetry map[string]FarmResourceTelemetry
+	lastControlRTT     time.Duration
+	heartbeatSeq       uint64
 }
 
 // NewFarmControlWSSClient constructs the production agent transport without
@@ -342,6 +343,7 @@ func (c *FarmControlWSSClient) Connect(ctx context.Context) error {
 	c.lastHeartbeatAck = time.Now()
 	c.lastControlRTT = 0
 	c.heartbeatSent = make(map[string]time.Time)
+	c.heartbeatTelemetry = make(map[string]FarmResourceTelemetry)
 	c.mu.Unlock()
 	go c.readLoop(conn)
 	go c.heartbeatLoop(conn)
@@ -414,6 +416,10 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn) {
 						c.lastControlRTT = rtt
 					}
 					delete(c.heartbeatSent, ack.HeartbeatID)
+				}
+				if telemetry, ok := c.heartbeatTelemetry[ack.HeartbeatID]; ok {
+					c.adapter.AcknowledgeResourceTelemetry(telemetry.SampleSequence, telemetry.ObservedAt)
+					delete(c.heartbeatTelemetry, ack.HeartbeatID)
 				}
 			}
 			c.mu.Unlock()
@@ -502,10 +508,14 @@ func (c *FarmControlWSSClient) heartbeatLoop(conn *websocket.Conn) {
 			if len(c.heartbeatSent) >= 64 {
 				for id := range c.heartbeatSent {
 					delete(c.heartbeatSent, id)
+					delete(c.heartbeatTelemetry, id)
 					break
 				}
 			}
 			c.heartbeatSent[heartbeatID] = sentAt
+			if telemetry != nil {
+				c.heartbeatTelemetry[heartbeatID] = *telemetry
+			}
 			c.mu.Unlock()
 			if err := c.writeJSON(conn, farmControlHeartbeat{
 				Type: "heartbeat", HeartbeatID: heartbeatID, Telemetry: telemetry,
