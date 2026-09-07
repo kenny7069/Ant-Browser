@@ -66,6 +66,11 @@ type FarmRuntimeIdentity struct {
 	FencingEpoch       uint64 `json:"fencing_epoch"`
 	ConfigHash         string `json:"config_hash,omitempty"`
 	Generation         uint64 `json:"generation"`
+	// Controller binding is populated only when the Control Plane has issued
+	// an authoritative controller lease. It is optional for older lifecycle
+	// commands, but mandatory at the strict P1.14 CDP boundary when configured.
+	ControllerID         string `json:"controller_id,omitempty"`
+	ControllerGeneration uint64 `json:"controller_generation,omitempty"`
 }
 
 // FarmRuntimeProfile is the allowlisted profile telemetry exposed by the Farm
@@ -190,6 +195,12 @@ type FarmRuntimeServiceConfig struct {
 	NodeID                string
 	ProviderInstanceID    string
 	FencingEpoch          uint64
+	ControllerID          string
+	ControllerGeneration  uint64
+	// CDPOpenHook is intentionally nil in production. Tests may use the
+	// bounded stage notifications to force validate/dial/publish races without
+	// changing lifecycle semantics.
+	CDPOpenHook func(stage string)
 	// AttestationStateProvider is a local Agent/host callback. A nil callback
 	// makes the attestation command fail closed as not-ready.
 	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
@@ -214,6 +225,9 @@ type FarmRuntimeServiceFactoryConfig struct {
 	NodeID                   string
 	ProviderInstanceID       string
 	FencingEpoch             uint64
+	ControllerID             string
+	ControllerGeneration     uint64
+	CDPOpenHook              func(stage string)
 	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 	ProxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
 	ProxyRuntimeCleanup      func()
@@ -382,6 +396,9 @@ type FarmRuntimeService struct {
 	nodeUID                  string
 	providerInstance         string
 	fencingEpoch             uint64
+	controllerID             string
+	controllerGeneration     uint64
+	cdpOpenHook              func(stage string)
 	attestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 	proxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
 	proxyRuntimeCleanup      func()
@@ -394,8 +411,10 @@ type FarmRuntimeService struct {
 	gatesMu sync.Mutex
 	gates   map[string]*farmRuntimeProfileGate
 
-	cdpSessionsMu sync.Mutex
-	cdpSessions   map[string]*farmCDPSession
+	cdpSessionsMu      sync.Mutex
+	cdpSessions        map[string]*farmCDPSession
+	cdpTombstones      map[string]farmCDPTombstone
+	cdpTokenTombstones map[string]farmCDPTombstone
 }
 
 // NewFarmRuntimeService constructs the Wails-free Farm lifecycle layer.
@@ -421,14 +440,23 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 	if options.FencingEpoch == 0 {
 		return nil, fmt.Errorf("%w: fencing epoch must be positive", ErrFarmRuntimeServiceUnavailable)
 	}
+	controllerID := strings.TrimSpace(options.ControllerID)
+	if (controllerID == "") != (options.ControllerGeneration == 0) {
+		return nil, fmt.Errorf("%w: controller id and generation must be supplied together", ErrFarmRuntimeServiceUnavailable)
+	}
 	return &FarmRuntimeService{
 		runtimeService:           runtimeService,
 		nodeUID:                  nodeUID,
 		providerInstance:         providerInstance,
 		fencingEpoch:             options.FencingEpoch,
+		controllerID:             controllerID,
+		controllerGeneration:     options.ControllerGeneration,
+		cdpOpenHook:              options.CDPOpenHook,
 		records:                  make(map[string]farmRuntimeRecord),
 		gates:                    make(map[string]*farmRuntimeProfileGate),
 		cdpSessions:              make(map[string]*farmCDPSession),
+		cdpTombstones:            make(map[string]farmCDPTombstone),
+		cdpTokenTombstones:       make(map[string]farmCDPTombstone),
 		attestation:              NewFarmAttestationAgent(),
 		attestationStateProvider: options.AttestationStateProvider,
 		proxyBindingVerifier:     options.ProxyBindingVerifier,
@@ -466,6 +494,9 @@ func NewFarmRuntimeServiceForHost(options FarmRuntimeServiceFactoryConfig) (*Far
 		NodeID:                   options.NodeID,
 		ProviderInstanceID:       options.ProviderInstanceID,
 		FencingEpoch:             options.FencingEpoch,
+		ControllerID:             options.ControllerID,
+		ControllerGeneration:     options.ControllerGeneration,
+		CDPOpenHook:              options.CDPOpenHook,
 		AttestationStateProvider: options.AttestationStateProvider,
 		ProxyBindingVerifier:     verifier,
 		ProxyRuntimeCleanup:      runtimeService.CleanupOwnedProxyRuntimes,
@@ -913,13 +944,15 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	}
 	runtime := FarmRuntime{
 		FarmRuntimeIdentity: FarmRuntimeIdentity{
-			NodeUID:            s.nodeUID,
-			ProfileID:          profileID,
-			RuntimeUID:         uuid.NewString(),
-			ProviderInstanceID: s.providerInstance,
-			FencingEpoch:       s.fencingEpoch,
-			ConfigHash:         request.ConfigHash,
-			Generation:         observed.Generation,
+			NodeUID:              s.nodeUID,
+			ProfileID:            profileID,
+			RuntimeUID:           uuid.NewString(),
+			ProviderInstanceID:   s.providerInstance,
+			FencingEpoch:         s.fencingEpoch,
+			ConfigHash:           request.ConfigHash,
+			Generation:           observed.Generation,
+			ControllerID:         s.controllerID,
+			ControllerGeneration: s.controllerGeneration,
 		},
 		State:      FarmRuntimeStateIdle,
 		LaunchMode: launchMode,

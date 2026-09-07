@@ -6,16 +6,21 @@ package backend
 // the browser-level CDP socket resolved from local service state.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 const (
-	farmCDPMaxSessionID = 128
-	farmCDPMaxToken     = 256
+	farmCDPMaxSessionID  = 128
+	farmCDPMaxToken      = 256
+	farmCDPTombstoneTTL  = 10 * time.Minute
+	farmCDPMaxTombstones = 4096
 )
 
 var (
@@ -37,8 +42,20 @@ type FarmCDPTunnelReady struct {
 }
 
 type farmCDPSession struct {
-	identity FarmRuntimeIdentity
-	conn     *websocket.Conn
+	identity  FarmRuntimeIdentity
+	tokenHash string
+	conn      *websocket.Conn
+}
+
+type farmCDPTombstone struct {
+	tokenHash string
+	identity  FarmRuntimeIdentity
+	expiresAt time.Time
+}
+
+func farmCDPTokenHash(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(hash[:])
 }
 
 func validateFarmCDPToken(value string, maximum int) error {
@@ -58,6 +75,13 @@ func (s *FarmRuntimeService) validateCDPRequest(request FarmCDPTunnelRequest) (f
 	}
 	identity := request.RuntimeIdentity
 	if identity.NodeUID == "" || identity.ProfileID == "" || identity.RuntimeUID == "" || identity.ProviderInstanceID == "" || identity.ConfigHash == "" || identity.FencingEpoch == 0 || identity.Generation == 0 {
+		return farmRuntimeRecord{}, ErrFarmCDPIdentity
+	}
+	if s.controllerID != "" {
+		if identity.ControllerID != s.controllerID || identity.ControllerGeneration != s.controllerGeneration || identity.ControllerGeneration == 0 {
+			return farmRuntimeRecord{}, ErrFarmCDPIdentity
+		}
+	} else if identity.ControllerID != "" || identity.ControllerGeneration != 0 {
 		return farmRuntimeRecord{}, ErrFarmCDPIdentity
 	}
 	if err := s.validateControllerIdentity(identity.NodeUID, identity.ProviderInstanceID, identity.FencingEpoch); err != nil {
@@ -80,19 +104,37 @@ func (s *FarmRuntimeService) validateCDPRequest(request FarmCDPTunnelRequest) (f
 // browser-level CDP WebSocket.  No port or URL from the Server command is
 // consumed here.
 func (s *FarmRuntimeService) OpenCDPTunnel(request FarmCDPTunnelRequest) (*websocket.Conn, error) {
+	if s == nil {
+		return nil, ErrFarmRuntimeServiceUnavailable
+	}
+	if err := request.validate(); err != nil {
+		return nil, err
+	}
+	if request.RuntimeIdentity.NodeUID == "" || request.RuntimeIdentity.ProfileID == "" ||
+		request.RuntimeIdentity.RuntimeUID == "" || request.RuntimeIdentity.ProviderInstanceID == "" ||
+		request.RuntimeIdentity.ConfigHash == "" || request.RuntimeIdentity.FencingEpoch == 0 ||
+		request.RuntimeIdentity.Generation == 0 {
+		return nil, ErrFarmCDPIdentity
+	}
+	profileID := strings.TrimSpace(request.RuntimeIdentity.ProfileID)
+	release, err := s.acquire(profileID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if s.cdpOpenHook != nil {
+		s.cdpOpenHook("validate")
+	}
 	record, err := s.validateCDPRequest(request)
 	if err != nil {
 		return nil, err
 	}
-	s.cdpSessionsMu.Lock()
-	if s.cdpSessions == nil {
-		s.cdpSessions = make(map[string]*farmCDPSession)
+	if s.cdpOpenHook != nil {
+		s.cdpOpenHook("validated")
 	}
-	if _, exists := s.cdpSessions[request.SessionID]; exists {
-		s.cdpSessionsMu.Unlock()
-		return nil, ErrFarmCDPReplay
+	if err := s.claimCDPSession(request); err != nil {
+		return nil, err
 	}
-	s.cdpSessionsMu.Unlock()
 	conn, err := s.runtimeService.OpenOwnedBrowserCDP(
 		record.runtime.ProfileID,
 		record.runtime.Generation,
@@ -100,18 +142,98 @@ func (s *FarmRuntimeService) OpenCDPTunnel(request FarmCDPTunnelRequest) (*webso
 	if err != nil {
 		return nil, ErrFarmCDPNotReady
 	}
-	s.cdpSessionsMu.Lock()
-	if _, exists := s.cdpSessions[request.SessionID]; exists {
-		s.cdpSessionsMu.Unlock()
-		_ = conn.Close()
-		return nil, ErrFarmCDPReplay
+	if s.cdpOpenHook != nil {
+		s.cdpOpenHook("dialed")
 	}
+	// StopRuntime uses the same Farm profile gate. This second identity read
+	// closes the post-dial window even if the local Chrome state changed while
+	// the browser-level WebSocket handshake was in flight.
+	if _, err := s.validateCDPRequest(request); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	s.cdpSessionsMu.Lock()
 	s.cdpSessions[request.SessionID] = &farmCDPSession{
-		identity: request.RuntimeIdentity,
-		conn:     conn,
+		identity:  request.RuntimeIdentity,
+		tokenHash: farmCDPTokenHash(request.TunnelToken),
+		conn:      conn,
 	}
 	s.cdpSessionsMu.Unlock()
+	if s.cdpOpenHook != nil {
+		s.cdpOpenHook("registered")
+	}
 	return conn, nil
+}
+
+func (s *FarmRuntimeService) claimCDPSession(request FarmCDPTunnelRequest) error {
+	now := time.Now()
+	tokenHash := farmCDPTokenHash(request.TunnelToken)
+	s.cdpSessionsMu.Lock()
+	defer s.cdpSessionsMu.Unlock()
+	if s.cdpSessions == nil {
+		s.cdpSessions = make(map[string]*farmCDPSession)
+	}
+	if s.cdpTombstones == nil {
+		s.cdpTombstones = make(map[string]farmCDPTombstone)
+	}
+	if s.cdpTokenTombstones == nil {
+		s.cdpTokenTombstones = make(map[string]farmCDPTombstone)
+	}
+	s.pruneCDPTombstonesLocked(now)
+	if _, exists := s.cdpSessions[request.SessionID]; exists {
+		return ErrFarmCDPReplay
+	}
+	if _, exists := s.cdpTombstones[request.SessionID]; exists {
+		return ErrFarmCDPReplay
+	}
+	if _, exists := s.cdpTokenTombstones[tokenHash]; exists {
+		return ErrFarmCDPReplay
+	}
+	tombstone := farmCDPTombstone{
+		tokenHash: tokenHash,
+		identity:  request.RuntimeIdentity,
+		expiresAt: now.Add(farmCDPTombstoneTTL),
+	}
+	// Claim and tombstone insertion are one mutex transaction. A failed local
+	// dial therefore consumes the one-time ticket just like a successful one.
+	s.cdpTombstones[request.SessionID] = tombstone
+	s.cdpTokenTombstones[tokenHash] = tombstone
+	s.pruneCDPTombstonesLocked(now)
+	return nil
+}
+
+func (s *FarmRuntimeService) pruneCDPTombstonesLocked(now time.Time) {
+	for sessionID, tombstone := range s.cdpTombstones {
+		if !tombstone.expiresAt.After(now) {
+			delete(s.cdpTombstones, sessionID)
+			delete(s.cdpTokenTombstones, tombstone.tokenHash)
+		}
+	}
+	for tokenHash, tombstone := range s.cdpTokenTombstones {
+		if !tombstone.expiresAt.After(now) {
+			delete(s.cdpTokenTombstones, tokenHash)
+			for sessionID, session := range s.cdpTombstones {
+				if session.tokenHash == tokenHash {
+					delete(s.cdpTombstones, sessionID)
+				}
+			}
+		}
+	}
+	for len(s.cdpTombstones) > farmCDPMaxTombstones {
+		var oldestID string
+		var oldest time.Time
+		for sessionID, tombstone := range s.cdpTombstones {
+			if oldestID == "" || tombstone.expiresAt.Before(oldest) {
+				oldestID, oldest = sessionID, tombstone.expiresAt
+			}
+		}
+		if oldestID == "" {
+			break
+		}
+		tokenHash := s.cdpTombstones[oldestID].tokenHash
+		delete(s.cdpTombstones, oldestID)
+		delete(s.cdpTokenTombstones, tokenHash)
+	}
 }
 
 // CloseCDPTunnel removes exactly one session.  It is idempotent and never
