@@ -254,8 +254,8 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 			}
 		}
 	}()
-	controlURL := waitForP118TextFile(
-		t, urlFile, 20*time.Second, &serverOutput,
+	controlURL := waitForP118TextFileOrProcess(
+		t, urlFile, 20*time.Second, &serverOutput, serverDone, &serverFinished, nil,
 		evidenceFile,
 		evidenceFile+".controller-a-progress.json",
 		evidenceFile+".controller-b-progress.json",
@@ -388,6 +388,7 @@ func waitForP118TextFileOrProcess(
 	processDone <-chan error,
 	processFinished *bool,
 	client *FarmControlWSSClient,
+	diagnosticPaths ...string,
 ) string {
 	t.Helper()
 	deadline := time.NewTimer(timeout)
@@ -399,8 +400,9 @@ func waitForP118TextFileOrProcess(
 		case err := <-processDone:
 			*processFinished = true
 			t.Fatalf(
-				"P1.18 fixture exited before publishing %s: %v output=%s agent_transport={%s}",
-				filepath.Base(path), err, output.String(), p118TransportDiagnostic(client),
+				"P1.18 fixture exited before publishing %s: %v output=%s diagnostics=%s agent_transport={%s}",
+				filepath.Base(path), err, output.String(),
+				p118AllowlistedJSONDiagnostics(diagnosticPaths...), p118TransportDiagnostic(client),
 			)
 			return ""
 		case <-ticker.C:
@@ -409,8 +411,9 @@ func waitForP118TextFileOrProcess(
 			}
 		case <-deadline.C:
 			t.Fatalf(
-				"P1.18 fixture did not publish %s: %s agent_transport={%s}",
-				filepath.Base(path), output.String(), p118TransportDiagnostic(client),
+				"P1.18 fixture did not publish %s: %s diagnostics=%s agent_transport={%s}",
+				filepath.Base(path), output.String(),
+				p118AllowlistedJSONDiagnostics(diagnosticPaths...), p118TransportDiagnostic(client),
 			)
 			return ""
 		}
