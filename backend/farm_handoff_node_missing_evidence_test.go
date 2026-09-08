@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -319,6 +320,48 @@ func TestP118NodeMissingEvidenceContract(t *testing.T) {
 	}
 }
 
+func TestP118NodeMissingFixtureTerminationReapsProcessGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	childPIDFile := filepath.Join(t.TempDir(), "child.pid")
+	command := exec.CommandContext(
+		ctx,
+		"sh",
+		"-c",
+		`trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM; sleep 60 & child=$!; echo "$child" > "$1"; wait "$child"`,
+		"p118-node-fixture",
+		childPIDFile,
+	)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	var childPID int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(childPIDFile)
+		if err == nil {
+			childPID, err = strconv.Atoi(strings.TrimSpace(string(raw)))
+			if err == nil && childPID > 0 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		cancel()
+		t.Fatal("fixture child process did not start")
+	}
+	p118TerminateNodeMissingFixture(command, done, cancel)
+	if command.ProcessState == nil || !command.ProcessState.Exited() {
+		t.Fatal("fixture parent process was not reaped")
+	}
+	if err := syscall.Kill(childPID, 0); err == nil {
+		t.Fatal("fixture child process survived parent teardown")
+	}
+}
+
 func p118Write0600(t *testing.T, path string, value []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, value, 0o600); err != nil {
@@ -350,7 +393,15 @@ func p118NodeMissingStage(value map[string]json.RawMessage) string {
 	return stage
 }
 
-func p118WaitNodeMissingStage(t *testing.T, path string, process *exec.Cmd, stage string, deadline time.Time) map[string]json.RawMessage {
+func p118WaitNodeMissingStage(
+	t *testing.T,
+	path string,
+	process *exec.Cmd,
+	stage string,
+	deadline time.Time,
+	output *p118SynchronizedBuffer,
+	diagnosticPaths ...string,
+) map[string]json.RawMessage {
 	t.Helper()
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
@@ -360,15 +411,27 @@ func p118WaitNodeMissingStage(t *testing.T, path string, process *exec.Cmd, stag
 			}
 			var running bool
 			if json.Unmarshal(value["running"], &running) == nil && !running {
-				t.Fatalf("fixture failed before %s", stage)
+				t.Fatalf(
+					"fixture failed before %s: output=%s diagnostics=%s",
+					stage, p118AllowlistedServerOutput(output.String()),
+					p118AllowlistedJSONDiagnostics(diagnosticPaths...),
+				)
 			}
 		}
 		if process != nil && process.ProcessState != nil && process.ProcessState.Exited() {
-			t.Fatalf("fixture exited before %s", stage)
+			t.Fatalf(
+				"fixture exited before %s: output=%s diagnostics=%s",
+				stage, p118AllowlistedServerOutput(output.String()),
+				p118AllowlistedJSONDiagnostics(diagnosticPaths...),
+			)
 		}
 		time.Sleep(30 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for fixture stage %s", stage)
+	t.Fatalf(
+		"timed out waiting for fixture stage %s: output=%s diagnostics=%s",
+		stage, p118AllowlistedServerOutput(output.String()),
+		p118AllowlistedJSONDiagnostics(diagnosticPaths...),
+	)
 	return nil
 }
 
@@ -395,6 +458,37 @@ func p118FarmProcessIdentity(t *testing.T, farm *FarmRuntimeService, profileID s
 		t.Fatalf("Agent Chrome process is not alive: %v", err)
 	}
 	return identity
+}
+
+func p118TerminateNodeMissingFixture(command *exec.Cmd, done <-chan error, cancel context.CancelFunc) {
+	if cancel != nil {
+		defer cancel()
+	}
+	if command == nil || command.Process == nil {
+		return
+	}
+	if command.ProcessState != nil && command.ProcessState.Exited() {
+		return
+	}
+	_ = command.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-done:
+		return
+	case <-time.After(5 * time.Second):
+	}
+	if cancel != nil {
+		cancel()
+	}
+	// The Python fixture owns Controller A/B children.  If its bounded SIGTERM
+	// cleanup cannot finish, kill the isolated process group so no child can
+	// survive a Go test failure.  The normal path still lets the Python parent
+	// verify its ownership marker and drop the unique schema first.
+	_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	_ = command.Process.Kill()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
 }
 
 func runP118NodeMissingScenario(t *testing.T, scenario string) {
@@ -434,7 +528,6 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 	controlDBName := fmt.Sprintf("bf_p118_missing_%x", time.Now().UnixNano())
 
 	serverCtx, cancelServer := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancelServer()
 	serverArgs := []string{
 		"--scenario", scenario,
 		"--url-file", urlFile,
@@ -456,6 +549,7 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 	}
 	serverCommand := exec.CommandContext(serverCtx, "python3", append([]string{fixtureScript}, serverArgs...)...)
 	serverCommand.Env = append(os.Environ(), "SCRAPER_CONTROL_DB_NAME="+controlDBName)
+	serverCommand.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var serverOutput p118SynchronizedBuffer
 	serverCommand.Stdout, serverCommand.Stderr = &serverOutput, &serverOutput
 	if err := serverCommand.Start(); err != nil {
@@ -464,18 +558,7 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- serverCommand.Wait() }()
 	serverFinished := false
-	defer func() {
-		if serverFinished || serverCommand.Process == nil {
-			return
-		}
-		_ = serverCommand.Process.Signal(syscall.SIGTERM)
-		select {
-		case <-serverDone:
-		case <-time.After(5 * time.Second):
-			_ = serverCommand.Process.Kill()
-			<-serverDone
-		}
-	}()
+	defer p118TerminateNodeMissingFixture(serverCommand, serverDone, cancelServer)
 	controlURL := waitForP118TextFileOrProcess(t, urlFile, 20*time.Second, &serverOutput, serverDone, &serverFinished, nil, evidenceFile, aStateFile, bStateFile)
 
 	cfg := DefaultConfig()
@@ -546,14 +629,23 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 	}
 	defer client.Close()
 	fixtureDeadline := time.Now().Add(110 * time.Second)
-	aState := p118WaitNodeMissingStage(t, aStateFile, serverCommand, "ready_for_node_exit", fixtureDeadline)
+	aState := p118WaitNodeMissingStage(
+		t, aStateFile, serverCommand, "ready_for_node_exit", fixtureDeadline,
+		&serverOutput, evidenceFile, aStateFile, bStateFile,
+	)
 	client.Close()
 	p118Write0600(t, nodeExitFile, []byte("close-agent-session\n"))
-	p118WaitNodeMissingStage(t, aStateFile, serverCommand, "ready_for_sigkill", fixtureDeadline)
+	p118WaitNodeMissingStage(
+		t, aStateFile, serverCommand, "ready_for_sigkill", fixtureDeadline,
+		&serverOutput, evidenceFile, aStateFile, bStateFile,
+	)
 
 	var replacementClient *FarmControlWSSClient
 	if scenario == p118NodeMissingRaceScenario {
-		p118WaitNodeMissingStage(t, bStateFile, serverCommand, "race_offline_snapshot", fixtureDeadline)
+		p118WaitNodeMissingStage(
+			t, bStateFile, serverCommand, "race_offline_snapshot", fixtureDeadline,
+			&serverOutput, evidenceFile, aStateFile, bStateFile,
+		)
 		bURLRaw, err := os.ReadFile(bURLFile)
 		if err != nil {
 			t.Fatal(err)
@@ -571,9 +663,15 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 			t.Fatalf("real Agent N+1 reconnect failed: %v", err)
 		}
 		defer replacementClient.Close()
-		p118WaitNodeMissingStage(t, bStateFile, serverCommand, "race_generation_ready", fixtureDeadline)
+		p118WaitNodeMissingStage(
+			t, bStateFile, serverCommand, "race_generation_ready", fixtureDeadline,
+			&serverOutput, evidenceFile, aStateFile, bStateFile,
+		)
 	}
-	p118WaitNodeMissingStage(t, bStateFile, serverCommand, "await_agent_identity_after", fixtureDeadline)
+	p118WaitNodeMissingStage(
+		t, bStateFile, serverCommand, "await_agent_identity_after", fixtureDeadline,
+		&serverOutput, evidenceFile, aStateFile, bStateFile,
+	)
 	after := p118FarmProcessIdentity(t, farm, profileID)
 	beforeRaw, ok := aState["before"]
 	if !ok {

@@ -490,7 +490,10 @@ func runP118ConfigMismatchScenario(t *testing.T, scenario string) {
 	}
 	defer client.Close()
 	deadline := time.Now().Add(180 * time.Second)
-	p118WaitNodeMissingStage(t, aStateFile, serverCommand, "ready_for_parent_sigkill", deadline)
+	p118WaitNodeMissingStage(
+		t, aStateFile, serverCommand, "ready_for_parent_sigkill", deadline,
+		&serverOutput, evidenceFile, aStateFile, bStateFile,
+	)
 	if err := <-serverDone; err != nil {
 		serverFinished = true
 		t.Fatalf("config-mismatch fixture failed: %v output=%s diagnostics=%s", err,
