@@ -58,7 +58,9 @@ publish/staging/
 publish/output/
 
 # Internal docs / scratch files
-docs/
+docs/*
+!docs/ant_farm_client/
+!docs/ant_farm_client/**
 DEPLOYMENT_GUIDE.md
 plan.md
 pic/
