@@ -90,7 +90,8 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 	for _, key := range []string{
 		"accepted", "control_db_cleanup", "failure_stage", "failure_type",
 		"cleanup_error_type", "old_connection_disconnected", "old_operation_rejected",
-		"marker_preserved", "new_io", "reattached",
+		"marker_preserved", "new_io", "reattached", "child_actor",
+		"reconcile_error_type", "reconcile_outcomes", "running", "actor", "stage",
 	} {
 		if value, ok := source[key]; ok {
 			allowed[key] = value
