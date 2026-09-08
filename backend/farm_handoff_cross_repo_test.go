@@ -92,6 +92,10 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		"cleanup_error_type", "old_connection_disconnected", "old_operation_rejected",
 		"marker_preserved", "new_io", "reattached", "child_actor",
 		"reconcile_error_type", "reconcile_outcomes", "running", "actor", "stage",
+		"inventory_dispatch_attempts", "inventory_list_online", "inventory_list_generation",
+		"inventory_auth_binding_generation", "inventory_sample_generation",
+		"inventory_heartbeat_age_ms", "inventory_dispatch_error_type",
+		"inventory_response_ok", "inventory_count",
 	} {
 		if value, ok := source[key]; ok {
 			allowed[key] = value
