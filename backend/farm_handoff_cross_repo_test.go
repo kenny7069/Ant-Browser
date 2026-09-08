@@ -156,7 +156,7 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		"reconcile_target_config_match", "reconcile_target_launch_mode_match",
 		"replacement_ack_identity_valid", "replacement_same_node", "replacement_runtime_uid_changed",
 		"replacement_generation_advanced", "replacement_pid_changed", "replacement_process_start_changed",
-		"replacement_profile_incarnation_changed", "old_process_identity_absent", "mutation_applied",
+		"replacement_profile_incarnation_preserved", "old_process_identity_absent", "mutation_applied",
 		"mutation_rowcount", "mutation_owner_scoped", "mutation_after_controller_a_exit",
 		"runtime_db_old_hash_before", "runtime_db_target_hash_after",
 		"replacement_persisted_by_authenticated_telemetry", "replacement_db_row_present",

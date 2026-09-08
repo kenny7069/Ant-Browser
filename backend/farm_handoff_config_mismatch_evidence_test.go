@@ -53,7 +53,7 @@ var p118ConfigMismatchEvidenceKeys = map[string]struct{}{
 	"replacement_ack_identity_valid": {}, "replacement_same_node": {},
 	"replacement_runtime_uid_changed": {}, "replacement_generation_advanced": {},
 	"replacement_pid_changed": {}, "replacement_process_start_changed": {},
-	"replacement_profile_incarnation_changed": {}, "old_process_identity_absent": {},
+	"replacement_profile_incarnation_preserved": {}, "old_process_identity_absent": {},
 	"mutation_applied": {}, "mutation_rowcount": {}, "mutation_owner_scoped": {},
 	"mutation_after_controller_a_exit": {}, "runtime_db_old_hash_before": {},
 	"runtime_db_target_hash_after": {}, "replacement_persisted_by_authenticated_telemetry": {},
@@ -172,7 +172,7 @@ func validateP118ConfigMismatchEvidence(raw []byte) error {
 		"reconcile_request_identity_match", "reconcile_target_config_match",
 		"reconcile_target_launch_mode_match", "replacement_ack_identity_valid",
 		"replacement_same_node", "replacement_runtime_uid_changed", "replacement_generation_advanced",
-		"replacement_process_start_changed", "replacement_profile_incarnation_changed",
+		"replacement_process_start_changed", "replacement_profile_incarnation_preserved",
 		"old_process_identity_absent", "replacement_persisted_by_authenticated_telemetry",
 		"replacement_db_row_present", "replacement_db_identity_match", "replacement_agent_inventory_match",
 		"replacement_strict_stop_confirmed", "replacement_exact_adopted", "old_runtime_marked_lost",
@@ -254,7 +254,7 @@ func validateP118ConfigMismatchEvidence(raw []byte) error {
 	}
 	if after.RuntimeUID == before.RuntimeUID || after.Generation <= before.Generation ||
 		after.ProcessStartIdentity == before.ProcessStartIdentity ||
-		after.ProfileIncarnation == before.ProfileIncarnation {
+		after.ProfileIncarnation != before.ProfileIncarnation {
 		return fmt.Errorf("replacement identity is not fresh")
 	}
 	if identity.ConfigHash != p118ConfigMismatchOldHash {
@@ -275,7 +275,7 @@ func TestP118ConfigMismatchEvidenceContract(t *testing.T) {
 	}
 	after := map[string]any{
 		"runtime_uid": "runtime-new", "generation": 8, "pid": 4242,
-		"process_start_identity": "start-new", "profile_incarnation": "incarnation-new",
+		"process_start_identity": "start-new", "profile_incarnation": "incarnation-old",
 	}
 	baseline := map[string]any{
 		"accepted": true, "control_db_cleanup": true, "scenario": p118ConfigMismatchScenario,
@@ -291,7 +291,7 @@ func TestP118ConfigMismatchEvidenceContract(t *testing.T) {
 		"reconcile_request_identity_match": true, "reconcile_target_config_match": true,
 		"reconcile_target_launch_mode_match": true, "replacement_ack_identity_valid": true,
 		"replacement_same_node": true, "replacement_runtime_uid_changed": true, "replacement_generation_advanced": true,
-		"replacement_process_start_changed": true, "replacement_profile_incarnation_changed": true,
+		"replacement_process_start_changed": true, "replacement_profile_incarnation_preserved": true,
 		"old_process_identity_absent": true, "replacement_persisted_by_authenticated_telemetry": true,
 		"replacement_db_row_present": true, "replacement_db_identity_match": true,
 		"replacement_agent_inventory_match": true, "replacement_strict_stop_confirmed": true,
@@ -320,13 +320,15 @@ func TestP118ConfigMismatchEvidenceContract(t *testing.T) {
 		{"same runtime UID", func(value map[string]any) { value["after"].(map[string]any)["runtime_uid"] = "runtime-old" }},
 		{"same generation", func(value map[string]any) { value["after"].(map[string]any)["generation"] = uint64(7) }},
 		{"target hash not persisted", func(value map[string]any) { value["replacement_db_target_hash"] = p118ConfigMismatchOldHash }},
+		{"same process start", func(value map[string]any) { value["after"].(map[string]any)["process_start_identity"] = "start-old" }},
+		{"changed profile incarnation", func(value map[string]any) { value["after"].(map[string]any)["profile_incarnation"] = "incarnation-new" }},
 		{"secret-bearing top-level key", func(value map[string]any) { value["controller_token"] = "secret" }},
 	}
 	for _, mutation := range mutations {
 		t.Run(mutation.name, func(t *testing.T) {
-			value := make(map[string]any, len(baseline))
-			for key, item := range baseline {
-				value[key] = item
+			var value map[string]any
+			if err := json.Unmarshal(raw, &value); err != nil {
+				t.Fatal(err)
 			}
 			mutation.edit(value)
 			raw, err := json.Marshal(value)
