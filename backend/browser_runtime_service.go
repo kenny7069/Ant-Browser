@@ -158,6 +158,7 @@ type BrowserRuntimeProcess struct {
 	cleanupFn   func()
 	cleanupMu   sync.Mutex
 	cleanupDone bool
+	cleanupWait chan struct{}
 
 	// teardownMu serializes the destructive part of termination without ever
 	// making Cmd.Wait observable to the service. stopIssued ensures that a
@@ -206,13 +207,20 @@ func (p *BrowserRuntimeProcess) cleanup() {
 	}
 	p.cleanupMu.Lock()
 	if p.cleanupDone {
+		wait := p.cleanupWait
 		p.cleanupMu.Unlock()
+		if wait != nil {
+			<-wait
+		}
 		return
 	}
 	p.cleanupDone = true
+	p.cleanupWait = make(chan struct{})
+	wait := p.cleanupWait
 	cleanup := p.cleanupFn
 	p.cleanupFn = nil
 	p.cleanupMu.Unlock()
+	defer close(wait)
 	if cleanup != nil {
 		cleanup()
 	}
@@ -228,7 +236,11 @@ func (p *BrowserRuntimeProcess) adoptCleanup(cleanup func()) {
 	}
 	p.cleanupMu.Lock()
 	if p.cleanupDone {
+		wait := p.cleanupWait
 		p.cleanupMu.Unlock()
+		if wait != nil {
+			<-wait
+		}
 		cleanup()
 		return
 	}

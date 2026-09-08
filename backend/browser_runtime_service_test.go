@@ -764,6 +764,77 @@ func TestBrowserRuntimeShutdownReapsPendingOwner(t *testing.T) {
 	}
 }
 
+func TestBrowserRuntimeShutdownWaitsForConcurrentPendingCleanupTerminal(t *testing.T) {
+	var cleanupCalls atomic.Int32
+	cleanupEntered := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	process, _ := newStartedRuntimeProcess(t, &blockingRuntimeMonitor{}, func() {
+		cleanupCalls.Add(1)
+		close(cleanupEntered)
+		<-releaseCleanup
+	})
+	service, manager := newRuntimeStartServiceTest(t, BrowserRuntimeHost{
+		StartProcess: func(*BrowserRuntimeLaunchPlan) (*BrowserRuntimeProcess, error) { return nil, nil },
+		StopProcess: func(cmd *exec.Cmd) error {
+			if cmd.Process != nil {
+				return cmd.Process.Kill()
+			}
+			return nil
+		},
+	})
+	service.registerPendingReap(process, &BrowserRuntimeLaunchPlan{Spec: BrowserRuntimeLaunchSpec{ProfileID: "profile-1"}})
+	if err := process.cmd.Process.Kill(); err != nil && !isProcessAlreadyFinished(err) {
+		t.Fatal(err)
+	}
+	select {
+	case <-cleanupEntered:
+	case <-time.After(time.Second):
+		t.Fatal("pending observer did not enter cleanup barrier")
+	}
+	// Replace the profile pointer while the old owned process is completing.
+	// Pending cleanup must remain bound to its process handle and must never
+	// mutate or terminate this newer, unowned generation (profile ABA).
+	replacement := &browser.Profile{
+		ProfileId: "profile-1", ProfileName: "replacement",
+		Running: true, DebugReady: true, Pid: 99001, DebugPort: 19901,
+	}
+	manager.Mutex.Lock()
+	manager.Profiles["profile-1"] = replacement
+	manager.Mutex.Unlock()
+
+	shutdownResults := make(chan error, 2)
+	go func() { shutdownResults <- service.Shutdown() }()
+	go func() { shutdownResults <- service.Shutdown() }()
+	select {
+	case err := <-shutdownResults:
+		t.Fatalf("Shutdown returned before pending cleanup completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseCleanup)
+	for index := 0; index < 2; index++ {
+		select {
+		case err := <-shutdownResults:
+			if err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Shutdown did not reach terminal cleanup")
+		}
+	}
+	if got := cleanupCalls.Load(); got != 1 {
+		t.Fatalf("cleanup calls = %d, want exactly 1", got)
+	}
+	if service.hasPendingReap("profile-1") {
+		t.Fatal("Shutdown returned with pending owner still registered")
+	}
+	manager.Mutex.Lock()
+	current := manager.Profiles["profile-1"]
+	manager.Mutex.Unlock()
+	if current != replacement || !current.Running || current.Pid != 99001 {
+		t.Fatalf("pending cleanup mutated replacement profile: %#v", current)
+	}
+}
+
 func TestBrowserRuntimeStartFailsClosedWithoutStopCapability(t *testing.T) {
 	var startCalls atomic.Int32
 	host := BrowserRuntimeHost{StartProcess: func(*BrowserRuntimeLaunchPlan) (*BrowserRuntimeProcess, error) {
