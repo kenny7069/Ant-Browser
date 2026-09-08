@@ -31,9 +31,15 @@ func secureRuntimeOwnerSecurityAttributes(directory bool) (*windows.SecurityAttr
 	if sid == "" {
 		return nil, fmt.Errorf("format current Windows token SID")
 	}
-	sddl := fmt.Sprintf("D:P(A;;FA;;;%s)", sid)
+	// Administrators running with an elevated token can otherwise create an
+	// object whose owner is the BUILTIN\Administrators group even though its
+	// only DACL ACE names the token user. Pin the owner in the create-time
+	// descriptor as well as the protected owner-only DACL so the immediately
+	// following authenticity check observes the same SID on every Windows
+	// token type.
+	sddl := fmt.Sprintf("O:%sD:P(A;;FA;;;%s)", sid, sid)
 	if directory {
-		sddl = fmt.Sprintf("D:P(A;OICI;FA;;;%s)", sid)
+		sddl = fmt.Sprintf("O:%sD:P(A;OICI;FA;;;%s)", sid, sid)
 	}
 	descriptor, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
