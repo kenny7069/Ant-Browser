@@ -135,6 +135,18 @@ type p118ScenarioBudget struct {
 	successorGatewayTimeout time.Duration
 }
 
+func p118TimeoutSeconds(duration time.Duration) string {
+	return fmt.Sprint(int64(duration / time.Second))
+}
+
+func TestP118TimeoutArgumentUsesNumericSeconds(t *testing.T) {
+	for duration, expected := range map[time.Duration]string{180 * time.Second: "180", 150 * time.Second: "150"} {
+		if actual := p118TimeoutSeconds(duration); actual != expected {
+			t.Fatalf("duration %v serialized as %q, want %q", duration, actual, expected)
+		}
+	}
+}
+
 func p118ScenarioBudgetFor(scenario string) (p118ScenarioBudget, error) {
 	switch scenario {
 	case "execv":
@@ -299,7 +311,7 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		"--provider-instance-id", providerID, "--fencing-epoch", fmt.Sprint(fencingEpoch),
 		"--controller-a-id", controllerA, "--controller-b-id", controllerB)
 	if budgets.fixtureTimeout > 0 {
-		serverCommand.Args = append(serverCommand.Args, "--timeout", fmt.Sprint(budgets.fixtureTimeout/time.Second))
+		serverCommand.Args = append(serverCommand.Args, "--timeout", p118TimeoutSeconds(budgets.fixtureTimeout))
 	}
 	serverCommand.Env = append(os.Environ(), "SCRAPER_CONTROL_DB_NAME="+controlDBName)
 	var serverOutput p118SynchronizedBuffer
@@ -410,7 +422,7 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		"--old-cdp-closed-file", oldCDPClosedFile,
 		"--reattach-gateway-file", reattachGatewayFile, "--done-file", doneFile)
 	if budgets.successorGatewayTimeout > 0 {
-		playwright.Args = append(playwright.Args, "--successor-gateway-timeout", fmt.Sprint(budgets.successorGatewayTimeout/time.Second))
+		playwright.Args = append(playwright.Args, "--successor-gateway-timeout", p118TimeoutSeconds(budgets.successorGatewayTimeout))
 	}
 	var playwrightOutput bytes.Buffer
 	playwright.Stdout, playwright.Stderr = &playwrightOutput, &playwrightOutput
