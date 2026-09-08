@@ -2,6 +2,15 @@ name: Windows DACL acceptance
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/browser-farm-p1-handoff-agent
+    paths:
+      - .github/workflows/windows-dacl-acceptance.yml
+      - backend/internal/proxy/secure_runtime_permissions_windows.go
+      - backend/internal/proxy/secure_runtime_windows_dacl_e2e_test.go
+      - backend/internal/proxy/secure_runtime_writer.go
+      - scripts/run_windows_dacl_acceptance.ps1
 
 permissions:
   contents: read

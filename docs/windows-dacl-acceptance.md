@@ -50,9 +50,12 @@ do not retain environment dumps.
 
 ## Hosted runner
 
-The manual `Windows DACL acceptance` GitHub Actions workflow provides the same
-ordinary and race run on `windows-2022`. It creates a uniquely named local
+The `Windows DACL acceptance` GitHub Actions workflow provides the same ordinary
+and race run on `windows-2022`. Before the workflow reaches the default branch,
+it runs only when `codex/browser-farm-p1-handoff-agent` is pushed with a relevant
+harness change; `workflow_dispatch` is also available once GitHub exposes it
+from the default branch. It creates a uniquely named local
 alternate account using an in-memory random masked password, passes the password
 only through the step process environment, and deletes that exact account in a
-`finally` block. Merely adding the workflow does not satisfy acceptance: retain
-a successful workflow run tied to the tested commit.
+`finally` block. A local commit alone does not satisfy acceptance: retain a
+successful workflow run tied to the tested commit.
