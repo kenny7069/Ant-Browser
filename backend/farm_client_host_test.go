@@ -338,6 +338,75 @@ func TestNewFarmClientHostLoadsSQLiteProfilesAndComposesServices(t *testing.T) {
 	}
 }
 
+func TestNewFarmClientHostLoadsSecureIdentityReference(t *testing.T) {
+	root := t.TempDir()
+	appConfigPath := filepath.Join(root, "config.yaml")
+	antConfig := DefaultConfig()
+	antConfig.Database.SQLite.Path = "profiles.db"
+	if err := antConfig.Save(appConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.NewDB(filepath.Join(root, "profiles.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ref, _ := NewFarmClientIdentityKeyRef("secure-node-key")
+	seed := make([]byte, ed25519.SeedSize)
+	for index := range seed {
+		seed[index] = 0x5a
+	}
+	key := ed25519.NewKeyFromSeed(seed)
+	store := &fakeFarmClientIdentityStore{keys: make(map[FarmClientIdentityKeyRef][]byte)}
+	if err := store.Save(ref, key); err != nil {
+		t.Fatal(err)
+	}
+	clientConfig := FarmClientConfig{
+		ApplicationRoot: root,
+		StateRoot:       filepath.Join(root, "state"),
+		AntConfigPath:   appConfigPath,
+		ControlURL:      "ws://127.0.0.1:1",
+		Identity: FarmClientIdentityConfig{
+			NodeUID:       "node-secure",
+			PrivateKeyRef: string(ref),
+		},
+	}
+	raw, err := yaml.Marshal(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPath := filepath.Join(root, "client-secure.yaml")
+	if err := os.WriteFile(clientPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host, err := NewFarmClientHostWithIdentityStore(clientPath, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalBytes(host.identity.PrivateKey, key) || host.identity.NodeUID != "node-secure" {
+		t.Fatal("host did not compose the securely stored device identity")
+	}
+	if host.config.Identity.PrivateKey != "" || host.config.Identity.PrivateKeyEnv != "" {
+		t.Fatal("host retained a development identity source")
+	}
+	if err := host.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	logBytes, err := os.ReadFile(host.config.LogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBytes), base64.StdEncoding.EncodeToString(key)) || strings.Contains(string(logBytes), string(ref)) {
+		t.Fatal("host log exposed secure identity material or reference")
+	}
+}
+
 func TestFarmClientRunKeepsReconnectSupervisorAliveAfterInitialDialFailure(t *testing.T) {
 	appRoot := t.TempDir()
 	cfg := DefaultConfig()

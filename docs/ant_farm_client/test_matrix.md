@@ -12,7 +12,7 @@
 | C1 | Control integration | authenticated WSS heartbeat/inventory and WSS→ensure→real Chrome→attest | PASS on macOS arm64 |
 | C1 | Attestation | actual args, generation/PID/debug port/readiness, direct-mode fail closed, evidence cleanup | PASS |
 | C1 | Core regression | full test, full race, vet, Windows cross-build | PASS |
-| C2 | Enrollment/security | one-time/expiry/replay/key storage/diagnostics | Not started |
+| C2 | Enrollment/security | one-time/expiry/replay/key storage/diagnostics | PASS on macOS arm64; target-OS native rerun required at C8 |
 | C3 | Profile pairing | CRUD/readiness/pair/unpair/same-ID ABA | Not started |
 | C4-C7 | Lifecycle/package/update | platform services, signed update, rollback | Not started |
 | C8-C10 | Installed E2E/release | Windows, Linux, macOS, social, soak, chaos | Not started |
@@ -30,3 +30,22 @@ chaos test may be counted as release acceptance.
 | `GOOS=windows GOARCH=amd64 go build ./backend ./backend/cmd/ant-farm-client` | PASS |
 | `C1_REAL_CHROME=1 C1_REAL_CHROME_CORE=/Applications go test ./backend -run '^TestFarmClientHostRealChromeEnsureAttest$' -count=1 -v` | PASS |
 | same real-Chrome command with `-race` | PASS |
+
+## C2 commands (macOS arm64)
+
+| Command | Result |
+|---|---|
+| `go test ./backend/... -count=1` | PASS (one known timing-sensitive baseline test passed on isolated rerun and full rerun) |
+| `go test -race ./backend/... -count=1` | PASS |
+| `go vet ./backend/...` | PASS |
+| `ANT_FARM_CLIENT_NATIVE_STORE_E2E=1 go test ./backend -run '^TestFarmClientDarwinKeychainNativeOptIn$' -count=1` | PASS |
+| `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./backend ./backend/cmd/ant-farm-client` | PASS |
+| equivalent Linux amd64 and Darwin amd64/no-cgo builds | PASS |
+| explicit Windows/Linux identity-store test compilation | PASS |
+| Server enrollment + P1.6 + auth + WSS + schema suites | 77 PASS, 2 existing environment skips |
+| `python3 輔助程式/test_security_hardening.py` | 36 PASS |
+| C1 real Chrome authenticated ensure/attest regression | PASS normal and race |
+
+Windows DPAPI, Linux Secret Service, different-user permissions and full
+installed-artifact execution remain mandatory C8 target-host tests; their
+opt-in test programs are present and are not counted as executed on macOS.

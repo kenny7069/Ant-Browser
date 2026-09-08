@@ -38,13 +38,14 @@ var (
 
 var farmClientNodeUIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
-// FarmClientIdentityConfig is the development/test identity input accepted by
-// C1. C2 will replace this with secure enrollment and durable key storage. A
-// private key is read into memory and is never written by this package.
+// FarmClientIdentityConfig accepts the C2 opaque secure-store reference. The
+// encoded key fields remain only for C1 development fixtures and are never
+// written by this package.
 type FarmClientIdentityConfig struct {
 	NodeUID       string `yaml:"node_uid" json:"node_uid"`
 	PrivateKey    string `yaml:"private_key,omitempty" json:"private_key,omitempty"`
 	PrivateKeyEnv string `yaml:"private_key_env,omitempty" json:"private_key_env,omitempty"`
+	PrivateKeyRef string `yaml:"private_key_ref,omitempty" json:"private_key_ref,omitempty"`
 }
 
 // FarmClientConfig describes only client-owned configuration. ApplicationRoot
@@ -61,6 +62,13 @@ type FarmClientConfig struct {
 	ControlURL    string `yaml:"control_url,omitempty" json:"control_url,omitempty"`
 	// WSSURL is a compatibility spelling for the control endpoint.
 	WSSURL string `yaml:"wss_url,omitempty" json:"wss_url,omitempty"`
+	// EnrollmentURL is used only by the explicit first-run enrollment command.
+	// The one-time code is never stored in this config.
+	EnrollmentURL string `yaml:"enrollment_url,omitempty" json:"enrollment_url,omitempty"`
+	NodeName      string `yaml:"node_name,omitempty" json:"node_name,omitempty"`
+	// AllowLoopbackHTTPEnrollment is an explicit development/test escape hatch.
+	// Production enrollment remains HTTPS-only, including loopback by default.
+	AllowLoopbackHTTPEnrollment bool `yaml:"allow_loopback_http_enrollment,omitempty" json:"allow_loopback_http_enrollment,omitempty"`
 
 	Identity FarmClientIdentityConfig `yaml:"identity,omitempty" json:"identity,omitempty"`
 	// The flat identity fields make one-shot development launch easy while the
@@ -167,6 +175,34 @@ func (c *FarmClientConfig) ValidateFarmClientConfig() error {
 	identity := c.identityConfig()
 	if err := validateFarmClientNodeUID(identity.NodeUID); err != nil {
 		return err
+	}
+	identitySources := 0
+	for _, value := range []string{identity.PrivateKey, identity.PrivateKeyEnv, identity.PrivateKeyRef} {
+		if strings.TrimSpace(value) != "" {
+			identitySources++
+		}
+	}
+	if identitySources > 1 {
+		return fmt.Errorf("%w: private key, environment and key reference are mutually exclusive", ErrFarmClientIdentity)
+	}
+	if strings.TrimSpace(identity.PrivateKeyRef) != "" {
+		if _, err := NewFarmClientIdentityKeyRef(identity.PrivateKeyRef); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(c.NodeName) != "" {
+		if err := validateFarmClientNodeName(c.NodeName); err != nil {
+			return err
+		}
+	} else {
+		c.NodeName = strings.TrimSpace(identity.NodeUID)
+	}
+	if strings.TrimSpace(c.EnrollmentURL) != "" {
+		enrollmentURL, err := normalizeFarmClientEnrollmentURL(c.EnrollmentURL, c.AllowLoopbackHTTPEnrollment)
+		if err != nil {
+			return err
+		}
+		c.EnrollmentURL = enrollmentURL
 	}
 	if strings.TrimSpace(c.ProviderInstanceID) == "" {
 		c.ProviderInstanceID = "ant-farm-client-" + identity.NodeUID
@@ -304,6 +340,31 @@ func validateFarmClientNodeUID(nodeUID string) error {
 	return nil
 }
 
+func validateFarmClientNodeName(nodeName string) error {
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" || len(nodeName) > 100 {
+		return fmt.Errorf("%w: node name is invalid", ErrFarmClientIdentity)
+	}
+	for _, char := range nodeName {
+		if char < 0x20 || char == 0x7f {
+			return fmt.Errorf("%w: node name is invalid", ErrFarmClientIdentity)
+		}
+	}
+	return nil
+}
+
+func normalizeFarmClientEnrollmentURL(raw string, allowLoopbackHTTP bool) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawQuery != "" {
+		return "", fmt.Errorf("%w: enrollment URL is invalid", ErrFarmClientConfig)
+	}
+	loopback := parsed.Hostname() == "localhost" || net.ParseIP(parsed.Hostname()).IsLoopback()
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && loopback && allowLoopbackHTTP) {
+		return "", fmt.Errorf("%w: enrollment URL must use https (http only on loopback)", ErrFarmClientConfig)
+	}
+	return parsed.String(), nil
+}
+
 func (c FarmClientConfig) identityConfig() FarmClientIdentityConfig {
 	identity := c.Identity
 	if strings.TrimSpace(c.NodeUID) != "" {
@@ -337,6 +398,9 @@ func (c FarmClientConfig) ResolveFarmClientIdentity(lookup func(string) string) 
 		encoded = strings.TrimSpace(lookup(strings.TrimSpace(identity.PrivateKeyEnv)))
 	}
 	if encoded == "" {
+		if strings.TrimSpace(identity.PrivateKeyRef) != "" {
+			return FarmClientIdentity{}, fmt.Errorf("%w: secure key reference requires identity store", ErrFarmClientIdentity)
+		}
 		return FarmClientIdentity{}, fmt.Errorf("%w: development private key input is required", ErrFarmClientIdentity)
 	}
 	key, err := decodeFarmClientPrivateKey(encoded)
@@ -344,6 +408,25 @@ func (c FarmClientConfig) ResolveFarmClientIdentity(lookup func(string) string) 
 		return FarmClientIdentity{}, err
 	}
 	return FarmClientIdentity{NodeUID: strings.TrimSpace(identity.NodeUID), PrivateKey: key}, nil
+}
+
+// ResolveFarmClientIdentityFromStore loads a production identity through its
+// validated opaque reference. Native errors are collapsed to stable classes
+// before crossing the bootstrap boundary.
+func (c FarmClientConfig) ResolveFarmClientIdentityFromStore(store FarmClientIdentityStore) (FarmClientIdentity, error) {
+	identity := c.identityConfig()
+	if err := validateFarmClientNodeUID(identity.NodeUID); err != nil {
+		return FarmClientIdentity{}, err
+	}
+	ref, err := NewFarmClientIdentityKeyRef(identity.PrivateKeyRef)
+	if err != nil || store == nil {
+		return FarmClientIdentity{}, ErrFarmClientIdentityStore
+	}
+	key, err := store.Load(ref)
+	if err != nil {
+		return FarmClientIdentity{}, farmClientIdentityStoreError(err)
+	}
+	return FarmClientIdentity{NodeUID: strings.TrimSpace(identity.NodeUID), PrivateKey: append(ed25519.PrivateKey(nil), key...)}, nil
 }
 
 func decodeFarmClientPrivateKey(encoded string) (ed25519.PrivateKey, error) {

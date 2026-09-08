@@ -48,6 +48,13 @@ type FarmClientHost struct {
 // runtime or network service is constructed. The returned host is ready for
 // Run or an explicit Connect/Shutdown lifecycle.
 func NewFarmClientHost(configPath string) (*FarmClientHost, error) {
+	return NewFarmClientHostWithIdentityStore(configPath, nil)
+}
+
+// NewFarmClientHostWithIdentityStore is the injectable C2 composition seam.
+// Production passes nil and receives the current OS store; tests and embedding
+// hosts can supply a store without weakening the normal bootstrap path.
+func NewFarmClientHostWithIdentityStore(configPath string, suppliedIdentityStore FarmClientIdentityStore) (*FarmClientHost, error) {
 	cfg, err := LoadFarmClientConfig(configPath)
 	if err != nil {
 		return nil, err
@@ -65,7 +72,20 @@ func NewFarmClientHost(configPath string) (*FarmClientHost, error) {
 	}
 	cfg.ApplicationRoot, cfg.AppRoot, cfg.StateRoot = appRoot, appRoot, stateRoot
 
-	identity, err := cfg.ResolveFarmClientIdentity(nil)
+	var identity FarmClientIdentity
+	if strings.TrimSpace(cfg.identityConfig().PrivateKeyRef) != "" {
+		identityStore := suppliedIdentityStore
+		if identityStore == nil {
+			var storeErr error
+			identityStore, storeErr = NewFarmClientIdentityStore(stateRoot)
+			if storeErr != nil {
+				return nil, farmClientIdentityStoreError(storeErr)
+			}
+		}
+		identity, err = cfg.ResolveFarmClientIdentityFromStore(identityStore)
+	} else {
+		identity, err = cfg.ResolveFarmClientIdentity(nil)
+	}
 	if err != nil {
 		return nil, err
 	}

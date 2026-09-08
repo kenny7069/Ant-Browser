@@ -18,3 +18,5 @@
 | Existing state-root ownership/permission hardening is platform-specific | Verify owner/mode/DACL in C5 installed-artifact tests; C1 creates new Unix roots with mode 0700 |
 | Connector stacks can be accidentally mixed | Enforce `xray` combined stack versus standalone `mihomo` at every operation |
 | Updater/uninstaller may kill foreign processes | Ownership-scoped drain/stop only; never global process-name kill |
+| Enrollment limiter is process-local | Safe for the current single-process server; C6 multi-worker/replica deployment must use a shared gateway/limiter before scale-out |
+| Windows DPAPI and Linux Secret Service cannot execute on macOS | Native opt-in tests and cross-builds are present; execute them again in C8 installed-artifact workflows on each target OS |

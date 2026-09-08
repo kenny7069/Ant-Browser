@@ -4,7 +4,7 @@
 |---|---|---|
 | C0 Baseline / Branch | PASS | Pinned pair, ownership, risks, matrix, and regressions reviewed |
 | C1 Standalone Host | PASS | Wails-free host, strict config, lock, canonical SQLite manager, WSS, real Chrome attestation and shutdown verified |
-| C2 Enrollment | READY | Existing primitives/API gap documented; C1 development-key input must be replaced |
+| C2 Enrollment | PASS | One-time HTTPS API, response-loss confirmation, secure per-OS identity, CLI bootstrap and secret-free diagnostics verified |
 | C3 Profile Pairing | NOT STARTED | Explicit local/server mapping required |
 | C4 Background Lifecycle | NOT STARTED | |
 | C5 Packaging | NOT STARTED | |
@@ -36,3 +36,21 @@
 - Authenticated WSS → ensure → real Chrome ready → attest passed on macOS arm64,
   including a race-enabled execution.
 - Full backend tests, full race tests, vet, and Windows amd64 cross-build passed.
+
+## C2 completion evidence
+
+- Added admin/CSRF code issuance and unauthenticated HTTPS enrollment routes
+  over the existing transactional P1.6 primitive; exact-tuple confirmation is
+  read-only and bounded to 120 seconds after consume.
+- Trusted-proxy TLS/source parsing, 8 KiB request bounds and source/node rate
+  limits execute before unauthenticated JSON parsing.
+- Added Ed25519 first-run generation and stable pending-key retry, Windows
+  DPAPI, macOS Keychain, Linux Secret Service with a pinned owner-only fallback,
+  and per-user/per-reference cross-process first-save locking.
+- Added `-enroll` stdin/password input, explicit loopback HTTP opt-in, secure
+  Host key-reference loading, allowlisted diagnostics and panic redaction.
+- Independent SOL security review found and verified fixes for five P1 issues;
+  the final review returned PASS with no remaining P0/P1.
+- Full Go tests/race/vet, macOS native Keychain, real Chrome acceptance,
+  Windows/Linux/macOS builds, Server enrollment/P1.6/auth/WSS/schema suites and
+  security hardening passed. Target-OS native execution repeats in C8.
