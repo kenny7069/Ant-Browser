@@ -47,3 +47,12 @@ needed for the positive control, runs both ordinary and race acceptance, clears
 its temporary environment, zeroes the prompted password buffer, and removes
 only that unique parent. Retain the command result as the acceptance artifact;
 do not retain environment dumps.
+
+## Hosted runner
+
+The manual `Windows DACL acceptance` GitHub Actions workflow provides the same
+ordinary and race run on `windows-2022`. It creates a uniquely named local
+alternate account using an in-memory random masked password, passes the password
+only through the step process environment, and deletes that exact account in a
+`finally` block. Merely adding the workflow does not satisfy acceptance: retain
+a successful workflow run tied to the tested commit.
