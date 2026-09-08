@@ -105,7 +105,8 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		"chrome_alive_during_execv_handoff", "runtime_process_identity_preserved",
 		"runtime_db_status", "runtime_db_provider", "runtime_db_fencing_epoch",
 		"controller_lease_acquired", "controller_generation", "controller_state",
-		"watcher_adopted_runtime_count", "watcher_controller_failure_type", "node_count",
+		"watcher_adopted_runtime_count", "watcher_reconcile_status",
+		"watcher_controller_failure_type", "node_count",
 		"inventory_dispatch_attempts", "inventory_list_online", "inventory_list_generation",
 		"inventory_auth_binding_generation", "inventory_sample_generation",
 		"inventory_heartbeat_age_ms", "inventory_dispatch_error_type",
@@ -554,7 +555,7 @@ func TestP118HandoffEvidenceParserRejectsContradictions(t *testing.T) {
 func TestP118FailureDiagnosticsAreAllowlisted(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "failure.json")
-	raw := []byte(`{"accepted":false,"failure_stage":"wait_successor_gateway","failure_type":"RuntimeError","scenario":"execv","stage":"production_startup","pid":4242,"boot_nonce":"image-a-nonce","runtime_db_status":"ready","runtime_db_provider":"farm","runtime_db_fencing_epoch":1,"controller_lease_acquired":true,"controller_generation":3,"controller_state":"active","watcher_reconciled":false,"watcher_adopted_runtime_count":0,"watcher_controller_failure_type":"none","node_count":1,"error":"ws://127.0.0.1/private-token","controller_token":"secret"}`)
+	raw := []byte(`{"accepted":false,"failure_stage":"wait_successor_gateway","failure_type":"RuntimeError","scenario":"execv","stage":"production_startup","pid":4242,"boot_nonce":"image-a-nonce","runtime_db_status":"ready","runtime_db_provider":"farm","runtime_db_fencing_epoch":1,"controller_lease_acquired":true,"controller_generation":3,"controller_state":"active","watcher_reconciled":false,"watcher_adopted_runtime_count":0,"watcher_reconcile_status":"reconciled_no_adoption","watcher_controller_failure_type":"none","node_count":1,"error":"ws://127.0.0.1/private-token","controller_token":"secret"}`)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -572,6 +573,7 @@ func TestP118FailureDiagnosticsAreAllowlisted(t *testing.T) {
 		`"controller_lease_acquired":true`, `"controller_generation":3`,
 		`"controller_state":"active"`, `"watcher_reconciled":false`,
 		`"watcher_adopted_runtime_count":0`,
+		`"watcher_reconcile_status":"reconciled_no_adoption"`,
 		`"watcher_controller_failure_type":"none"`, `"node_count":1`,
 	} {
 		if !strings.Contains(diagnostic, expected) {
