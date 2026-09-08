@@ -218,9 +218,9 @@ func p118ScenarioBudgetFor(scenario string) (p118ScenarioBudget, error) {
 		// the Playwright and successor-gateway budgets disabled.
 		return p118ScenarioBudget{serverTimeout: 120 * time.Second}, nil
 	case "db_ready_node_missing":
-		return p118ScenarioBudget{serverTimeout: 120 * time.Second, fixtureTimeout: 120 * time.Second}, nil
+		return p118ScenarioBudget{serverTimeout: 200 * time.Second, fixtureTimeout: 180 * time.Second}, nil
 	case "db_ready_node_missing_race":
-		return p118ScenarioBudget{serverTimeout: 120 * time.Second, fixtureTimeout: 120 * time.Second}, nil
+		return p118ScenarioBudget{serverTimeout: 200 * time.Second, fixtureTimeout: 180 * time.Second}, nil
 	case "config_mismatch_restart":
 		return p118ScenarioBudget{serverTimeout: 180 * time.Second, fixtureTimeout: 180 * time.Second}, nil
 	default:
@@ -267,7 +267,7 @@ func TestP118ScenarioBudgetMapping(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := p118ScenarioBudget{serverTimeout: 120 * time.Second, fixtureTimeout: 120 * time.Second}
+		want := p118ScenarioBudget{serverTimeout: 200 * time.Second, fixtureTimeout: 180 * time.Second}
 		if budget != want {
 			t.Fatalf("node-missing scenario %q budget = %#v, want %#v", scenario, budget, want)
 		}

@@ -527,7 +527,7 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 	publicKey := base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
 	controlDBName := fmt.Sprintf("bf_p118_missing_%x", time.Now().UnixNano())
 
-	serverCtx, cancelServer := context.WithTimeout(context.Background(), 120*time.Second)
+	serverCtx, cancelServer := context.WithTimeout(context.Background(), 200*time.Second)
 	serverArgs := []string{
 		"--scenario", scenario,
 		"--url-file", urlFile,
@@ -545,7 +545,10 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 		"--agent-after-file", agentAfterFile,
 		"--a-state-file", aStateFile,
 		"--b-state-file", bStateFile,
-		"--timeout", "110",
+		// Production missing-node eligibility retains its real 120-second
+		// handoff TTL.  This outer fixture budget adds setup and cleanup margin;
+		// it does not inject a shorter production policy.
+		"--timeout", "180",
 	}
 	serverCommand := exec.CommandContext(serverCtx, "python3", append([]string{fixtureScript}, serverArgs...)...)
 	serverCommand.Env = append(os.Environ(), "SCRAPER_CONTROL_DB_NAME="+controlDBName)
@@ -628,7 +631,7 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 		t.Fatalf("real Agent authenticated connect failed: %v", err)
 	}
 	defer client.Close()
-	fixtureDeadline := time.Now().Add(110 * time.Second)
+	fixtureDeadline := time.Now().Add(190 * time.Second)
 	aState := p118WaitNodeMissingStage(
 		t, aStateFile, serverCommand, "ready_for_node_exit", fixtureDeadline,
 		&serverOutput, evidenceFile, aStateFile, bStateFile,
