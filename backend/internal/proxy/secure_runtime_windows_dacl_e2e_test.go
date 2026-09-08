@@ -5,7 +5,6 @@ package proxy
 import (
 	"crypto/rand"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -166,9 +165,12 @@ func TestSecureRuntimeWindowsDACLE2E(t *testing.T) {
 		t.Fatalf("write outside sentinel: %v", err)
 	}
 	junctionPath := filepath.Join(writer.root, "junction-node")
-	junctionCommand := fmt.Sprintf(`mklink /J "%s" "%s"`, junctionPath, outsideDir)
-	if output, err := exec.Command("cmd.exe", "/d", "/s", "/c", junctionCommand).CombinedOutput(); err != nil {
-		t.Fatalf("create real Windows directory junction: %v (output length %d)", err, len(output))
+	// Pass mklink and each argument separately. A single pre-quoted command
+	// string combined with cmd.exe /S is re-parsed using cmd's special outer-
+	// quote rules and can turn otherwise valid runner temp paths into a syntax
+	// error. None of these arguments or the command output contain credentials.
+	if output, err := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", junctionPath, outsideDir).CombinedOutput(); err != nil {
+		t.Fatalf("create real Windows directory junction: %v: %s", err, strings.TrimSpace(string(output)))
 	}
 	if _, err := writer.runtimeDir("junction-node"); !errors.Is(err, ErrSecureRuntimePath) {
 		t.Fatalf("runtimeDir accepted a Windows junction: %v", err)
