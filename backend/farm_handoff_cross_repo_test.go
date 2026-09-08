@@ -77,6 +77,50 @@ func p118TransportDiagnostic(client *FarmControlWSSClient) string {
 	)
 }
 
+func p118AllowlistedJSONDiagnostic(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "unavailable"
+	}
+	var source map[string]json.RawMessage
+	if json.Unmarshal(raw, &source) != nil {
+		return "invalid_json"
+	}
+	allowed := map[string]json.RawMessage{}
+	for _, key := range []string{
+		"accepted", "control_db_cleanup", "failure_stage", "failure_type",
+		"cleanup_error_type", "old_connection_disconnected", "old_operation_rejected",
+		"marker_preserved", "new_io", "reattached",
+	} {
+		if value, ok := source[key]; ok {
+			allowed[key] = value
+		}
+	}
+	encoded, err := json.Marshal(allowed)
+	if err != nil {
+		return "invalid_allowlisted_json"
+	}
+	return string(encoded)
+}
+
+func p118AllowlistedServerOutput(output string) string {
+	lines := make([]string, 0, 2)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "Controller B failed stage=") {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return "no_allowlisted_diagnostic_lines"
+	}
+	joined := strings.Join(lines, " | ")
+	if len(joined) > 2048 {
+		joined = joined[len(joined)-2048:]
+	}
+	return joined
+}
+
 type p118HandoffIdentity struct {
 	RuntimeUID           string `json:"runtime_uid"`
 	ProcessStartIdentity string `json:"process_start_identity"`
@@ -245,9 +289,32 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	var playwrightOutput bytes.Buffer
 	playwright.Stdout, playwright.Stderr = &playwrightOutput, &playwrightOutput
 	if err := playwright.Run(); err != nil {
+		// Let Controller B observe the atomic done file and let the parent own
+		// its DB cleanup before failing the Go test.  If it does not finish,
+		// explicitly terminate and wait rather than relying on a deferred Kill.
+		select {
+		case <-serverDone:
+			serverFinished = true
+		case <-time.After(10 * time.Second):
+			_ = serverCommand.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-serverDone:
+				serverFinished = true
+			case <-time.After(5 * time.Second):
+				_ = serverCommand.Process.Kill()
+				select {
+				case <-serverDone:
+					serverFinished = true
+				case <-time.After(2 * time.Second):
+				}
+			}
+		}
 		t.Fatalf(
-			"P1.18 Playwright handoff failed: %v output=%s agent_transport={%s}",
-			err, playwrightOutput.String(), p118TransportDiagnostic(client),
+			"P1.18 Playwright handoff failed: error_type=%T done=%s fixture=%s server_output=%s agent_transport={%s}",
+			err, p118AllowlistedJSONDiagnostic(doneFile),
+			p118AllowlistedJSONDiagnostic(evidenceFile),
+			p118AllowlistedServerOutput(serverOutput.String()),
+			p118TransportDiagnostic(client),
 		)
 	}
 	if err := <-serverDone; err != nil {
@@ -411,5 +478,29 @@ func TestP118HandoffEvidenceParserRejectsContradictions(t *testing.T) {
 				t.Fatal("contradictory evidence was accepted")
 			}
 		})
+	}
+}
+
+func TestP118FailureDiagnosticsAreAllowlisted(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "failure.json")
+	raw := []byte(`{"accepted":false,"failure_stage":"wait_successor_gateway","failure_type":"RuntimeError","error":"ws://127.0.0.1/private-token","controller_token":"secret"}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := p118AllowlistedJSONDiagnostic(path)
+	if strings.Contains(diagnostic, "private-token") || strings.Contains(diagnostic, "secret") {
+		t.Fatalf("failure JSON leaked a non-allowlisted value: %s", diagnostic)
+	}
+	if !strings.Contains(diagnostic, `"failure_stage":"wait_successor_gateway"`) {
+		t.Fatalf("failure JSON omitted stage: %s", diagnostic)
+	}
+	serverDiagnostic := p118AllowlistedServerOutput(
+		"sensitive raw failure ws://127.0.0.1/private-token\n" +
+			"RuntimeError: Controller B failed stage=get_runtime_client error_type=FarmRuntimeControlError\n",
+	)
+	if strings.Contains(serverDiagnostic, "private-token") ||
+		!strings.Contains(serverDiagnostic, "stage=get_runtime_client") {
+		t.Fatalf("server diagnostic allowlist failed: %s", serverDiagnostic)
 	}
 }
