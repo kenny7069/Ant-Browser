@@ -18,6 +18,8 @@ func p118ScenarioFixture(scenario string) (string, error) {
 		return "p1_18_reconcile_stop_fixture.py", nil
 	case "db_ready_node_missing", "db_ready_node_missing_race":
 		return "p1_18_node_missing_fixture.py", nil
+	case "config_mismatch_restart":
+		return "p1_18_config_mismatch_fixture.py", nil
 	default:
 		return "", fmt.Errorf("unsupported P1.18 scenario: %q", scenario)
 	}
@@ -33,6 +35,7 @@ func TestP118ScenarioFixtureSelection(t *testing.T) {
 		"unknown_runtime_stop":       "p1_18_reconcile_stop_fixture.py",
 		"db_ready_node_missing":      "p1_18_node_missing_fixture.py",
 		"db_ready_node_missing_race": "p1_18_node_missing_fixture.py",
+		"config_mismatch_restart":    "p1_18_config_mismatch_fixture.py",
 	} {
 		actual, err := p118ScenarioFixture(scenario)
 		if err != nil || actual != expected {

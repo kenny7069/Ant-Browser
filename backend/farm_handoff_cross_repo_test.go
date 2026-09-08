@@ -148,6 +148,22 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		"target_connection_generation_before", "target_connection_generation_after",
 		"target_inventory_complete", "target_inventory_count", "target_inventory_generation",
 		"before", "after",
+		// Config-mismatch evidence is restricted to the authenticated command
+		// projection, owner-scoped hash mutation, and fresh process identity.
+		"controller_a_crashed", "controller_a_exit_signal", "controller_b_started_fresh_process",
+		"runtime_process_identity_observed", "command_observer_installed", "command_observation_count",
+		"reconcile_command_observed", "reconcile_ack_observed", "reconcile_request_identity_match",
+		"reconcile_target_config_match", "reconcile_target_launch_mode_match",
+		"replacement_ack_identity_valid", "replacement_same_node", "replacement_runtime_uid_changed",
+		"replacement_generation_advanced", "replacement_pid_changed", "replacement_process_start_changed",
+		"replacement_profile_incarnation_changed", "old_process_identity_absent", "mutation_applied",
+		"mutation_rowcount", "mutation_owner_scoped", "mutation_after_controller_a_exit",
+		"runtime_db_old_hash_before", "runtime_db_target_hash_after",
+		"replacement_persisted_by_authenticated_telemetry", "replacement_db_row_present",
+		"replacement_db_target_hash", "replacement_db_status", "replacement_db_identity_match",
+		"replacement_agent_inventory_match", "replacement_strict_stop_confirmed", "replacement_exact_adopted",
+		"old_runtime_marked_lost", "replacement_lease_held_by_controller_b", "old_lease_not_successor",
+		"runtime_lease_released", "controller_b_cleanup",
 	} {
 		if value, ok := source[key]; ok {
 			allowed[key] = value
@@ -205,6 +221,8 @@ func p118ScenarioBudgetFor(scenario string) (p118ScenarioBudget, error) {
 		return p118ScenarioBudget{serverTimeout: 120 * time.Second, fixtureTimeout: 120 * time.Second}, nil
 	case "db_ready_node_missing_race":
 		return p118ScenarioBudget{serverTimeout: 120 * time.Second, fixtureTimeout: 120 * time.Second}, nil
+	case "config_mismatch_restart":
+		return p118ScenarioBudget{serverTimeout: 180 * time.Second, fixtureTimeout: 180 * time.Second}, nil
 	default:
 		return p118ScenarioBudget{}, fmt.Errorf("unsupported P1.18 scenario budget: %q", scenario)
 	}
@@ -253,6 +271,14 @@ func TestP118ScenarioBudgetMapping(t *testing.T) {
 		if budget != want {
 			t.Fatalf("node-missing scenario %q budget = %#v, want %#v", scenario, budget, want)
 		}
+	}
+	configMismatch, err := p118ScenarioBudgetFor("config_mismatch_restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantConfigMismatch := p118ScenarioBudget{serverTimeout: 180 * time.Second, fixtureTimeout: 180 * time.Second}
+	if configMismatch != wantConfigMismatch {
+		t.Fatalf("config mismatch budget = %#v, want %#v", configMismatch, wantConfigMismatch)
 	}
 	if _, err := p118ScenarioBudgetFor("unsupported"); err == nil {
 		t.Fatal("unsupported scenario budget was accepted")
@@ -353,6 +379,10 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	scenario := os.Getenv("P118_HANDOFF_SCENARIO")
 	if scenario == "db_ready_node_missing" || scenario == "db_ready_node_missing_race" {
 		runP118NodeMissingScenario(t, scenario)
+		return
+	}
+	if scenario == "config_mismatch_restart" {
+		runP118ConfigMismatchScenario(t, scenario)
 		return
 	}
 	stopScenario := p118StopScenario(scenario)
