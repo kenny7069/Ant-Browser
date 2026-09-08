@@ -31,6 +31,8 @@ const (
 	p118ConfigMismatchScenario = "config_mismatch_restart"
 	p118ConfigMismatchOldHash  = "1111111111111111111111111111111111111111111111111111111111111111"
 	p118ConfigMismatchNewHash  = "2222222222222222222222222222222222222222222222222222222222222222"
+	p118ConfigFixtureTimeout   = 170 * time.Second
+	p118ConfigServerTimeout    = 190 * time.Second
 )
 
 var p118ConfigMismatchEvidenceKeys = map[string]struct{}{
@@ -338,6 +340,12 @@ func TestP118ConfigMismatchEvidenceContract(t *testing.T) {
 	}
 }
 
+func TestP118ConfigMismatchTimeoutHasCleanupMargin(t *testing.T) {
+	if margin := p118ConfigServerTimeout - p118ConfigFixtureTimeout; margin < 15*time.Second {
+		t.Fatalf("config fixture cleanup margin = %s, want at least 15s", margin)
+	}
+}
+
 // runP118ConfigMismatchScenario is the opt-in production cross-repository
 // branch.  It deliberately uses the same real BrowserRuntimeService,
 // FarmRuntimeService, authenticated WSS client, and Chrome setup as the
@@ -376,7 +384,7 @@ func runP118ConfigMismatchScenario(t *testing.T, scenario string) {
 	publicKey := base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
 	controlDBName := fmt.Sprintf("bf_p118_config_%x", time.Now().UnixNano())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), p118ConfigServerTimeout)
 	defer cancel()
 	serverArgs := []string{
 		"--scenario", scenario,
@@ -392,7 +400,7 @@ func runP118ConfigMismatchScenario(t *testing.T, scenario string) {
 		"--controller-b-id", controllerB,
 		"--a-state-file", aStateFile,
 		"--b-state-file", bStateFile,
-		"--timeout", "170",
+		"--timeout", p118TimeoutSeconds(p118ConfigFixtureTimeout),
 	}
 	serverCommand := exec.CommandContext(ctx, "python3", append([]string{fixtureScript}, serverArgs...)...)
 	serverCommand.Env = append(os.Environ(), "SCRAPER_CONTROL_DB_NAME="+controlDBName)
@@ -489,7 +497,7 @@ func runP118ConfigMismatchScenario(t *testing.T, scenario string) {
 		t.Fatalf("real Agent authenticated config-mismatch connect failed: %v", err)
 	}
 	defer client.Close()
-	deadline := time.Now().Add(180 * time.Second)
+	deadline := time.Now().Add(p118ConfigServerTimeout)
 	p118WaitNodeMissingStage(
 		t, aStateFile, serverCommand, "ready_for_parent_sigkill", deadline,
 		&serverOutput, evidenceFile, aStateFile, bStateFile,
