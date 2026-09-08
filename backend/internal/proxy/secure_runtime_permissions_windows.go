@@ -188,11 +188,14 @@ func secureRuntimeCheckOwnerAndMode(path string, infoMode os.FileMode, directory
 		return fmt.Errorf("%w: secure proxy Windows DACL is inheritable", ErrSecureRuntimeAuth)
 	}
 	acl, _, err := sd.DACL()
-	if err != nil || acl == nil || acl.AceCount != 1 {
+	if err != nil || acl == nil {
 		if err != nil {
 			return fmt.Errorf("inspect secure proxy Windows DACL entries: %w", err)
 		}
-		return fmt.Errorf("%w: secure proxy Windows DACL must contain one owner entry", ErrSecureRuntimeAuth)
+		return fmt.Errorf("%w: secure proxy Windows DACL is missing", ErrSecureRuntimeAuth)
+	}
+	if acl.AceCount != 1 {
+		return fmt.Errorf("%w: secure proxy Windows DACL must contain one owner entry (got %d)", ErrSecureRuntimeAuth, acl.AceCount)
 	}
 	var ace *windows.ACCESS_ALLOWED_ACE
 	if err := windows.GetAce(acl, 0, &ace); err != nil || ace == nil {
