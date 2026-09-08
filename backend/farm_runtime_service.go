@@ -1183,7 +1183,15 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 			return FarmRuntime{}, fmt.Errorf("%w: process start identity", ErrFarmRuntimeServiceUnavailable)
 		}
 	}
-	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, processStartIdentity: processStartIdentity, launchMode: launchMode, proxyBinding: cloneFarmRuntimeProxyBinding(request.Proxy), profileCreatedAt: observed.Profile.CreatedAt})
+	record = farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, processStartIdentity: processStartIdentity, launchMode: launchMode, proxyBinding: cloneFarmRuntimeProxyBinding(request.Proxy), profileCreatedAt: observed.Profile.CreatedAt}
+	// Re-project from the same generation/incarnation-fenced BrowserRuntime
+	// snapshot only after the OS process-start identity has been verified.
+	// The earlier projection intentionally could not carry these record-owned
+	// fields and returning it would make the first ensure response weaker than
+	// the immediately following inventory/heartbeat for the same runtime.
+	runtime = farmRuntimeFromSnapshot(record, observed)
+	record.runtime = runtime
+	s.setRecord(profileID, record)
 	if err := s.persistOwnershipProvenance(); err != nil {
 		return FarmRuntime{}, err
 	}
