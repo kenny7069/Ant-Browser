@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -587,6 +588,7 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 		Commands []struct {
 			Command string         `json:"command"`
 			OK      bool           `json:"ok"`
+			Error   string         `json:"error"`
 			Payload map[string]any `json:"payload"`
 		} `json:"commands"`
 	}
@@ -628,21 +630,53 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 		!evidence.Playwright.Reattached {
 		t.Fatalf("P1.14 Playwright infrastructure evidence incomplete: %+v", evidence.Playwright)
 	}
-	want := []string{"ensure_runtime", "open_cdp_tunnel", "open_cdp_tunnel", "stop_runtime"}
-	if len(evidence.Commands) != len(want) {
-		t.Fatalf("P1.14 command count = %d, want %d: %s", len(evidence.Commands), len(want), raw)
+	wantPrefix := []string{"ensure_runtime", "open_cdp_tunnel", "open_cdp_tunnel"}
+	if len(evidence.Commands) != 4 && len(evidence.Commands) != 5 {
+		t.Fatalf("P1.14 command count = %d, want direct stop (4) or one bounded stale retry (5): %s", len(evidence.Commands), raw)
 	}
-	for index, command := range evidence.Commands {
-		if command.Command != want[index] || !command.OK {
-			t.Fatalf("P1.14 command %d = %+v", index, command)
+	for index, wantCommand := range wantPrefix {
+		command := evidence.Commands[index]
+		if command.Command != wantCommand || !command.OK || command.Error != "" || command.Payload == nil {
+			t.Fatalf("P1.14 command %d = %+v, want successful %s", index, command, wantCommand)
+		}
+	}
+	if len(evidence.Commands) == 5 {
+		stale := evidence.Commands[3]
+		if stale.Command != "stop_runtime" || stale.OK || stale.Error != "farm runtime identity is stale" || stale.Payload != nil {
+			t.Fatalf("P1.14 bounded stale stop = %+v", stale)
 		}
 	}
 	ensurePayload := evidence.Commands[0].Payload
+	if ensurePayload["state"] != "idle" || ensurePayload["debug_ready"] != true {
+		t.Fatalf("P1.14 ensure evidence was not ready idle: %+v", ensurePayload)
+	}
+	for index := 1; index <= 2; index++ {
+		if evidence.Commands[index].Payload["ready"] != true {
+			t.Fatalf("P1.14 tunnel command %d was not ready: %+v", index, evidence.Commands[index])
+		}
+	}
 	initialDebugPort, ok := ensurePayload["debug_port"].(float64)
 	if !ok || initialDebugPort <= 0 {
 		t.Fatalf("P1.14 ensure evidence debug_port = %#v", ensurePayload["debug_port"])
 	}
-	stopPayload := evidence.Commands[len(evidence.Commands)-1].Payload
+	stop := evidence.Commands[len(evidence.Commands)-1]
+	if stop.Command != "stop_runtime" || !stop.OK || stop.Error != "" || stop.Payload == nil {
+		t.Fatalf("P1.14 exact stop command = %+v", stop)
+	}
+	stopPayload := stop.Payload
+	identityFields := []string{
+		"node_uid", "profile_id", "runtime_uid", "provider_instance_id",
+		"fencing_epoch", "config_hash", "generation", "controller_id",
+		"controller_generation", "process_start_identity", "profile_incarnation",
+	}
+	for _, field := range identityFields {
+		if !reflect.DeepEqual(stopPayload[field], ensurePayload[field]) {
+			t.Fatalf("P1.14 stop identity %s = %#v, want %#v", field, stopPayload[field], ensurePayload[field])
+		}
+	}
+	if stopPayload["state"] != "stopped" || stopPayload["pid"] != float64(0) {
+		t.Fatalf("P1.14 stop evidence was not stopped: %+v", stopPayload)
+	}
 	if debugPort, ok := stopPayload["debug_port"].(float64); !ok || debugPort != 0 {
 		t.Fatalf("P1.14 stop evidence debug_port = %#v, want 0", stopPayload["debug_port"])
 	}
