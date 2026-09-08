@@ -85,6 +85,7 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	urlFile := filepath.Join(root, "control-wss.url")
 	gatewayFile := filepath.Join(root, "controller-a.gateway.url")
 	reattachRequestFile := filepath.Join(root, "controller-b.reattach.request")
+	oldCDPClosedFile := filepath.Join(root, "controller-a.old-cdp-closed.json")
 	reattachGatewayFile := filepath.Join(root, "controller-b.gateway.url")
 	doneFile := filepath.Join(root, "playwright.done.json")
 	evidenceFile := filepath.Join(root, "p118-evidence.json")
@@ -96,6 +97,7 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	serverCommand := exec.CommandContext(serverCtx, "python3", fixtureScript,
 		"--url-file", urlFile, "--gateway-file", gatewayFile,
 		"--reattach-request-file", reattachRequestFile,
+		"--old-cdp-closed-file", oldCDPClosedFile,
 		"--reattach-gateway-file", reattachGatewayFile,
 		"--done-file", doneFile, "--evidence-file", evidenceFile,
 		"--ca-file", caFile, "--node-uid", nodeUID,
@@ -202,6 +204,7 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	defer cancelPlaywright()
 	playwright := exec.CommandContext(playwrightCtx, "python3", playwrightScript,
 		"--gateway-file", gatewayFile, "--reattach-request-file", reattachRequestFile,
+		"--old-cdp-closed-file", oldCDPClosedFile,
 		"--reattach-gateway-file", reattachGatewayFile, "--done-file", doneFile)
 	var playwrightOutput bytes.Buffer
 	playwright.Stdout, playwright.Stderr = &playwrightOutput, &playwrightOutput
