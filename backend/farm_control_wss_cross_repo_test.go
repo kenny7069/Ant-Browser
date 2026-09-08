@@ -23,6 +23,149 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type p114FixtureProcess struct {
+	command *exec.Cmd
+	done    chan struct{}
+	waitErr error
+}
+
+func startP114FixtureProcess(command *exec.Cmd) (*p114FixtureProcess, error) {
+	if err := command.Start(); err != nil {
+		return nil, err
+	}
+	process := &p114FixtureProcess{command: command, done: make(chan struct{})}
+	go func() {
+		process.waitErr = command.Wait()
+		close(process.done)
+	}()
+	return process, nil
+}
+
+func (process *p114FixtureProcess) wait() error {
+	<-process.done
+	return process.waitErr
+}
+
+func (process *p114FixtureProcess) terminate(grace time.Duration) bool {
+	select {
+	case <-process.done:
+		return true
+	default:
+	}
+	if process.command.Process == nil {
+		return false
+	}
+	// Python turns an interrupt into KeyboardInterrupt, so its finally block can
+	// release the isolated Control DB before a hard-kill fallback is necessary.
+	_ = process.command.Process.Signal(os.Interrupt)
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-process.done:
+		return true
+	case <-timer.C:
+	}
+	_ = process.command.Process.Kill()
+	killTimer := time.NewTimer(grace)
+	defer killTimer.Stop()
+	select {
+	case <-process.done:
+		return true
+	case <-killTimer.C:
+		return false
+	}
+}
+
+func (process *p114FixtureProcess) reaped() bool {
+	select {
+	case <-process.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestP114FixtureProcessConnectFailureCleanup(t *testing.T) {
+	root := t.TempDir()
+	controlDBName := fmt.Sprintf("bf_p114_%x", time.Now().UnixNano())
+	schemaPath := filepath.Join(root, controlDBName)
+	neighborPath := filepath.Join(root, "bf_p114_neighbor_must_survive")
+	if err := os.Mkdir(neighborPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := filepath.Join(root, "fixture.ready")
+	fixtureScript := filepath.Join(root, "connect_failure_fixture.py")
+	const fixtureSource = `import os
+import sys
+import time
+
+schema_path, ready_path, owner = sys.argv[1:]
+owner_path = os.path.join(schema_path, "owner")
+try:
+    os.mkdir(schema_path)
+    with open(owner_path, "w", encoding="utf-8") as handle:
+        handle.write(owner)
+    with open(ready_path, "w", encoding="utf-8") as handle:
+        handle.write("ready")
+    while True:
+        time.sleep(0.05)
+finally:
+    try:
+        with open(owner_path, "r", encoding="utf-8") as handle:
+            owned = handle.read() == owner
+    except OSError:
+        owned = False
+    if owned:
+        os.remove(owner_path)
+        os.rmdir(schema_path)
+`
+	if err := os.WriteFile(fixtureScript, []byte(fixtureSource), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const ownerMarker = "p114-connect-failure-owner"
+	var fixture *p114FixtureProcess
+	connectErr := func() (result error) {
+		command := exec.Command("python3", fixtureScript, schemaPath, readyPath, ownerMarker)
+		var err error
+		fixture, err = startP114FixtureProcess(command)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if !fixture.terminate(3 * time.Second) {
+				result = fmt.Errorf("P1.14 fixture process was not reaped")
+			}
+		}()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if raw, err := os.ReadFile(readyPath); err == nil && string(raw) == "ready" {
+				break
+			}
+			if fixture.reaped() {
+				return fmt.Errorf("P1.14 fixture exited before connect stage")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if raw, err := os.ReadFile(filepath.Join(schemaPath, "owner")); err != nil || string(raw) != ownerMarker {
+			return fmt.Errorf("P1.14 fixture did not create its owned schema marker")
+		}
+		return fmt.Errorf("forced P1.14 connect-stage failure")
+	}()
+	if connectErr == nil || connectErr.Error() != "forced P1.14 connect-stage failure" {
+		t.Fatalf("connect-stage result = %v", connectErr)
+	}
+	if fixture == nil || !fixture.reaped() {
+		t.Fatal("P1.14 fixture process was not reaped after connect-stage failure")
+	}
+	if matches, err := filepath.Glob(schemaPath); err != nil || len(matches) != 0 {
+		t.Fatalf("owned P1.14 schema count = %d, want 0", len(matches))
+	}
+	if _, err := os.Stat(neighborPath); err != nil {
+		t.Fatalf("unowned neighboring schema was changed: %v", err)
+	}
+}
+
 // TestFarmRuntimeP112CrossRepoRealChrome is an explicit cross-repo evidence
 // gate. The default test suite never starts Python, opens a socket, or starts
 // Chrome; operators opt in with P112_CROSS_REPO_REAL_CHROME=1.
@@ -308,12 +451,13 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 	var serverOutput bytes.Buffer
 	serverCommand.Stdout = &serverOutput
 	serverCommand.Stderr = &serverOutput
-	if err := serverCommand.Start(); err != nil {
+	serverProcess, err := startP114FixtureProcess(serverCommand)
+	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		if serverCommand.Process != nil {
-			_ = serverCommand.Process.Kill()
+		if !serverProcess.terminate(5 * time.Second) {
+			t.Errorf("P1.14 Python fixture process was not reaped")
 		}
 	}()
 	var controlURL string
@@ -326,8 +470,6 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if controlURL == "" {
-		_ = serverCommand.Process.Kill()
-		_ = serverCommand.Wait()
 		t.Fatalf("P1.14 Control WSS fixture did not publish URL: %s", serverOutput.String())
 	}
 
@@ -417,7 +559,7 @@ func TestFarmRuntimeP114CrossRepoRealChromeCDPGateway(t *testing.T) {
 		raw, _ := os.ReadFile(doneFile)
 		t.Fatalf("real Playwright.connect_over_cdp failed: %v done=%s output=%s", err, raw, playwrightOutput.String())
 	}
-	if err := serverCommand.Wait(); err != nil {
+	if err := serverProcess.wait(); err != nil {
 		t.Fatalf("P1.14 Python fixture failed: %v output=%s", err, serverOutput.String())
 	}
 	var evidence struct {
