@@ -6,6 +6,31 @@ import (
 	"testing"
 )
 
+func p118ScenarioFixture(scenario string) (string, error) {
+	switch scenario {
+	case "", "graceful":
+		return "p1_18_handoff_fixture.py", nil
+	case "crash_watcher":
+		return "p1_18_crash_watcher_fixture.py", nil
+	default:
+		return "", fmt.Errorf("unsupported P1.18 scenario: %q", scenario)
+	}
+}
+
+func TestP118ScenarioFixtureSelection(t *testing.T) {
+	for scenario, expected := range map[string]string{"": "p1_18_handoff_fixture.py", "graceful": "p1_18_handoff_fixture.py", "crash_watcher": "p1_18_crash_watcher_fixture.py"} {
+		actual, err := p118ScenarioFixture(scenario)
+		if err != nil || actual != expected {
+			t.Fatalf("scenario %q: %q, %v", scenario, actual, err)
+		}
+	}
+	for _, scenario := range []string{"execv", "unknown", "../other.py"} {
+		if _, err := p118ScenarioFixture(scenario); err == nil {
+			t.Fatalf("unimplemented scenario %q accepted", scenario)
+		}
+	}
+}
+
 var p118CrashProofs = []string{
 	"accepted", "control_db_cleanup", "controller_a_crashed", "controller_a_cleanup_skipped",
 	"runtime_created_by_ensure", "runtime_persisted_by_authenticated_telemetry",

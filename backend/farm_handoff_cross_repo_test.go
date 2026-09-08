@@ -147,7 +147,12 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	if serverRepo == "" {
 		serverRepo = "/Users/bot/Desktop/p18-acceptance-docs"
 	}
-	fixtureScript := filepath.Join(serverRepo, "輔助程式", "p1_18_handoff_fixture.py")
+	scenario := os.Getenv("P118_HANDOFF_SCENARIO")
+	fixtureName, err := p118ScenarioFixture(scenario)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureScript := filepath.Join(serverRepo, "輔助程式", fixtureName)
 	playwrightScript := filepath.Join(serverRepo, "輔助程式", "p1_18_playwright_client.py")
 	for _, path := range []string{fixtureScript, playwrightScript} {
 		if _, err := os.Stat(path); err != nil {
@@ -330,7 +335,7 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		)
 	}
 	serverFinished = true
-	assertP118HandoffEvidence(t, evidenceFile)
+	assertP118HandoffEvidence(t, evidenceFile, scenario)
 }
 
 func waitForP118TextFileOrProcess(
@@ -383,13 +388,17 @@ func waitForP118TextFile(t *testing.T, path string, timeout time.Duration, outpu
 	return ""
 }
 
-func assertP118HandoffEvidence(t *testing.T, path string) {
+func assertP118HandoffEvidence(t *testing.T, path, scenario string) {
 	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateP118HandoffEvidence(raw); err != nil {
+	validate := validateP118HandoffEvidence
+	if scenario == "crash_watcher" {
+		validate = validateP118CrashEvidence
+	}
+	if err := validate(raw); err != nil {
 		t.Fatalf("invalid P1.18 handoff evidence: %v evidence=%s", err, raw)
 	}
 }
