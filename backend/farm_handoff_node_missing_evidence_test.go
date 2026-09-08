@@ -353,8 +353,7 @@ func TestP118NodeMissingFixtureTerminationReapsProcessGroup(t *testing.T) {
 		cancel()
 		t.Fatal("fixture child process did not start")
 	}
-	p118TerminateNodeMissingFixture(command, done, cancel)
-	if command.ProcessState == nil || !command.ProcessState.Exited() {
+	if !p118TerminateNodeMissingFixture(command, done, cancel) {
 		t.Fatal("fixture parent process was not reaped")
 	}
 	if err := syscall.Kill(childPID, 0); err == nil {
@@ -460,20 +459,22 @@ func p118FarmProcessIdentity(t *testing.T, farm *FarmRuntimeService, profileID s
 	return identity
 }
 
-func p118TerminateNodeMissingFixture(command *exec.Cmd, done <-chan error, cancel context.CancelFunc) {
+func p118TerminateNodeMissingFixture(command *exec.Cmd, done <-chan error, cancel context.CancelFunc) bool {
 	if cancel != nil {
 		defer cancel()
 	}
 	if command == nil || command.Process == nil {
-		return
+		return false
 	}
-	if command.ProcessState != nil && command.ProcessState.Exited() {
-		return
+	select {
+	case <-done:
+		return true
+	default:
 	}
 	_ = command.Process.Signal(syscall.SIGTERM)
 	select {
 	case <-done:
-		return
+		return true
 	case <-time.After(5 * time.Second):
 	}
 	if cancel != nil {
@@ -487,7 +488,9 @@ func p118TerminateNodeMissingFixture(command *exec.Cmd, done <-chan error, cance
 	_ = command.Process.Kill()
 	select {
 	case <-done:
+		return true
 	case <-time.After(5 * time.Second):
+		return false
 	}
 }
 
@@ -561,7 +564,11 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- serverCommand.Wait() }()
 	serverFinished := false
-	defer p118TerminateNodeMissingFixture(serverCommand, serverDone, cancelServer)
+	defer func() {
+		if !serverFinished {
+			p118TerminateNodeMissingFixture(serverCommand, serverDone, cancelServer)
+		}
+	}()
 	controlURL := waitForP118TextFileOrProcess(t, urlFile, 20*time.Second, &serverOutput, serverDone, &serverFinished, nil, evidenceFile, aStateFile, bStateFile)
 
 	cfg := DefaultConfig()
