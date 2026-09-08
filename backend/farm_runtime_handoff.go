@@ -209,8 +209,15 @@ func (s *FarmRuntimeService) QuarantineRuntime(request FarmRuntimeHandoffRequest
 // closes only that process generation. It never stops another profile or
 // treats a port/PID match as ownership.
 func (s *FarmRuntimeService) StopHandoffRuntime(request FarmRuntimeHandoffRequest) (FarmRuntime, error) {
+	if s == nil {
+		return FarmRuntime{}, ErrFarmRuntimeServiceUnavailable
+	}
 	s.controllerOperationMu.RLock()
 	defer s.controllerOperationMu.RUnlock()
+	return s.stopHandoffRuntimeLocked(request)
+}
+
+func (s *FarmRuntimeService) stopHandoffRuntimeLocked(request FarmRuntimeHandoffRequest) (FarmRuntime, error) {
 	release, err := s.acquire(request.ProfileID)
 	if err != nil {
 		return FarmRuntime{}, err
@@ -248,22 +255,30 @@ func (s *FarmRuntimeService) StopHandoffRuntime(request FarmRuntimeHandoffReques
 // old identity is used only for the strict stop; the replacement receives the
 // target hash/mode and a fresh runtime UID from EnsureRuntime.
 func (s *FarmRuntimeService) ReconcileRuntime(request FarmRuntimeReconcileRequest) (FarmRuntime, error) {
+	if s == nil {
+		return FarmRuntime{}, ErrFarmRuntimeServiceUnavailable
+	}
 	if request.Action != "restart" || strings.TrimSpace(request.TargetConfigHash) == "" || strings.TrimSpace(request.TargetLaunchMode) == "" {
 		return FarmRuntime{}, ErrFarmRuntimeConfigMismatch
 	}
 	if _, err := normalizeFarmRuntimeLaunchMode(request.TargetLaunchMode); err != nil {
 		return FarmRuntime{}, err
 	}
-	if _, err := s.StopHandoffRuntime(request.FarmRuntimeHandoffRequest); err != nil {
+	s.controllerOperationMu.RLock()
+	defer s.controllerOperationMu.RUnlock()
+	if _, err := s.stopHandoffRuntimeLocked(request.FarmRuntimeHandoffRequest); err != nil {
 		return FarmRuntime{}, err
 	}
 	controllerID, controllerGeneration := s.controllerBinding()
 	if controllerID != request.ControllerID || controllerGeneration != request.ControllerGeneration {
 		return FarmRuntime{}, ErrFarmRuntimeStale
 	}
-	return s.EnsureRuntime(FarmRuntimeEnsureRequest{
+	if s.controlledRestartEnsureHook != nil {
+		s.controlledRestartEnsureHook()
+	}
+	return s.ensureRuntimeLocked(FarmRuntimeEnsureRequest{
 		NodeUID: request.NodeUID, ProfileID: request.ProfileID,
 		ProviderInstanceID: request.ProviderInstanceID, FencingEpoch: request.FencingEpoch,
 		ConfigHash: request.TargetConfigHash, LaunchMode: request.TargetLaunchMode,
-	})
+	}, true)
 }

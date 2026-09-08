@@ -482,24 +482,25 @@ type FarmRuntimeService struct {
 	// setter. Lifecycle and CDP side effects hold the read side until their
 	// final generation check and record publication; Rebind takes the write
 	// side so an old controller cannot cross the handoff boundary.
-	controllerOperationMu      sync.RWMutex
-	connectionOperationMu      sync.RWMutex
-	cdpOpenHook                func(stage string)
-	attestationStateProvider   func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
-	proxyBindingVerifier       func(profileID string, binding FarmRuntimeProxyBinding) error
-	proxyRuntimeCleanup        func()
-	resourceTelemetryHooks     *FarmResourceTelemetryHooks
-	connectionMu               sync.Mutex
-	connectionGeneration       uint64
-	activeConnectionGeneration uint64
-	ownershipStore             FarmRuntimeOwnershipStore
-	ownershipMu                sync.Mutex
-	resourceTelemetrySequence  uint64
-	resourceTelemetryMu        sync.Mutex
-	latestResourceSequence     uint64
-	latestResourceObservedAt   string
-	stopRequestHook            func(FarmRuntimeStopRequest)
-	handoffValidationHook      func()
+	controllerOperationMu       sync.RWMutex
+	connectionOperationMu       sync.RWMutex
+	cdpOpenHook                 func(stage string)
+	attestationStateProvider    func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
+	proxyBindingVerifier        func(profileID string, binding FarmRuntimeProxyBinding) error
+	proxyRuntimeCleanup         func()
+	resourceTelemetryHooks      *FarmResourceTelemetryHooks
+	connectionMu                sync.Mutex
+	connectionGeneration        uint64
+	activeConnectionGeneration  uint64
+	ownershipStore              FarmRuntimeOwnershipStore
+	ownershipMu                 sync.Mutex
+	resourceTelemetrySequence   uint64
+	resourceTelemetryMu         sync.Mutex
+	latestResourceSequence      uint64
+	latestResourceObservedAt    string
+	stopRequestHook             func(FarmRuntimeStopRequest)
+	handoffValidationHook       func()
+	controlledRestartEnsureHook func()
 
 	recordsMu sync.RWMutex
 	records   map[string]farmRuntimeRecord
@@ -1022,6 +1023,16 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	}
 	s.controllerOperationMu.RLock()
 	defer s.controllerOperationMu.RUnlock()
+	return s.ensureRuntimeLocked(request, false)
+}
+
+// ensureRuntimeLocked permits a target config transition only for the private
+// controlled-restart path after its exact old process has reached a terminal
+// state. Ordinary ensure calls retain strict config-token equality.
+func (s *FarmRuntimeService) ensureRuntimeLocked(request FarmRuntimeEnsureRequest, allowTerminalConfigReplacement bool) (FarmRuntime, error) {
+	if s == nil {
+		return FarmRuntime{}, ErrFarmRuntimeServiceUnavailable
+	}
 	profileID := strings.TrimSpace(request.ProfileID)
 	if profileID == "" {
 		return FarmRuntime{}, fmt.Errorf("%w: profile id", ErrFarmRuntimeIdentityRequired)
@@ -1083,7 +1094,11 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 		}
 	}
 	if owned {
-		if err := s.validateAgainstRecord(profileID, request.RuntimeUID, request.ProviderInstanceID, request.FencingEpoch, request.ConfigHash, request.Generation, record); err != nil {
+		validationConfigHash := request.ConfigHash
+		if allowTerminalConfigReplacement && request.RuntimeUID == "" && request.Generation == 0 && record.runtime.State == FarmRuntimeStateStopped {
+			validationConfigHash = record.runtime.ConfigHash
+		}
+		if err := s.validateAgainstRecord(profileID, request.RuntimeUID, request.ProviderInstanceID, request.FencingEpoch, validationConfigHash, request.Generation, record); err != nil {
 			return FarmRuntime{}, err
 		}
 		if launchMode != "" && record.launchMode != launchMode &&

@@ -214,3 +214,73 @@ func TestHandoffStopBarrierPreventsControllerRebindTOCTOU(t *testing.T) {
 		t.Fatalf("rebind after stop: %v", err)
 	}
 }
+
+func TestControlledRestartAuthorizesTargetConfigOnlyAfterExactStop(t *testing.T) {
+	farm, old, _ := newProvenRestartFixture(t, true)
+	_, err := farm.ReconcileRuntime(FarmRuntimeReconcileRequest{
+		Action:                    "restart",
+		TargetConfigHash:          "config-b",
+		TargetLaunchMode:          FarmRuntimeLaunchModeDirectNoProxy,
+		FarmRuntimeHandoffRequest: old,
+	})
+	if errors.Is(err, ErrFarmRuntimeConfigMismatch) {
+		t.Fatalf("controlled restart rejected its authoritative target config: %v", err)
+	}
+	if !errors.Is(err, ErrFarmRuntimeServiceUnavailable) {
+		t.Fatalf("controlled restart reached error = %v, want post-stop replacement boundary", err)
+	}
+	record, owned := farm.currentRecord(old.ProfileID)
+	if !owned || record.runtime.State != FarmRuntimeStateStopped || record.runtime.ConfigHash != old.ConfigHash {
+		t.Fatalf("failed replacement changed old authority: owned=%t record=%+v", owned, record.runtime)
+	}
+}
+
+func TestOrdinaryEnsureCannotReplaceStoppedRuntimeConfig(t *testing.T) {
+	farm, old, _ := newProvenRestartFixture(t, true)
+	if _, err := farm.StopHandoffRuntime(old); err != nil {
+		t.Fatalf("strict stop: %v", err)
+	}
+	_, err := farm.EnsureRuntime(FarmRuntimeEnsureRequest{
+		NodeUID: old.NodeUID, ProfileID: old.ProfileID,
+		ProviderInstanceID: old.ProviderInstanceID, FencingEpoch: old.FencingEpoch,
+		ConfigHash: "config-b", LaunchMode: FarmRuntimeLaunchModeDirectNoProxy,
+	})
+	if !errors.Is(err, ErrFarmRuntimeConfigMismatch) {
+		t.Fatalf("ordinary ensure error = %v, want config mismatch", err)
+	}
+}
+
+func TestControlledRestartBlocksControllerRebindThroughTargetLaunch(t *testing.T) {
+	farm, old, _ := newProvenRestartFixture(t, true)
+	beforeEnsure := make(chan struct{})
+	releaseEnsure := make(chan struct{})
+	farm.controlledRestartEnsureHook = func() {
+		close(beforeEnsure)
+		<-releaseEnsure
+	}
+	reconcileDone := make(chan error, 1)
+	go func() {
+		_, err := farm.ReconcileRuntime(FarmRuntimeReconcileRequest{
+			Action:                    "restart",
+			TargetConfigHash:          "config-b",
+			TargetLaunchMode:          FarmRuntimeLaunchModeDirectNoProxy,
+			FarmRuntimeHandoffRequest: old,
+		})
+		reconcileDone <- err
+	}()
+	<-beforeEnsure
+	rebindDone := make(chan error, 1)
+	go func() { rebindDone <- farm.RebindController("controller-next", 6) }()
+	select {
+	case err := <-rebindDone:
+		t.Fatalf("controller rebind crossed controlled restart boundary: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseEnsure)
+	if err := <-reconcileDone; !errors.Is(err, ErrFarmRuntimeServiceUnavailable) {
+		t.Fatalf("controlled restart result = %v", err)
+	}
+	if err := <-rebindDone; err != nil {
+		t.Fatalf("rebind after controlled restart: %v", err)
+	}
+}
