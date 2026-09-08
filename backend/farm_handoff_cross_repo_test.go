@@ -115,6 +115,7 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		"inventory_auth_binding_generation", "inventory_sample_generation",
 		"inventory_heartbeat_age_ms", "inventory_dispatch_error_type",
 		"inventory_response_ok", "inventory_count",
+		"configured_handoff_ttl_seconds", "execv_elapsed_seconds",
 	} {
 		if value, ok := source[key]; ok {
 			allowed[key] = value
@@ -125,6 +126,64 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		return "invalid_allowlisted_json"
 	}
 	return string(encoded)
+}
+
+type p118ScenarioBudget struct {
+	serverTimeout           time.Duration
+	playwrightTimeout       time.Duration
+	fixtureTimeout          time.Duration
+	successorGatewayTimeout time.Duration
+}
+
+func p118ScenarioBudgetFor(scenario string) (p118ScenarioBudget, error) {
+	switch scenario {
+	case "execv":
+		return p118ScenarioBudget{
+			serverTimeout:           210 * time.Second,
+			playwrightTimeout:       180 * time.Second,
+			fixtureTimeout:          180 * time.Second,
+			successorGatewayTimeout: 150 * time.Second,
+		}, nil
+	case "", "graceful", "crash_watcher":
+		// Keep the existing graceful/crash budgets and the Playwright client's
+		// default 20-second successor wait.  These scenarios must not inherit
+		// execv-only command-line overrides.
+		return p118ScenarioBudget{
+			serverTimeout:     120 * time.Second,
+			playwrightTimeout: 60 * time.Second,
+		}, nil
+	default:
+		return p118ScenarioBudget{}, fmt.Errorf("unsupported P1.18 scenario budget: %q", scenario)
+	}
+}
+
+func TestP118ScenarioBudgetMapping(t *testing.T) {
+	execv, err := p118ScenarioBudgetFor("execv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantExecv := p118ScenarioBudget{
+		serverTimeout:           210 * time.Second,
+		playwrightTimeout:       180 * time.Second,
+		fixtureTimeout:          180 * time.Second,
+		successorGatewayTimeout: 150 * time.Second,
+	}
+	if execv != wantExecv {
+		t.Fatalf("execv budget = %#v, want %#v", execv, wantExecv)
+	}
+	for _, scenario := range []string{"", "graceful", "crash_watcher"} {
+		budget, err := p118ScenarioBudgetFor(scenario)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := p118ScenarioBudget{serverTimeout: 120 * time.Second, playwrightTimeout: 60 * time.Second}
+		if budget != want {
+			t.Fatalf("scenario %q budget = %#v, want %#v", scenario, budget, want)
+		}
+	}
+	if _, err := p118ScenarioBudgetFor("unsupported"); err == nil {
+		t.Fatal("unsupported scenario budget was accepted")
+	}
 }
 
 func p118AllowlistedJSONDiagnostics(paths ...string) string {
@@ -222,7 +281,8 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	evidenceFile := filepath.Join(root, "p118-evidence.json")
 	caFile := filepath.Join(root, "p118-ca.pem")
 	publicKey := base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
-	serverCtx, stopServer := context.WithTimeout(context.Background(), 120*time.Second)
+	budgets := p118ScenarioBudgets(scenario)
+	serverCtx, stopServer := context.WithTimeout(context.Background(), budgets.server)
 	defer stopServer()
 	controlDBName := fmt.Sprintf("bf_p118_%x", time.Now().UnixNano())
 	serverCommand := exec.CommandContext(serverCtx, "python3", fixtureScript,
@@ -235,6 +295,9 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		"--public-key", publicKey, "--profile-id", profileID,
 		"--provider-instance-id", providerID, "--fencing-epoch", fmt.Sprint(fencingEpoch),
 		"--controller-a-id", controllerA, "--controller-b-id", controllerB)
+	if budgets.fixtureSeconds > 0 {
+		serverCommand.Args = append(serverCommand.Args, "--timeout", fmt.Sprint(budgets.fixtureSeconds))
+	}
 	serverCommand.Env = append(os.Environ(), "SCRAPER_CONTROL_DB_NAME="+controlDBName)
 	var serverOutput p118SynchronizedBuffer
 	serverCommand.Stdout, serverCommand.Stderr = &serverOutput, &serverOutput
@@ -337,12 +400,15 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	waitForP118TextFileOrProcess(
 		t, gatewayFile, 30*time.Second, &serverOutput, serverDone, &serverFinished, client,
 	)
-	playwrightCtx, cancelPlaywright := context.WithTimeout(context.Background(), 60*time.Second)
+	playwrightCtx, cancelPlaywright := context.WithTimeout(context.Background(), budgets.playwright)
 	defer cancelPlaywright()
 	playwright := exec.CommandContext(playwrightCtx, "python3", playwrightScript,
 		"--gateway-file", gatewayFile, "--reattach-request-file", reattachRequestFile,
 		"--old-cdp-closed-file", oldCDPClosedFile,
 		"--reattach-gateway-file", reattachGatewayFile, "--done-file", doneFile)
+	if budgets.successorSeconds > 0 {
+		playwright.Args = append(playwright.Args, "--successor-gateway-timeout", fmt.Sprint(budgets.successorSeconds))
+	}
 	var playwrightOutput bytes.Buffer
 	playwright.Stdout, playwright.Stderr = &playwrightOutput, &playwrightOutput
 	if err := playwright.Run(); err != nil {
