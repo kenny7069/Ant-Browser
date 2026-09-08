@@ -92,6 +92,20 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		"cleanup_error_type", "old_connection_disconnected", "old_operation_rejected",
 		"marker_preserved", "new_io", "reattached", "child_actor",
 		"reconcile_error_type", "reconcile_outcomes", "running", "actor", "stage",
+		// Crash/execv progress fields are deliberately limited to enum-like
+		// strings, booleans, and counters emitted by the fixtures.  Do not add
+		// capability-bearing tokens or free-form error payloads here.
+		"scenario", "pid", "boot_nonce", "controller_a_execv_requested",
+		"controller_b_started_new_image", "same_pid", "boot_nonce_changed",
+		"controller_pid_before", "controller_pid_after", "boot_nonce_before",
+		"boot_nonce_after", "runtime_created_by_ensure",
+		"runtime_persisted_by_authenticated_telemetry", "runtime_lease_acquired",
+		"initial_cdp_published", "watcher_reconciled", "production_startup_wiring",
+		"production_watcher_started", "runtime_lease_released", "strict_stop_confirmed",
+		"chrome_alive_during_execv_handoff", "runtime_process_identity_preserved",
+		"runtime_db_status", "runtime_db_provider", "runtime_db_fencing_epoch",
+		"controller_lease_acquired", "controller_generation", "controller_state",
+		"watcher_adopted_runtime_count", "watcher_controller_failure_type", "node_count",
 		"inventory_dispatch_attempts", "inventory_list_online", "inventory_list_generation",
 		"inventory_auth_binding_generation", "inventory_sample_generation",
 		"inventory_heartbeat_age_ms", "inventory_dispatch_error_type",
@@ -106,6 +120,28 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		return "invalid_allowlisted_json"
 	}
 	return string(encoded)
+}
+
+func p118AllowlistedJSONDiagnostics(paths ...string) string {
+	parts := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		diagnostic := p118AllowlistedJSONDiagnostic(path)
+		if diagnostic == "unavailable" {
+			continue
+		}
+		parts = append(parts, filepath.Base(path)+"="+diagnostic)
+	}
+	if len(parts) == 0 {
+		return "unavailable"
+	}
+	joined := strings.Join(parts, " | ")
+	if len(joined) > 4096 {
+		joined = joined[:4096]
+	}
+	return joined
 }
 
 func p118AllowlistedServerOutput(output string) string {
@@ -218,7 +254,13 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 			}
 		}
 	}()
-	controlURL := waitForP118TextFile(t, urlFile, 20*time.Second, &serverOutput)
+	controlURL := waitForP118TextFile(
+		t, urlFile, 20*time.Second, &serverOutput,
+		evidenceFile,
+		evidenceFile+".controller-a-progress.json",
+		evidenceFile+".controller-b-progress.json",
+		evidenceFile+".execv-phase.json",
+	)
 
 	cfg := DefaultConfig()
 	cfg.Browser.UserDataRoot = filepath.Join(root, "profiles")
@@ -375,7 +417,13 @@ func waitForP118TextFileOrProcess(
 	}
 }
 
-func waitForP118TextFile(t *testing.T, path string, timeout time.Duration, output *p118SynchronizedBuffer) string {
+func waitForP118TextFile(
+	t *testing.T,
+	path string,
+	timeout time.Duration,
+	output *p118SynchronizedBuffer,
+	diagnosticPaths ...string,
+) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -384,7 +432,10 @@ func waitForP118TextFile(t *testing.T, path string, timeout time.Duration, outpu
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("P1.18 fixture did not publish %s: %s", filepath.Base(path), output.String())
+	t.Fatalf(
+		"P1.18 fixture did not publish %s: %s diagnostics=%s",
+		filepath.Base(path), output.String(), p118AllowlistedJSONDiagnostics(diagnosticPaths...),
+	)
 	return ""
 }
 
@@ -500,7 +551,7 @@ func TestP118HandoffEvidenceParserRejectsContradictions(t *testing.T) {
 func TestP118FailureDiagnosticsAreAllowlisted(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "failure.json")
-	raw := []byte(`{"accepted":false,"failure_stage":"wait_successor_gateway","failure_type":"RuntimeError","error":"ws://127.0.0.1/private-token","controller_token":"secret"}`)
+	raw := []byte(`{"accepted":false,"failure_stage":"wait_successor_gateway","failure_type":"RuntimeError","scenario":"execv","stage":"production_startup","pid":4242,"boot_nonce":"image-a-nonce","runtime_db_status":"ready","runtime_db_provider":"farm","runtime_db_fencing_epoch":1,"controller_lease_acquired":true,"controller_generation":3,"controller_state":"active","watcher_reconciled":false,"watcher_adopted_runtime_count":0,"watcher_controller_failure_type":"none","node_count":1,"error":"ws://127.0.0.1/private-token","controller_token":"secret"}`)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -510,6 +561,25 @@ func TestP118FailureDiagnosticsAreAllowlisted(t *testing.T) {
 	}
 	if !strings.Contains(diagnostic, `"failure_stage":"wait_successor_gateway"`) {
 		t.Fatalf("failure JSON omitted stage: %s", diagnostic)
+	}
+	for _, expected := range []string{
+		`"scenario":"execv"`, `"stage":"production_startup"`, `"pid":4242`,
+		`"boot_nonce":"image-a-nonce"`, `"runtime_db_status":"ready"`,
+		`"runtime_db_provider":"farm"`, `"runtime_db_fencing_epoch":1`,
+		`"controller_lease_acquired":true`, `"controller_generation":3`,
+		`"controller_state":"active"`, `"watcher_reconciled":false`,
+		`"watcher_adopted_runtime_count":0`,
+		`"watcher_controller_failure_type":"none"`, `"node_count":1`,
+	} {
+		if !strings.Contains(diagnostic, expected) {
+			t.Fatalf("failure JSON omitted bounded fixture field %s: %s", expected, diagnostic)
+		}
+	}
+
+	pathsDiagnostic := p118AllowlistedJSONDiagnostics(path, filepath.Join(directory, "missing.json"))
+	if !strings.Contains(pathsDiagnostic, filepath.Base(path)+"=") ||
+		strings.Contains(pathsDiagnostic, "missing.json") {
+		t.Fatalf("bounded diagnostics included unavailable path or omitted evidence: %s", pathsDiagnostic)
 	}
 	serverDiagnostic := p118AllowlistedServerOutput(
 		"sensitive raw failure ws://127.0.0.1/private-token\n" +
