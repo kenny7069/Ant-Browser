@@ -656,15 +656,18 @@ func runP118NodeMissingScenario(t *testing.T, scenario string) {
 		replacementClient, err = NewFarmControlWSSClient(FarmControlWSSClientConfig{
 			URL: strings.TrimSpace(string(bURLRaw)), NodeUID: nodeUID, PrivateKey: privateKey,
 			HandshakeTimeout: 5 * time.Second, CommandTimeout: 15 * time.Second,
-			HeartbeatInterval: 200 * time.Millisecond, AutoReconnect: false,
+			HeartbeatInterval: 200 * time.Millisecond,
+			AutoReconnect:     true, ReconnectMinBackoff: 50 * time.Millisecond, ReconnectMaxBackoff: time.Second,
 			Dialer: &websocket.Dialer{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}},
 		}, adapter)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := replacementClient.Connect(nil); err != nil {
-			t.Fatalf("real Agent N+1 reconnect failed: %v", err)
-		}
+		// The stale Controller A lease can still reject the first handshake.
+		// A real Agent keeps reconnecting; require the later authenticated
+		// generation barrier rather than treating that transient refusal as a
+		// completed race result.
+		_ = replacementClient.Connect(nil)
 		defer replacementClient.Close()
 		p118WaitNodeMissingStage(
 			t, bStateFile, serverCommand, "race_generation_ready", fixtureDeadline,
