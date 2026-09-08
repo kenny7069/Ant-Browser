@@ -1776,6 +1776,48 @@ func (s *BrowserRuntimeService) RuntimeSnapshot(profileID string) (*BrowserRunti
 	}, nil
 }
 
+// RestoreProvenRuntimeIdentity reinstates the in-memory lifecycle identity
+// only after the Farm layer has authenticated durable ownership provenance and
+// revalidated the live OS process. It never performs detection or infers
+// ownership from Running/PID/debug-port alone.
+func (s *BrowserRuntimeService) RestoreProvenRuntimeIdentity(profileID string, generation uint64, pid, debugPort int, profileCreatedAt string) (string, error) {
+	profileID = strings.TrimSpace(profileID)
+	if s == nil || profileID == "" || generation == 0 || pid <= 0 || debugPort <= 0 || strings.TrimSpace(profileCreatedAt) == "" {
+		return "", ErrBrowserRuntimeProfileMismatch
+	}
+	release, err := s.acquire(profileID)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	manager := s.Manager()
+	if manager == nil {
+		return "", fmt.Errorf("browser manager is not initialized")
+	}
+	manager.Mutex.Lock()
+	profile := manager.Profiles[profileID]
+	if profile == nil || !profile.Running || !profile.DebugReady || profile.Pid != pid || profile.DebugPort != debugPort || profile.CreatedAt != profileCreatedAt {
+		manager.Mutex.Unlock()
+		return "", ErrBrowserRuntimeProfileMismatch
+	}
+	incarnation := s.profileIncarnationLocked(profileID, profile)
+	tracked := manager.BrowserProcesses[profileID]
+	s.identityMu.Lock()
+	current := s.active[profileID]
+	if current.generation != 0 && (current.generation != generation || current.profile != profile || current.pid != pid || current.debugPort != debugPort) {
+		s.identityMu.Unlock()
+		manager.Mutex.Unlock()
+		return "", ErrBrowserRuntimeGenerationMismatch
+	}
+	if s.nextGen[profileID] < generation {
+		s.nextGen[profileID] = generation
+	}
+	s.active[profileID] = browserRuntimeIdentity{generation: generation, pid: pid, debugPort: debugPort, cmd: tracked, profile: profile}
+	s.identityMu.Unlock()
+	manager.Mutex.Unlock()
+	return incarnation, nil
+}
+
 // profileIncarnationLocked returns an opaque token for the current Manager
 // profile pointer. The caller holds Manager.Mutex so the pointer and token are
 // observed as one snapshot. A random token prevents callers from fabricating
@@ -1821,6 +1863,48 @@ func (s *BrowserRuntimeService) StopIfGeneration(profileID string, generation ui
 		if current := s.Generation(profileID); current != generation {
 			profile, err := s.currentProfileSnapshotResult(profileID, nil)
 			return profile, errors.Join(err, fmt.Errorf("%w: expected %d, current %d", ErrBrowserRuntimeGenerationMismatch, generation, current))
+		}
+		return s.stopLocked(host, profileID)
+	})
+}
+
+// StopIfIdentity is the destructive Farm handoff boundary.  Unlike the
+// compatibility StopIfGeneration entrypoint, it revalidates the Manager entry,
+// opaque profile incarnation and OS process-start identity while holding the
+// BrowserRuntimeService per-profile gate.  This prevents a recovered browser's
+// PID/debug port from becoming authority to stop a replacement process.
+func (s *BrowserRuntimeService) StopIfIdentity(profileID string, generation uint64, profileIncarnation string, pid int, processStartIdentity string) (*browser.Profile, error) {
+	profileID = strings.TrimSpace(profileID)
+	profileIncarnation = strings.TrimSpace(profileIncarnation)
+	processStartIdentity = strings.TrimSpace(processStartIdentity)
+	if generation == 0 || profileIncarnation == "" || pid <= 0 || processStartIdentity == "" {
+		return nil, fmt.Errorf("%w: complete runtime identity is required", ErrBrowserRuntimeGenerationMismatch)
+	}
+	return s.withProfileResult(profileID, func(host BrowserRuntimeHost) (*browser.Profile, error) {
+		if current := s.Generation(profileID); current != generation {
+			profile, err := s.currentProfileSnapshotResult(profileID, nil)
+			return profile, errors.Join(err, fmt.Errorf("%w: expected %d, current %d", ErrBrowserRuntimeGenerationMismatch, generation, current))
+		}
+		manager := s.Manager()
+		if manager == nil {
+			return nil, fmt.Errorf("browser manager is not initialized")
+		}
+		manager.Mutex.Lock()
+		profile := manager.Profiles[profileID]
+		if profile == nil {
+			manager.Mutex.Unlock()
+			return nil, fmt.Errorf("profile not found")
+		}
+		incarnation := s.profileIncarnationLocked(profileID, profile)
+		currentPID := profile.Pid
+		snapshot := copyBrowserProfileSnapshot(profile)
+		manager.Mutex.Unlock()
+		if incarnation != profileIncarnation || currentPID != pid {
+			return snapshot, fmt.Errorf("%w: profile/process incarnation changed", ErrBrowserRuntimeProfileMismatch)
+		}
+		currentStartIdentity, err := defaultProcessStartIdentity(pid)
+		if err != nil || currentStartIdentity == "" || currentStartIdentity != processStartIdentity {
+			return snapshot, fmt.Errorf("%w: process start identity changed", ErrBrowserRuntimeProfileMismatch)
 		}
 		return s.stopLocked(host, profileID)
 	})

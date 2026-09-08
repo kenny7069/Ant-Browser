@@ -83,7 +83,7 @@ func TestFarmControlWSSClientAuthenticatesAndDispatchesSharedAdapter(t *testing.
 			serverDone <- fmt.Errorf("invalid challenge signature")
 			return
 		}
-		if err := connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: "node-test"}); err != nil {
+		if err := connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: "node-test", ControllerID: "controller-test", ControllerGeneration: 1}); err != nil {
 			serverDone <- err
 			return
 		}
@@ -148,7 +148,7 @@ func TestFarmControlWSSClientRejectsContradictoryNodeAndOversize(t *testing.T) {
 				if connection.ReadJSON(&prove) != nil {
 					return
 				}
-				_ = connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: "node-test"})
+				_ = connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: "node-test", ControllerID: "controller-test", ControllerGeneration: 1})
 				if err := connection.WriteMessage(websocket.TextMessage, test.message()); err != nil {
 					t.Logf("server write: %v", err)
 				}
@@ -186,7 +186,7 @@ func TestFarmControlWSSClientMutationSensitiveEnvelopeRejectsDuplicateKeys(t *te
 		if connection.ReadJSON(&prove) != nil {
 			return
 		}
-		_ = connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: "node-test"})
+		_ = connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: "node-test", ControllerID: "controller-test", ControllerGeneration: 1})
 		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"command","node_uid":"node-test","correlation_id":"x","correlation_id":"y","command":"inventory","payload":{}}`))
 		assertFarmControlPeerCloses(t, connection)
 	})
@@ -240,7 +240,7 @@ func farmControlTestHandshake(connection *websocket.Conn) error {
 	if err := connection.ReadJSON(&prove); err != nil {
 		return err
 	}
-	return connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: "node-test"})
+	return connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: "node-test", ControllerID: "controller-test", ControllerGeneration: 1})
 }
 
 func TestFarmControlWSSClientCancelAndCloseRace(t *testing.T) {
@@ -325,20 +325,22 @@ func TestFarmControlWSSClientHeartbeatTimeout(t *testing.T) {
 
 func TestFarmControlWSSClientCommandTimeoutDiscardsLateResponse(t *testing.T) {
 	peerDone := make(chan struct{})
+	sendCommand := make(chan struct{})
 	client, server := newFarmControlTestClient(t, func(connection *websocket.Conn, _ ed25519.PublicKey) {
 		defer close(peerDone)
 		defer connection.Close()
 		_ = farmControlTestHandshake(connection)
+		<-sendCommand
 		_ = connection.WriteJSON(FarmRuntimeCommand{Type: "command", NodeUID: "node-test", CorrelationID: "blocked", Command: "inventory", Payload: map[string]any{}})
 		assertFarmControlPeerCloses(t, connection)
 	})
 	defer server.Close()
 	client.config.CommandTimeout = 40 * time.Millisecond
-	client.adapter.service.recordsMu.Lock()
 	if err := client.Connect(nil); err != nil {
-		client.adapter.service.recordsMu.Unlock()
 		t.Fatal(err)
 	}
+	client.adapter.service.recordsMu.Lock()
+	close(sendCommand)
 	select {
 	case <-client.Done():
 	case <-time.After(time.Second):

@@ -58,6 +58,7 @@ type FarmRuntimeResourceTelemetry struct {
 	ProviderInstanceID   string `json:"provider_instance_id"`
 	FencingEpoch         uint64 `json:"fencing_epoch"`
 	Generation           uint64 `json:"generation"`
+	ConfigHash           string `json:"config_hash"`
 	ControllerID         string `json:"controller_id"`
 	ControllerGeneration uint64 `json:"controller_generation"`
 	PID                  int    `json:"pid"`
@@ -81,6 +82,7 @@ type FarmResourceTelemetry struct {
 	FencingEpoch         uint64                         `json:"fencing_epoch"`
 	ControllerID         string                         `json:"controller_id"`
 	ControllerGeneration uint64                         `json:"controller_generation"`
+	ConnectionGeneration uint64                         `json:"connection_generation"`
 	SampleSequence       uint64                         `json:"sample_sequence"`
 	ObservedAt           string                         `json:"observed_at"`
 	ControlRTTMS         float64                        `json:"control_rtt_ms,omitempty"`
@@ -326,6 +328,10 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 	if s == nil {
 		return FarmResourceTelemetry{}, ErrFarmRuntimeServiceUnavailable
 	}
+	s.controllerOperationMu.RLock()
+	defer s.controllerOperationMu.RUnlock()
+	controllerID, controllerGeneration := s.controllerBinding()
+	connectionGeneration := s.ConnectionGeneration()
 	if math.IsNaN(controlRTTMS) || math.IsInf(controlRTTMS, 0) || controlRTTMS < 0 {
 		controlRTTMS = -1
 	}
@@ -401,7 +407,8 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 			RuntimeUID: record.runtime.RuntimeUID, Provider: "farm",
 			ProviderInstanceID: s.providerInstance, FencingEpoch: s.fencingEpoch,
 			Generation:   record.runtime.Generation,
-			ControllerID: s.controllerID, ControllerGeneration: s.controllerGeneration,
+			ConfigHash:   record.runtime.ConfigHash,
+			ControllerID: controllerID, ControllerGeneration: controllerGeneration,
 			PID: pid, ProcessStartIdentity: processStartIdentity, ProfileIncarnation: profileIncarnation,
 			RSSMB: rss, RSSValid: rssValid, State: record.runtime.State,
 			Health: memory.Health, ObservedAt: now.Format(time.RFC3339Nano),
@@ -411,8 +418,9 @@ func (s *FarmRuntimeService) ResourceTelemetry(controlRTTMS float64) (FarmResour
 	telemetry := FarmResourceTelemetry{
 		Version: FarmResourceTelemetryVersion, NodeUID: s.nodeUID,
 		Provider: "farm", ProviderInstanceID: s.providerInstance,
-		FencingEpoch: s.fencingEpoch, ControllerID: s.controllerID,
-		ControllerGeneration: s.controllerGeneration, SampleSequence: sequence,
+		FencingEpoch: s.fencingEpoch, ControllerID: controllerID,
+		ControllerGeneration: controllerGeneration,
+		ConnectionGeneration: connectionGeneration, SampleSequence: sequence,
 		ObservedAt:   now.Format(time.RFC3339Nano),
 		ControlRTTMS: 0, RTTClass: FarmRTTUnknownClass,
 		NodeMemory: memory, Runtimes: runtimes,

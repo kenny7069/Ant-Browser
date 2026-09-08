@@ -78,8 +78,9 @@ func (s *FarmRuntimeService) validateCDPRequest(request FarmCDPTunnelRequest) (f
 	if identity.NodeUID == "" || identity.ProfileID == "" || identity.RuntimeUID == "" || identity.ProviderInstanceID == "" || identity.ConfigHash == "" || identity.FencingEpoch == 0 || identity.Generation == 0 {
 		return farmRuntimeRecord{}, ErrFarmCDPIdentity
 	}
-	if s.controllerID != "" {
-		if identity.ControllerID != s.controllerID || identity.ControllerGeneration != s.controllerGeneration || identity.ControllerGeneration == 0 {
+	controllerID, controllerGeneration := s.controllerBinding()
+	if controllerID != "" {
+		if identity.ControllerID != controllerID || identity.ControllerGeneration != controllerGeneration || identity.ControllerGeneration == 0 {
 			return farmRuntimeRecord{}, ErrFarmCDPIdentity
 		}
 	} else if identity.ControllerID != "" || identity.ControllerGeneration != 0 {
@@ -108,6 +109,8 @@ func (s *FarmRuntimeService) OpenCDPTunnel(request FarmCDPTunnelRequest) (*webso
 	if s == nil {
 		return nil, ErrFarmRuntimeServiceUnavailable
 	}
+	s.controllerOperationMu.RLock()
+	defer s.controllerOperationMu.RUnlock()
 	if err := request.validate(); err != nil {
 		return nil, err
 	}

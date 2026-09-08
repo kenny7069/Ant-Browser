@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +53,11 @@ type FarmControlWSSClientConfig struct {
 	CommandTimeout    time.Duration
 	HeartbeatInterval time.Duration
 	MaxMessageBytes   int
+	// AutoReconnect keeps the authenticated Agent process alive across a
+	// controller/WSS restart. It is opt-in for the one-shot P1.12 contract.
+	AutoReconnect       bool
+	ReconnectMinBackoff time.Duration
+	ReconnectMaxBackoff time.Duration
 }
 
 type FarmControlWSSClient struct {
@@ -70,6 +76,8 @@ type FarmControlWSSClient struct {
 	cancel             context.CancelFunc
 	writeMu            sync.Mutex
 	commandSlots       chan struct{}
+	reconnectNotify    chan struct{}
+	supervisorOnce     sync.Once
 	cdpMu              sync.Mutex
 	cdpSessions        map[string]*farmControlCDPSession
 	lastHeartbeatAck   time.Time
@@ -77,6 +85,8 @@ type FarmControlWSSClient struct {
 	heartbeatTelemetry map[string]FarmResourceTelemetry
 	lastControlRTT     time.Duration
 	heartbeatSeq       uint64
+	connectionCancel   context.CancelFunc
+	connectionFence    uint64
 }
 
 // NewFarmControlWSSClient constructs the production agent transport without
@@ -122,6 +132,15 @@ func NewFarmControlWSSClient(config FarmControlWSSClientConfig, adapter *FarmRun
 	if config.MaxMessageBytes <= 0 || config.MaxMessageBytes > maxFarmControlMessageBytes {
 		config.MaxMessageBytes = maxFarmControlMessageBytes
 	}
+	if config.ReconnectMinBackoff <= 0 {
+		config.ReconnectMinBackoff = 250 * time.Millisecond
+	}
+	if config.ReconnectMaxBackoff <= 0 {
+		config.ReconnectMaxBackoff = 10 * time.Second
+	}
+	if config.ReconnectMinBackoff > config.ReconnectMaxBackoff || config.ReconnectMaxBackoff > 120*time.Second {
+		return nil, fmt.Errorf("%w: reconnect backoff invalid", ErrFarmControlWSSProtocol)
+	}
 	if config.HandshakeTimeout > 120*time.Second || config.CommandTimeout > 120*time.Second || config.HeartbeatInterval > 60*time.Second {
 		return nil, fmt.Errorf("%w: timeout exceeds limit", ErrFarmControlWSSProtocol)
 	}
@@ -129,8 +148,9 @@ func NewFarmControlWSSClient(config FarmControlWSSClientConfig, adapter *FarmRun
 	return &FarmControlWSSClient{
 		config: config, adapter: adapter, private: privateKey,
 		done: make(chan struct{}), ctx: ctx, cancel: cancel, commandSlots: make(chan struct{}, 16),
-		cdpSessions:   make(map[string]*farmControlCDPSession),
-		heartbeatSent: make(map[string]time.Time),
+		reconnectNotify: make(chan struct{}, 1),
+		cdpSessions:     make(map[string]*farmControlCDPSession),
+		heartbeatSent:   make(map[string]time.Time),
 	}, nil
 }
 
@@ -157,8 +177,10 @@ type farmControlAuthProve struct {
 }
 
 type farmControlAuthenticated struct {
-	Type    string `json:"type"`
-	NodeUID string `json:"node_uid"`
+	Type                 string `json:"type"`
+	NodeUID              string `json:"node_uid"`
+	ControllerID         string `json:"controller_id"`
+	ControllerGeneration uint64 `json:"controller_generation"`
 }
 
 type farmControlHeartbeat struct {
@@ -248,9 +270,17 @@ func (c *FarmControlWSSClient) readHandshake(conn *websocket.Conn, target any) e
 }
 
 // Connect performs the actual P1.6 challenge/prove exchange, then starts one
-// reader and one heartbeat loop. No command is considered dispatched until
-// the server has returned the authenticated acknowledgement.
+// reader and one heartbeat loop. When AutoReconnect is enabled, transport
+// loss starts a bounded reconnect supervisor while Chrome/CDP process state
+// remains owned by the Agent.
 func (c *FarmControlWSSClient) Connect(ctx context.Context) error {
+	if c.config.AutoReconnect {
+		c.startReconnectSupervisor()
+	}
+	return c.connectOnce(ctx)
+}
+
+func (c *FarmControlWSSClient) connectOnce(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed || c.connecting {
 		c.mu.Unlock()
@@ -258,6 +288,11 @@ func (c *FarmControlWSSClient) Connect(ctx context.Context) error {
 	}
 	c.connecting = true
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.connecting = false
+		c.mu.Unlock()
+	}()
 	dialer := *websocket.DefaultDialer
 	if c.config.Dialer != nil {
 		dialer = *c.config.Dialer
@@ -320,7 +355,7 @@ func (c *FarmControlWSSClient) Connect(ctx context.Context) error {
 		return err
 	}
 	var authenticated farmControlAuthenticated
-	if err := c.readHandshake(conn, &authenticated); err != nil || authenticated.Type != "authenticated" || authenticated.NodeUID != c.config.NodeUID {
+	if err := c.readHandshake(conn, &authenticated); err != nil || authenticated.Type != "authenticated" || authenticated.NodeUID != c.config.NodeUID || strings.TrimSpace(authenticated.ControllerID) == "" || authenticated.ControllerGeneration == 0 {
 		_ = conn.Close()
 		if err == nil {
 			err = ErrFarmControlWSSAuth
@@ -333,9 +368,18 @@ func (c *FarmControlWSSClient) Connect(ctx context.Context) error {
 		c.fail(err)
 		return err
 	}
+	connectionFence, err := c.adapter.BeginAuthenticatedControlConnection(authenticated.ControllerID, authenticated.ControllerGeneration)
+	if err != nil {
+		_ = conn.Close()
+		c.fail(err)
+		return err
+	}
+	connectionCtx, cancelConnection := context.WithCancel(c.ctx)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		cancelConnection()
+		c.adapter.EndControlConnection(connectionFence)
 		_ = conn.Close()
 		return ErrFarmControlWSSClosed
 	}
@@ -344,20 +388,124 @@ func (c *FarmControlWSSClient) Connect(ctx context.Context) error {
 	c.lastControlRTT = 0
 	c.heartbeatSent = make(map[string]time.Time)
 	c.heartbeatTelemetry = make(map[string]FarmResourceTelemetry)
+	c.connectionCancel = cancelConnection
+	c.connectionFence = connectionFence
 	c.mu.Unlock()
-	go c.readLoop(conn)
+	go c.readLoop(conn, connectionCtx, connectionFence)
 	go c.heartbeatLoop(conn)
 	return nil
 }
 
-func (c *FarmControlWSSClient) fail(err error) { c.shutdown(err) }
+func (c *FarmControlWSSClient) startReconnectSupervisor() {
+	c.supervisorOnce.Do(func() {
+		go c.reconnectLoop()
+	})
+}
+
+func (c *FarmControlWSSClient) reconnectLoop() {
+	for {
+		select {
+		case <-c.reconnectNotify:
+		case <-c.done:
+			return
+		case <-c.ctx.Done():
+			return
+		}
+		backoff := c.config.ReconnectMinBackoff
+		for {
+			c.mu.Lock()
+			closed, connected, connecting := c.closed, c.conn != nil, c.connecting
+			c.mu.Unlock()
+			if closed || connected || connecting {
+				break
+			}
+			if err := c.connectOnce(c.ctx); err == nil {
+				break
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-c.done:
+				timer.Stop()
+				return
+			case <-c.ctx.Done():
+				timer.Stop()
+				return
+			}
+			backoff *= 2
+			if backoff > c.config.ReconnectMaxBackoff {
+				backoff = c.config.ReconnectMaxBackoff
+			}
+		}
+	}
+}
+
+func (c *FarmControlWSSClient) notifyReconnect() {
+	if !c.config.AutoReconnect {
+		return
+	}
+	select {
+	case c.reconnectNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (c *FarmControlWSSClient) fail(err error) {
+	if c.config.AutoReconnect {
+		c.transportFailure(nil, err)
+		return
+	}
+	c.shutdown(err)
+}
+
+func (c *FarmControlWSSClient) transportFailure(conn *websocket.Conn, err error) {
+	if !c.config.AutoReconnect {
+		c.shutdown(err)
+		return
+	}
+	c.mu.Lock()
+	if c.closed || (conn != nil && c.conn != conn) {
+		c.mu.Unlock()
+		return
+	}
+	active := c.conn
+	cancelConnection := c.connectionCancel
+	connectionFence := c.connectionFence
+	c.conn = nil
+	c.connectionCancel = nil
+	c.connectionFence = 0
+	c.connecting = false
+	if err != nil {
+		c.closeErr = err
+	}
+	c.mu.Unlock()
+	if cancelConnection != nil {
+		cancelConnection()
+	}
+	c.adapter.EndControlConnection(connectionFence)
+	c.closeCDPSessions()
+	if active != nil {
+		_ = active.Close()
+	}
+	c.notifyReconnect()
+}
 
 func (c *FarmControlWSSClient) shutdown(err error) {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed, c.closeErr = true, err
 		conn := c.conn
+		cancelConnection := c.connectionCancel
+		connectionFence := c.connectionFence
+		c.conn = nil
+		c.connectionCancel = nil
+		c.connectionFence = 0
+		c.connecting = false
 		c.mu.Unlock()
+		if cancelConnection != nil {
+			cancelConnection()
+		}
+		c.adapter.EndControlConnection(connectionFence)
 		c.closeCDPSessions()
 		c.cancel()
 		if conn != nil {
@@ -375,13 +523,15 @@ func (c *FarmControlWSSClient) shutdown(err error) {
 	})
 }
 
-func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn) {
-	defer c.shutdown(ErrFarmControlWSSClosed)
+func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn, connectionCtx context.Context, connectionFence uint64) {
+	defer c.transportFailure(conn, ErrFarmControlWSSClosed)
 	for {
 		messageType, raw, err := conn.ReadMessage()
 		if err != nil {
 			if errors.Is(err, websocket.ErrReadLimit) {
 				c.shutdown(ErrFarmControlWSSMessageLimit)
+			} else {
+				c.transportFailure(conn, ErrFarmControlWSSClosed)
 			}
 			return
 		}
@@ -432,7 +582,7 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn) {
 			}
 			select {
 			case c.commandSlots <- struct{}{}:
-			case <-c.ctx.Done():
+			case <-connectionCtx.Done():
 				return
 			default:
 				c.shutdown(ErrFarmControlWSSProtocol)
@@ -445,7 +595,12 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn) {
 					// opened only after the shared runtime service proves current
 					// ownership; the helper sends the compact command response
 					// after the outbound tunnel receives its ready handshake.
-					c.handleOpenCDPCommand(conn, command)
+					service := c.adapter.service
+					service.connectionOperationMu.RLock()
+					if connectionCtx.Err() == nil && service.connectionIsCurrent(connectionFence) {
+						c.handleOpenCDPCommand(conn, command)
+					}
+					service.connectionOperationMu.RUnlock()
 					return
 				}
 				// Runtime calls retain their existing service ownership/bounds.
@@ -453,21 +608,21 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn) {
 				// must preserve persistent Chrome for subsequent reconciliation.
 				result := make(chan FarmRuntimeCommandResponse, 1)
 				go func() {
-					if c.ctx.Err() != nil {
+					if connectionCtx.Err() != nil {
 						return
 					}
-					result <- c.adapter.DispatchCommand(command)
+					result <- c.adapter.DispatchCommandForConnection(command, connectionFence)
 				}()
 				timer := time.NewTimer(c.config.CommandTimeout)
 				defer timer.Stop()
 				select {
 				case response := <-result:
 					if err := c.writeJSON(conn, response); err != nil {
-						c.shutdown(err)
+						c.transportFailure(conn, err)
 					}
 				case <-timer.C:
-					c.shutdown(context.DeadlineExceeded)
-				case <-c.ctx.Done():
+					c.transportFailure(conn, context.DeadlineExceeded)
+				case <-connectionCtx.Done():
 				}
 			}(command)
 		default:
@@ -495,7 +650,7 @@ func (c *FarmControlWSSClient) heartbeatLoop(conn *websocket.Conn) {
 				ackDeadline = 300 * time.Millisecond
 			}
 			if !lastAck.IsZero() && time.Since(lastAck) > ackDeadline {
-				c.shutdown(ErrFarmControlWSSClosed)
+				c.transportFailure(conn, ErrFarmControlWSSClosed)
 				return
 			}
 			heartbeatID := strconv.FormatInt(time.Now().UnixNano(), 10) + "-" + strconv.FormatUint(atomic.AddUint64(&c.heartbeatSeq, 1), 10)
@@ -520,7 +675,7 @@ func (c *FarmControlWSSClient) heartbeatLoop(conn *websocket.Conn) {
 			if err := c.writeJSON(conn, farmControlHeartbeat{
 				Type: "heartbeat", HeartbeatID: heartbeatID, Telemetry: telemetry,
 			}); err != nil {
-				c.shutdown(err)
+				c.transportFailure(conn, err)
 				return
 			}
 		case <-c.ctx.Done():

@@ -17,11 +17,12 @@ import (
 // runtime. A ready runtime is idle between jobs; it is not stopped merely
 // because the preceding job finished.
 const (
-	FarmRuntimeStateStarting = "starting"
-	FarmRuntimeStateIdle     = "idle"
-	FarmRuntimeStateStopped  = "stopped"
-	FarmRuntimeStateCrashed  = "crashed"
-	FarmRuntimeStateStale    = "stale"
+	FarmRuntimeStateStarting    = "starting"
+	FarmRuntimeStateIdle        = "idle"
+	FarmRuntimeStateQuarantined = "quarantined"
+	FarmRuntimeStateStopped     = "stopped"
+	FarmRuntimeStateCrashed     = "crashed"
+	FarmRuntimeStateStale       = "stale"
 )
 
 var (
@@ -95,16 +96,18 @@ type FarmRuntimeProfile struct {
 // detached telemetry value and never a Manager-owned pointer.
 type FarmRuntime struct {
 	FarmRuntimeIdentity
-	State          string              `json:"state"`
-	Profile        *FarmRuntimeProfile `json:"profile,omitempty"`
-	PID            int                 `json:"pid"`
-	DebugPort      int                 `json:"debug_port"`
-	DebugReady     bool                `json:"debug_ready"`
-	RuntimeWarning string              `json:"runtime_warning,omitempty"`
-	LastError      string              `json:"last_error,omitempty"`
-	LastStartAt    string              `json:"last_start_at,omitempty"`
-	LastStopAt     string              `json:"last_stop_at,omitempty"`
-	LaunchMode     string              `json:"launch_mode"`
+	State                string              `json:"state"`
+	Profile              *FarmRuntimeProfile `json:"profile,omitempty"`
+	PID                  int                 `json:"pid"`
+	DebugPort            int                 `json:"debug_port"`
+	DebugReady           bool                `json:"debug_ready"`
+	RuntimeWarning       string              `json:"runtime_warning,omitempty"`
+	LastError            string              `json:"last_error,omitempty"`
+	LastStartAt          string              `json:"last_start_at,omitempty"`
+	LastStopAt           string              `json:"last_stop_at,omitempty"`
+	LaunchMode           string              `json:"launch_mode"`
+	ProcessStartIdentity string              `json:"process_start_identity,omitempty"`
+	ProfileIncarnation   string              `json:"profile_incarnation,omitempty"`
 }
 
 // MarshalJSON is an additional wire fence for records assembled by older
@@ -114,24 +117,28 @@ type FarmRuntime struct {
 func (runtime FarmRuntime) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		FarmRuntimeIdentity
-		State       string              `json:"state"`
-		Profile     *FarmRuntimeProfile `json:"profile,omitempty"`
-		PID         int                 `json:"pid"`
-		DebugPort   int                 `json:"debug_port"`
-		DebugReady  bool                `json:"debug_ready"`
-		LastStartAt string              `json:"last_start_at,omitempty"`
-		LastStopAt  string              `json:"last_stop_at,omitempty"`
-		LaunchMode  string              `json:"launch_mode"`
+		State                string              `json:"state"`
+		Profile              *FarmRuntimeProfile `json:"profile,omitempty"`
+		PID                  int                 `json:"pid"`
+		DebugPort            int                 `json:"debug_port"`
+		DebugReady           bool                `json:"debug_ready"`
+		LastStartAt          string              `json:"last_start_at,omitempty"`
+		LastStopAt           string              `json:"last_stop_at,omitempty"`
+		LaunchMode           string              `json:"launch_mode"`
+		ProcessStartIdentity string              `json:"process_start_identity,omitempty"`
+		ProfileIncarnation   string              `json:"profile_incarnation,omitempty"`
 	}{
-		FarmRuntimeIdentity: runtime.FarmRuntimeIdentity,
-		State:               runtime.State,
-		Profile:             runtime.Profile,
-		PID:                 runtime.PID,
-		DebugPort:           runtime.DebugPort,
-		DebugReady:          runtime.DebugReady,
-		LastStartAt:         runtime.LastStartAt,
-		LastStopAt:          runtime.LastStopAt,
-		LaunchMode:          runtime.LaunchMode,
+		FarmRuntimeIdentity:  runtime.FarmRuntimeIdentity,
+		State:                runtime.State,
+		Profile:              runtime.Profile,
+		PID:                  runtime.PID,
+		DebugPort:            runtime.DebugPort,
+		DebugReady:           runtime.DebugReady,
+		LastStartAt:          runtime.LastStartAt,
+		LastStopAt:           runtime.LastStopAt,
+		LaunchMode:           runtime.LaunchMode,
+		ProcessStartIdentity: runtime.ProcessStartIdentity,
+		ProfileIncarnation:   runtime.ProfileIncarnation,
 	})
 }
 
@@ -153,6 +160,13 @@ func farmRuntimeWirePayload(payload any) (any, error) {
 	case []FarmRuntime:
 		return typed, nil
 	case []*FarmRuntime:
+		return typed, nil
+	case FarmRuntimeInventorySnapshot:
+		return typed, nil
+	case *FarmRuntimeInventorySnapshot:
+		if typed == nil {
+			return nil, nil
+		}
 		return typed, nil
 	case FarmRuntimeProfile:
 		return typed, nil
@@ -216,6 +230,7 @@ type FarmRuntimeServiceConfig struct {
 	// The wire projection is built by FarmRuntimeService and never carries the
 	// callback or arbitrary host errors.
 	ResourceTelemetryHooks *FarmResourceTelemetryHooks
+	OwnershipStore         FarmRuntimeOwnershipStore
 }
 
 // FarmRuntimeServiceFactoryConfig is the public, Wails-free factory boundary.
@@ -236,6 +251,7 @@ type FarmRuntimeServiceFactoryConfig struct {
 	ProxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
 	ProxyRuntimeCleanup      func()
 	ResourceTelemetryHooks   *FarmResourceTelemetryHooks
+	OwnershipStore           FarmRuntimeOwnershipStore
 }
 
 // FarmRuntimeEnsureRequest identifies the profile and, when supplied, the
@@ -302,6 +318,54 @@ type FarmRuntimeStopRequest struct {
 	ControllerGeneration uint64 `json:"controller_generation"`
 	TelemetrySequence    uint64 `json:"telemetry_sequence"`
 	TelemetryObservedAt  string `json:"telemetry_observed_at"`
+}
+
+// FarmRuntimeHandoffRequest is the authenticated inventory evidence used by
+// controller reconcile.  It is intentionally separate from
+// FarmRuntimeStopRequest: stale/unknown runtimes may be stopped by a new
+// controller only after complete process identity validation, without
+// pretending their old fencing epoch is current or minting a lease.
+type FarmRuntimeHandoffRequest struct {
+	Provider             string `json:"provider"`
+	NodeUID              string `json:"node_uid"`
+	ProfileID            string `json:"profile_id"`
+	RuntimeUID           string `json:"runtime_uid"`
+	ProviderInstanceID   string `json:"provider_instance_id"`
+	FencingEpoch         uint64 `json:"fencing_epoch"`
+	ConfigHash           string `json:"config_hash"`
+	Generation           uint64 `json:"generation"`
+	PID                  int    `json:"pid"`
+	ProcessStartIdentity string `json:"process_start_identity"`
+	ProfileIncarnation   string `json:"profile_incarnation"`
+	ControllerID         string `json:"controller_id"`
+	ControllerGeneration uint64 `json:"controller_generation"`
+	State                string `json:"state,omitempty"`
+	DebugReady           bool   `json:"debug_ready,omitempty"`
+	LaunchMode           string `json:"launch_mode,omitempty"`
+}
+
+type FarmRuntimeReconcileRequest struct {
+	Action           string `json:"action"`
+	TargetConfigHash string `json:"target_config_hash,omitempty"`
+	TargetPolicyHash string `json:"target_policy_hash,omitempty"`
+	TargetLaunchMode string `json:"target_launch_mode,omitempty"`
+	FarmRuntimeHandoffRequest
+}
+
+// FarmRuntimeInventorySnapshot is used only by the handoff inventory command.
+// The legacy inventory command remains a plain list for P1.12 compatibility.
+type FarmRuntimeInventorySnapshot struct {
+	ConnectionGeneration uint64        `json:"connection_generation"`
+	Inventory            []FarmRuntime `json:"inventory"`
+}
+
+// FarmRuntimeControllerBindingRequest projects the newly authenticated
+// Server controller onto the Agent before an inventory snapshot is read.
+// It is deliberately a command rather than a local config update: only the
+// authenticated Control WSS session may advance this binding.
+type FarmRuntimeControllerBindingRequest struct {
+	ControllerID         string `json:"controller_id"`
+	ControllerGeneration uint64 `json:"controller_generation"`
 }
 
 // FarmRuntimeCommand is transport-agnostic and mirrors the command portion
@@ -391,6 +455,7 @@ type farmRuntimeRecord struct {
 	processStartIdentity string
 	launchMode           string
 	proxyBinding         *FarmRuntimeProxyBinding
+	profileCreatedAt     string
 }
 
 type farmRuntimeProfileGate struct {
@@ -406,22 +471,35 @@ type farmRuntimeProfileGate struct {
 // Authenticated persistent inventory/reconcile metadata belongs to the later
 // Control WSS/fencing gates.
 type FarmRuntimeService struct {
-	runtimeService            *BrowserRuntimeService
-	nodeUID                   string
-	providerInstance          string
-	fencingEpoch              uint64
-	controllerID              string
-	controllerGeneration      uint64
-	cdpOpenHook               func(stage string)
-	attestationStateProvider  func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
-	proxyBindingVerifier      func(profileID string, binding FarmRuntimeProxyBinding) error
-	proxyRuntimeCleanup       func()
-	resourceTelemetryHooks    *FarmResourceTelemetryHooks
-	resourceTelemetrySequence uint64
-	resourceTelemetryMu       sync.Mutex
-	latestResourceSequence    uint64
-	latestResourceObservedAt  string
-	stopRequestHook           func(FarmRuntimeStopRequest)
+	runtimeService       *BrowserRuntimeService
+	nodeUID              string
+	providerInstance     string
+	fencingEpoch         uint64
+	controllerID         string
+	controllerGeneration uint64
+	controllerMu         sync.RWMutex
+	// Rebind is a controller projection operation, not a local metadata
+	// setter. Lifecycle and CDP side effects hold the read side until their
+	// final generation check and record publication; Rebind takes the write
+	// side so an old controller cannot cross the handoff boundary.
+	controllerOperationMu      sync.RWMutex
+	connectionOperationMu      sync.RWMutex
+	cdpOpenHook                func(stage string)
+	attestationStateProvider   func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
+	proxyBindingVerifier       func(profileID string, binding FarmRuntimeProxyBinding) error
+	proxyRuntimeCleanup        func()
+	resourceTelemetryHooks     *FarmResourceTelemetryHooks
+	connectionMu               sync.Mutex
+	connectionGeneration       uint64
+	activeConnectionGeneration uint64
+	ownershipStore             FarmRuntimeOwnershipStore
+	ownershipMu                sync.Mutex
+	resourceTelemetrySequence  uint64
+	resourceTelemetryMu        sync.Mutex
+	latestResourceSequence     uint64
+	latestResourceObservedAt   string
+	stopRequestHook            func(FarmRuntimeStopRequest)
+	handoffValidationHook      func()
 
 	recordsMu sync.RWMutex
 	records   map[string]farmRuntimeRecord
@@ -435,6 +513,52 @@ type FarmRuntimeService struct {
 	cdpSessions        map[string]*farmCDPSession
 	cdpTombstones      map[string]farmCDPTombstone
 	cdpTokenTombstones map[string]farmCDPTombstone
+}
+
+func (s *FarmRuntimeService) controllerBinding() (string, uint64) {
+	if s == nil {
+		return "", 0
+	}
+	s.controllerMu.RLock()
+	id, generation := s.controllerID, s.controllerGeneration
+	s.controllerMu.RUnlock()
+	return id, generation
+}
+
+// ControllerBinding returns the current authenticated controller generation.
+func (s *FarmRuntimeService) ControllerBinding() (string, uint64) {
+	return s.controllerBinding()
+}
+
+// RebindController is only used after a Server has authenticated inventory
+// and supplied a strictly newer controller generation.  It updates existing
+// records' controller projection but never creates a runtime or infers
+// ownership from a local profile/PID/port.
+func (s *FarmRuntimeService) RebindController(controllerID string, generation uint64) error {
+	if s == nil {
+		return ErrFarmRuntimeServiceUnavailable
+	}
+	controllerID = strings.TrimSpace(controllerID)
+	if controllerID == "" || generation == 0 {
+		return ErrFarmRuntimeIdentityRequired
+	}
+	s.controllerOperationMu.Lock()
+	defer s.controllerOperationMu.Unlock()
+	s.controllerMu.Lock()
+	if generation < s.controllerGeneration || (generation == s.controllerGeneration && controllerID != s.controllerID) {
+		s.controllerMu.Unlock()
+		return ErrFarmRuntimeStale
+	}
+	s.controllerID, s.controllerGeneration = controllerID, generation
+	s.controllerMu.Unlock()
+	s.recordsMu.Lock()
+	for profileID, record := range s.records {
+		record.runtime.ControllerID = controllerID
+		record.runtime.ControllerGeneration = generation
+		s.records[profileID] = record
+	}
+	s.recordsMu.Unlock()
+	return nil
 }
 
 // NewFarmRuntimeService constructs the Wails-free Farm lifecycle layer.
@@ -464,7 +588,7 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 	if (controllerID == "") != (options.ControllerGeneration == 0) {
 		return nil, fmt.Errorf("%w: controller id and generation must be supplied together", ErrFarmRuntimeServiceUnavailable)
 	}
-	return &FarmRuntimeService{
+	service := &FarmRuntimeService{
 		runtimeService:           runtimeService,
 		nodeUID:                  nodeUID,
 		providerInstance:         providerInstance,
@@ -482,7 +606,73 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 		proxyBindingVerifier:     options.ProxyBindingVerifier,
 		proxyRuntimeCleanup:      options.ProxyRuntimeCleanup,
 		resourceTelemetryHooks:   options.ResourceTelemetryHooks,
-	}, nil
+		ownershipStore:           options.OwnershipStore,
+		connectionGeneration:     1,
+	}
+	if err := service.restoreOwnershipProvenance(); err != nil {
+		return nil, err
+	}
+	return service, nil
+}
+
+// BeginControlConnection advances the authenticated Agent connection fence.
+// A fresh WSS session must obtain a new generation before inventory can be
+// used to mark absent runtimes lost.
+func (s *FarmRuntimeService) BeginControlConnection() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.connectionMu.Lock()
+	s.connectionGeneration++
+	generation := s.connectionGeneration
+	s.activeConnectionGeneration = generation
+	s.connectionMu.Unlock()
+	return generation
+}
+
+// BeginAuthenticatedControlConnection binds controller authority to the
+// authenticated transport session, before that session may dispatch commands.
+// A business command cannot create or advance this binding.
+func (s *FarmRuntimeService) BeginAuthenticatedControlConnection(controllerID string, controllerGeneration uint64) (uint64, error) {
+	if s == nil {
+		return 0, ErrFarmRuntimeServiceUnavailable
+	}
+	s.connectionOperationMu.Lock()
+	defer s.connectionOperationMu.Unlock()
+	if err := s.RebindController(controllerID, controllerGeneration); err != nil {
+		return 0, err
+	}
+	return s.BeginControlConnection(), nil
+}
+
+func (s *FarmRuntimeService) EndControlConnection(generation uint64) {
+	if s == nil || generation == 0 {
+		return
+	}
+	s.connectionOperationMu.Lock()
+	s.connectionMu.Lock()
+	if s.activeConnectionGeneration == generation {
+		s.activeConnectionGeneration = 0
+	}
+	s.connectionMu.Unlock()
+	s.connectionOperationMu.Unlock()
+}
+
+func (s *FarmRuntimeService) connectionIsCurrent(generation uint64) bool {
+	s.connectionMu.Lock()
+	current := s.activeConnectionGeneration
+	s.connectionMu.Unlock()
+	return generation != 0 && current == generation
+}
+
+func (s *FarmRuntimeService) ConnectionGeneration() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.connectionMu.Lock()
+	generation := s.connectionGeneration
+	s.connectionMu.Unlock()
+	return generation
 }
 
 // NewFarmRuntimeServiceForHost creates the shared BrowserRuntimeService via
@@ -522,6 +712,7 @@ func NewFarmRuntimeServiceForHost(options FarmRuntimeServiceFactoryConfig) (*Far
 		ProxyBindingVerifier:     verifier,
 		ProxyRuntimeCleanup:      runtimeService.CleanupOwnedProxyRuntimes,
 		ResourceTelemetryHooks:   options.ResourceTelemetryHooks,
+		OwnershipStore:           options.OwnershipStore,
 	})
 }
 
@@ -781,6 +972,8 @@ func farmRuntimeFromSnapshot(record farmRuntimeRecord, snapshot *BrowserRuntimeS
 	runtime.LastError = ""
 	runtime.LastStartAt = profile.LastStartAt
 	runtime.LastStopAt = profile.LastStopAt
+	runtime.ProcessStartIdentity = record.processStartIdentity
+	runtime.ProfileIncarnation = record.profileIncarnation
 	switch {
 	case snapshot.Generation == runtime.Generation && profile.Running && !profile.DebugReady:
 		runtime.State = FarmRuntimeStateStarting
@@ -827,6 +1020,8 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	if s == nil {
 		return FarmRuntime{}, ErrFarmRuntimeServiceUnavailable
 	}
+	s.controllerOperationMu.RLock()
+	defer s.controllerOperationMu.RUnlock()
 	profileID := strings.TrimSpace(request.ProfileID)
 	if profileID == "" {
 		return FarmRuntime{}, fmt.Errorf("%w: profile id", ErrFarmRuntimeIdentityRequired)
@@ -964,6 +1159,7 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 	if owned && existingActiveGeneration != 0 && observed.Generation != existingActiveGeneration {
 		return FarmRuntime{}, fmt.Errorf("%w: replacement generation", ErrFarmRuntimeStale)
 	}
+	controllerID, controllerGeneration := s.controllerBinding()
 	runtime := FarmRuntime{
 		FarmRuntimeIdentity: FarmRuntimeIdentity{
 			NodeUID:              s.nodeUID,
@@ -973,21 +1169,24 @@ func (s *FarmRuntimeService) EnsureRuntime(request FarmRuntimeEnsureRequest) (Fa
 			FencingEpoch:         s.fencingEpoch,
 			ConfigHash:           request.ConfigHash,
 			Generation:           observed.Generation,
-			ControllerID:         s.controllerID,
-			ControllerGeneration: s.controllerGeneration,
+			ControllerID:         controllerID,
+			ControllerGeneration: controllerGeneration,
 		},
 		State:      FarmRuntimeStateIdle,
 		LaunchMode: launchMode,
 	}
 	runtime = farmRuntimeFromSnapshot(farmRuntimeRecord{runtime: runtime}, observed)
 	processStartIdentity := ""
-	if s.controllerID != "" {
+	if controllerID != "" {
 		processStartIdentity, err = s.readProcessStartIdentity(observed.Profile.Pid)
 		if err != nil || processStartIdentity == "" {
 			return FarmRuntime{}, fmt.Errorf("%w: process start identity", ErrFarmRuntimeServiceUnavailable)
 		}
 	}
-	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, processStartIdentity: processStartIdentity, launchMode: launchMode, proxyBinding: cloneFarmRuntimeProxyBinding(request.Proxy)})
+	s.setRecord(profileID, farmRuntimeRecord{runtime: runtime, profileIncarnation: observed.ProfileIncarnation, processStartIdentity: processStartIdentity, launchMode: launchMode, proxyBinding: cloneFarmRuntimeProxyBinding(request.Proxy), profileCreatedAt: observed.Profile.CreatedAt})
+	if err := s.persistOwnershipProvenance(); err != nil {
+		return FarmRuntime{}, err
+	}
 	if startErr != nil {
 		return runtime, startErr
 	}
@@ -1000,6 +1199,8 @@ func (s *FarmRuntimeService) RuntimeStatus(request FarmRuntimeStatusRequest) (Fa
 	if s == nil {
 		return FarmRuntime{}, ErrFarmRuntimeServiceUnavailable
 	}
+	s.controllerOperationMu.RLock()
+	defer s.controllerOperationMu.RUnlock()
 	profileID := strings.TrimSpace(request.ProfileID)
 	if profileID == "" {
 		return FarmRuntime{}, fmt.Errorf("%w: profile id", ErrFarmRuntimeIdentityRequired)
@@ -1040,6 +1241,8 @@ func (s *FarmRuntimeService) ApplyAttestation(
 	if s == nil {
 		return FarmAttestationResponse{}, ErrFarmRuntimeServiceUnavailable
 	}
+	s.controllerOperationMu.RLock()
+	defer s.controllerOperationMu.RUnlock()
 	if err := request.validate(); err != nil {
 		return FarmAttestationResponse{}, err
 	}
@@ -1126,20 +1329,23 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 	if s == nil {
 		return FarmRuntime{}, ErrFarmRuntimeServiceUnavailable
 	}
+	s.controllerOperationMu.RLock()
+	defer s.controllerOperationMu.RUnlock()
 	profileID := strings.TrimSpace(request.ProfileID)
+	controllerID, controllerGeneration := s.controllerBinding()
 	if s.stopRequestHook != nil {
 		s.stopRequestHook(request)
 	}
 	if strings.TrimSpace(request.NodeUID) == "" || profileID == "" || strings.TrimSpace(request.RuntimeUID) == "" || strings.TrimSpace(request.ProviderInstanceID) == "" || request.FencingEpoch == 0 || request.Generation == 0 {
 		return FarmRuntime{}, ErrFarmRuntimeIdentityRequired
 	}
-	if s.controllerID != "" && (request.PID <= 0 || strings.TrimSpace(request.ProcessStartIdentity) == "" || strings.TrimSpace(request.ProfileIncarnation) == "") {
+	if controllerID != "" && (request.PID <= 0 || strings.TrimSpace(request.ProcessStartIdentity) == "" || strings.TrimSpace(request.ProfileIncarnation) == "") {
 		return FarmRuntime{}, ErrFarmRuntimeIdentityRequired
 	}
-	if s.controllerID != "" && (request.Provider != "farm" || request.ControllerID != s.controllerID || request.ControllerGeneration != s.controllerGeneration) {
+	if controllerID != "" && (request.Provider != "farm" || request.ControllerID != controllerID || request.ControllerGeneration != controllerGeneration) {
 		return FarmRuntime{}, fmt.Errorf("%w: controller generation", ErrFarmRuntimeStale)
 	}
-	if s.controllerID != "" {
+	if controllerID != "" {
 		s.resourceTelemetryMu.Lock()
 		latestSequence, latestObserved := s.latestResourceSequence, s.latestResourceObservedAt
 		s.resourceTelemetryMu.Unlock()
@@ -1162,7 +1368,7 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 	if err := s.validateAgainstRecord(profileID, request.RuntimeUID, request.ProviderInstanceID, request.FencingEpoch, request.ConfigHash, request.Generation, record); err != nil {
 		return FarmRuntime{}, err
 	}
-	if s.controllerID != "" && (request.PID != record.runtime.PID || request.ProcessStartIdentity != record.processStartIdentity || request.ProfileIncarnation != record.profileIncarnation) {
+	if controllerID != "" && (request.PID != record.runtime.PID || request.ProcessStartIdentity != record.processStartIdentity || request.ProfileIncarnation != record.profileIncarnation) {
 		return FarmRuntime{}, fmt.Errorf("%w: process identity", ErrFarmRuntimeStale)
 	}
 	observed, err := s.snapshot(profileID)
@@ -1185,7 +1391,7 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 		s.setRecord(profileID, record)
 		return FarmRuntime{}, fmt.Errorf("%w: generation", ErrFarmRuntimeStale)
 	}
-	if s.controllerID != "" {
+	if controllerID != "" {
 		if observed.Profile.Pid != request.PID || observed.ProfileIncarnation != request.ProfileIncarnation {
 			return FarmRuntime{}, fmt.Errorf("%w: current process identity", ErrFarmRuntimeStale)
 		}
@@ -1223,6 +1429,9 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 	record.runtime = farmRuntimeFromSnapshot(record, finalSnapshot)
 	record.runtime.State = FarmRuntimeStateStopped
 	s.setRecord(profileID, record)
+	if err := s.persistOwnershipProvenance(); err != nil {
+		return FarmRuntime{}, err
+	}
 	if s.proxyRuntimeCleanup != nil && !s.hasActiveRecord() {
 		s.proxyRuntimeCleanup()
 	}
@@ -1471,7 +1680,7 @@ func (s *FarmRuntimeService) validateCommand(command FarmRuntimeCommand) error {
 		return fmt.Errorf("%w: command is required", ErrFarmRuntimeCommand)
 	}
 	switch strings.TrimSpace(command.Command) {
-	case "ensure_runtime", "runtime_status", "stop_runtime", "inventory", "attest_runtime":
+	case "ensure_runtime", "runtime_status", "stop_runtime", "inventory", "inventory_handoff", "attest_runtime", "prepare_adopt_runtime", "adopt_runtime", "quarantine_runtime", "stop_runtime_handoff", "reconcile_runtime":
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown command", ErrFarmRuntimeCommand)
@@ -1587,6 +1796,81 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		}
 		response.OK = true
 		response.Payload = inventory
+	case "inventory_handoff":
+		var request struct{}
+		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
+			return FarmRuntimeCommandResponse{}, err
+		}
+		inventory, err := s.InventoryWithError()
+		if err != nil {
+			response.Error = farmRuntimeWireError(err)
+			return response, nil
+		}
+		response.OK = true
+		response.Payload = FarmRuntimeInventorySnapshot{
+			ConnectionGeneration: s.ConnectionGeneration(),
+			Inventory:            inventory,
+		}
+	case "prepare_adopt_runtime":
+		var request FarmRuntimeHandoffRequest
+		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
+			return FarmRuntimeCommandResponse{}, err
+		}
+		runtime, err := s.PrepareAdoptRuntime(request)
+		if err != nil {
+			response.Error = farmRuntimeWireError(err)
+			return response, nil
+		}
+		response.OK = true
+		response.Payload = runtime
+	case "adopt_runtime":
+		var request FarmRuntimeHandoffRequest
+		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
+			return FarmRuntimeCommandResponse{}, err
+		}
+		runtime, err := s.AdoptRuntime(request)
+		if err != nil {
+			response.Error = farmRuntimeWireError(err)
+			return response, nil
+		}
+		response.OK = true
+		response.Payload = runtime
+	case "quarantine_runtime":
+		var request FarmRuntimeHandoffRequest
+		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
+			return FarmRuntimeCommandResponse{}, err
+		}
+		runtime, err := s.QuarantineRuntime(request)
+		if err != nil {
+			response.Error = farmRuntimeWireError(err)
+			return response, nil
+		}
+		response.OK = true
+		response.Payload = runtime
+	case "stop_runtime_handoff":
+		var request FarmRuntimeHandoffRequest
+		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
+			return FarmRuntimeCommandResponse{}, err
+		}
+		runtime, err := s.StopHandoffRuntime(request)
+		if err != nil {
+			response.Error = farmRuntimeWireError(err)
+			return response, nil
+		}
+		response.OK = true
+		response.Payload = runtime
+	case "reconcile_runtime":
+		var request FarmRuntimeReconcileRequest
+		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
+			return FarmRuntimeCommandResponse{}, err
+		}
+		runtime, err := s.ReconcileRuntime(request)
+		if err != nil {
+			response.Error = farmRuntimeWireError(err)
+			return response, nil
+		}
+		response.OK = true
+		response.Payload = runtime
 	case "attest_runtime":
 		var request FarmAttestationRequest
 		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
@@ -1633,6 +1917,26 @@ func (adapter *FarmRuntimeControlAdapter) DispatchCommand(command FarmRuntimeCom
 	return adapter.service.DispatchCommand(command)
 }
 
+// DispatchCommandForConnection keeps the authenticated connection fence held
+// across the complete command. Reconnect/rebind waits for an admitted command,
+// while queued work from an invalidated connection fails before any side effect.
+func (adapter *FarmRuntimeControlAdapter) DispatchCommandForConnection(command FarmRuntimeCommand, connectionGeneration uint64) FarmRuntimeCommandResponse {
+	if adapter == nil || adapter.service == nil {
+		return FarmRuntimeCommandResponse{Type: "command_response", Error: farmRuntimeWireError(ErrFarmRuntimeServiceUnavailable)}
+	}
+	service := adapter.service
+	name := strings.TrimSpace(command.Command)
+	mutatesRuntime := name != "inventory" && name != "inventory_handoff" && name != "runtime_status"
+	if mutatesRuntime {
+		service.connectionOperationMu.RLock()
+		defer service.connectionOperationMu.RUnlock()
+	}
+	if !service.connectionIsCurrent(connectionGeneration) {
+		return FarmRuntimeCommandResponse{Type: "command_response", NodeUID: service.nodeUID, CorrelationID: command.CorrelationID, Error: farmRuntimeWireError(ErrFarmRuntimeStale)}
+	}
+	return adapter.DispatchCommand(command)
+}
+
 // ResourceTelemetry is the authenticated heartbeat projection used by the
 // Control WSS transport. It does not dispatch through the command surface and
 // therefore cannot be confused with a lifecycle response or locator payload.
@@ -1641,6 +1945,29 @@ func (adapter *FarmRuntimeControlAdapter) ResourceTelemetry(controlRTTMS float64
 		return FarmResourceTelemetry{}, ErrFarmRuntimeServiceUnavailable
 	}
 	return adapter.service.ResourceTelemetry(controlRTTMS)
+}
+
+// BeginControlConnection is called only after the WSS authentication ACK.
+// It is intentionally not exposed as a command payload: a remote caller
+// cannot mint a connection generation without authenticating the node.
+func (adapter *FarmRuntimeControlAdapter) BeginControlConnection() uint64 {
+	if adapter == nil || adapter.service == nil {
+		return 0
+	}
+	return adapter.service.BeginControlConnection()
+}
+
+func (adapter *FarmRuntimeControlAdapter) BeginAuthenticatedControlConnection(controllerID string, controllerGeneration uint64) (uint64, error) {
+	if adapter == nil || adapter.service == nil {
+		return 0, ErrFarmRuntimeServiceUnavailable
+	}
+	return adapter.service.BeginAuthenticatedControlConnection(controllerID, controllerGeneration)
+}
+
+func (adapter *FarmRuntimeControlAdapter) EndControlConnection(connectionGeneration uint64) {
+	if adapter != nil && adapter.service != nil {
+		adapter.service.EndControlConnection(connectionGeneration)
+	}
 }
 
 // HandleCommandEnvelope is the explicit envelope-named entry point for a
