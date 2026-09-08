@@ -12,22 +12,39 @@ func p118ScenarioFixture(scenario string) (string, error) {
 		return "p1_18_handoff_fixture.py", nil
 	case "crash_watcher":
 		return "p1_18_crash_watcher_fixture.py", nil
+	case "execv":
+		return "p1_18_execv_fencing_fixture.py", nil
 	default:
 		return "", fmt.Errorf("unsupported P1.18 scenario: %q", scenario)
 	}
 }
 
 func TestP118ScenarioFixtureSelection(t *testing.T) {
-	for scenario, expected := range map[string]string{"": "p1_18_handoff_fixture.py", "graceful": "p1_18_handoff_fixture.py", "crash_watcher": "p1_18_crash_watcher_fixture.py"} {
+	for scenario, expected := range map[string]string{
+		"":              "p1_18_handoff_fixture.py",
+		"graceful":      "p1_18_handoff_fixture.py",
+		"crash_watcher": "p1_18_crash_watcher_fixture.py",
+		"execv":         "p1_18_execv_fencing_fixture.py",
+	} {
 		actual, err := p118ScenarioFixture(scenario)
 		if err != nil || actual != expected {
 			t.Fatalf("scenario %q: %q, %v", scenario, actual, err)
 		}
 	}
-	for _, scenario := range []string{"execv", "unknown", "../other.py"} {
+	for _, scenario := range []string{"unknown", "../other.py"} {
 		if _, err := p118ScenarioFixture(scenario); err == nil {
 			t.Fatalf("unimplemented scenario %q accepted", scenario)
 		}
+	}
+}
+
+func TestP118ExecvScenarioRoutesToDedicatedFixture(t *testing.T) {
+	fixture, err := p118ScenarioFixture("execv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixture != "p1_18_execv_fencing_fixture.py" {
+		t.Fatalf("execv scenario routed to %q", fixture)
 	}
 }
 

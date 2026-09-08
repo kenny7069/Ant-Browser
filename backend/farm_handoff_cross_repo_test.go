@@ -397,6 +397,8 @@ func assertP118HandoffEvidence(t *testing.T, path, scenario string) {
 	validate := validateP118HandoffEvidence
 	if scenario == "crash_watcher" {
 		validate = validateP118CrashEvidence
+	} else if scenario == "execv" {
+		validate = validateP118ExecvEvidence
 	}
 	if err := validate(raw); err != nil {
 		t.Fatalf("invalid P1.18 handoff evidence: %v evidence=%s", err, raw)
