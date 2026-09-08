@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -39,6 +40,41 @@ func (b *p118SynchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.b.String()
+}
+
+func p118TransportDiagnostic(client *FarmControlWSSClient) string {
+	if client == nil {
+		return "client=nil"
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	category := "none"
+	switch {
+	case errors.Is(client.closeErr, ErrFarmControlWSSMessageLimit):
+		category = "message_limit"
+	case errors.Is(client.closeErr, ErrFarmControlWSSProtocol):
+		category = "protocol"
+	case errors.Is(client.closeErr, ErrFarmControlWSSAuth):
+		category = "authentication"
+	case errors.Is(client.closeErr, context.DeadlineExceeded):
+		category = "command_deadline"
+	case errors.Is(client.closeErr, ErrFarmControlWSSClosed):
+		ackDeadline := 4 * client.config.HeartbeatInterval
+		if ackDeadline < 300*time.Millisecond {
+			ackDeadline = 300 * time.Millisecond
+		}
+		if !client.lastHeartbeatAck.IsZero() && time.Since(client.lastHeartbeatAck) >= ackDeadline {
+			category = "heartbeat_deadline_exceeded"
+		} else {
+			category = "closed_transport"
+		}
+	case client.closeErr != nil:
+		category = fmt.Sprintf("transport_type=%T", client.closeErr)
+	}
+	return fmt.Sprintf(
+		"category=%s connected=%t connecting=%t connection_fence=%d",
+		category, client.conn != nil, client.connecting, client.connectionFence,
+	)
 }
 
 type p118HandoffIdentity struct {
@@ -198,7 +234,7 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	}
 	defer client.Close()
 	waitForP118TextFileOrProcess(
-		t, gatewayFile, 30*time.Second, &serverOutput, serverDone, &serverFinished,
+		t, gatewayFile, 30*time.Second, &serverOutput, serverDone, &serverFinished, client,
 	)
 	playwrightCtx, cancelPlaywright := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelPlaywright()
@@ -209,11 +245,17 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	var playwrightOutput bytes.Buffer
 	playwright.Stdout, playwright.Stderr = &playwrightOutput, &playwrightOutput
 	if err := playwright.Run(); err != nil {
-		t.Fatalf("P1.18 Playwright handoff failed: %v output=%s", err, playwrightOutput.String())
+		t.Fatalf(
+			"P1.18 Playwright handoff failed: %v output=%s agent_transport={%s}",
+			err, playwrightOutput.String(), p118TransportDiagnostic(client),
+		)
 	}
 	if err := <-serverDone; err != nil {
 		serverFinished = true
-		t.Fatalf("P1.18 Python fixture failed: %v output=%s", err, serverOutput.String())
+		t.Fatalf(
+			"P1.18 Python fixture failed: %v output=%s agent_transport={%s}",
+			err, serverOutput.String(), p118TransportDiagnostic(client),
+		)
 	}
 	serverFinished = true
 	assertP118HandoffEvidence(t, evidenceFile)
@@ -226,6 +268,7 @@ func waitForP118TextFileOrProcess(
 	output *p118SynchronizedBuffer,
 	processDone <-chan error,
 	processFinished *bool,
+	client *FarmControlWSSClient,
 ) string {
 	t.Helper()
 	deadline := time.NewTimer(timeout)
@@ -237,8 +280,8 @@ func waitForP118TextFileOrProcess(
 		case err := <-processDone:
 			*processFinished = true
 			t.Fatalf(
-				"P1.18 fixture exited before publishing %s: %v output=%s",
-				filepath.Base(path), err, output.String(),
+				"P1.18 fixture exited before publishing %s: %v output=%s agent_transport={%s}",
+				filepath.Base(path), err, output.String(), p118TransportDiagnostic(client),
 			)
 			return ""
 		case <-ticker.C:
@@ -246,7 +289,10 @@ func waitForP118TextFileOrProcess(
 				return strings.TrimSpace(string(raw))
 			}
 		case <-deadline.C:
-			t.Fatalf("P1.18 fixture did not publish %s: %s", filepath.Base(path), output.String())
+			t.Fatalf(
+				"P1.18 fixture did not publish %s: %s agent_transport={%s}",
+				filepath.Base(path), output.String(), p118TransportDiagnostic(client),
+			)
 			return ""
 		}
 	}
