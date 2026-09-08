@@ -195,7 +195,9 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		t.Fatalf("P1.18 Agent initial authenticated connect: %v", err)
 	}
 	defer client.Close()
-	waitForP118TextFile(t, gatewayFile, 30*time.Second, &serverOutput)
+	waitForP118TextFileOrProcess(
+		t, gatewayFile, 30*time.Second, &serverOutput, serverDone, &serverFinished,
+	)
 	playwrightCtx, cancelPlaywright := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelPlaywright()
 	playwright := exec.CommandContext(playwrightCtx, "python3", playwrightScript,
@@ -212,6 +214,39 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	}
 	serverFinished = true
 	assertP118HandoffEvidence(t, evidenceFile)
+}
+
+func waitForP118TextFileOrProcess(
+	t *testing.T,
+	path string,
+	timeout time.Duration,
+	output *p118SynchronizedBuffer,
+	processDone <-chan error,
+	processFinished *bool,
+) string {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-processDone:
+			*processFinished = true
+			t.Fatalf(
+				"P1.18 fixture exited before publishing %s: %v output=%s",
+				filepath.Base(path), err, output.String(),
+			)
+			return ""
+		case <-ticker.C:
+			if raw, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(raw)) != "" {
+				return strings.TrimSpace(string(raw))
+			}
+		case <-deadline.C:
+			t.Fatalf("P1.18 fixture did not publish %s: %s", filepath.Base(path), output.String())
+			return ""
+		}
+	}
 }
 
 func waitForP118TextFile(t *testing.T, path string, timeout time.Duration, output *p118SynchronizedBuffer) string {
