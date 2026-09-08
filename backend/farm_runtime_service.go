@@ -295,6 +295,9 @@ type FarmRuntimeStopRequest struct {
 	FencingEpoch         uint64 `json:"fencing_epoch"`
 	ConfigHash           string `json:"config_hash,omitempty"`
 	Generation           uint64 `json:"generation"`
+	PID                  int    `json:"pid"`
+	ProcessStartIdentity string `json:"process_start_identity"`
+	ProfileIncarnation   string `json:"profile_incarnation"`
 	ControllerID         string `json:"controller_id"`
 	ControllerGeneration uint64 `json:"controller_generation"`
 	TelemetrySequence    uint64 `json:"telemetry_sequence"`
@@ -418,6 +421,7 @@ type FarmRuntimeService struct {
 	resourceTelemetryMu       sync.Mutex
 	latestResourceSequence    uint64
 	latestResourceObservedAt  string
+	stopRequestHook           func(FarmRuntimeStopRequest)
 
 	recordsMu sync.RWMutex
 	records   map[string]farmRuntimeRecord
@@ -1123,7 +1127,13 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 		return FarmRuntime{}, ErrFarmRuntimeServiceUnavailable
 	}
 	profileID := strings.TrimSpace(request.ProfileID)
+	if s.stopRequestHook != nil {
+		s.stopRequestHook(request)
+	}
 	if strings.TrimSpace(request.NodeUID) == "" || profileID == "" || strings.TrimSpace(request.RuntimeUID) == "" || strings.TrimSpace(request.ProviderInstanceID) == "" || request.FencingEpoch == 0 || request.Generation == 0 {
+		return FarmRuntime{}, ErrFarmRuntimeIdentityRequired
+	}
+	if s.controllerID != "" && (request.PID <= 0 || strings.TrimSpace(request.ProcessStartIdentity) == "" || strings.TrimSpace(request.ProfileIncarnation) == "") {
 		return FarmRuntime{}, ErrFarmRuntimeIdentityRequired
 	}
 	if s.controllerID != "" && (request.Provider != "farm" || request.ControllerID != s.controllerID || request.ControllerGeneration != s.controllerGeneration) {
@@ -1152,6 +1162,9 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 	if err := s.validateAgainstRecord(profileID, request.RuntimeUID, request.ProviderInstanceID, request.FencingEpoch, request.ConfigHash, request.Generation, record); err != nil {
 		return FarmRuntime{}, err
 	}
+	if s.controllerID != "" && (request.PID != record.runtime.PID || request.ProcessStartIdentity != record.processStartIdentity || request.ProfileIncarnation != record.profileIncarnation) {
+		return FarmRuntime{}, fmt.Errorf("%w: process identity", ErrFarmRuntimeStale)
+	}
 	observed, err := s.snapshot(profileID)
 	if err != nil {
 		return FarmRuntime{}, err
@@ -1171,6 +1184,15 @@ func (s *FarmRuntimeService) StopRuntime(request FarmRuntimeStopRequest) (FarmRu
 		record.runtime.State = FarmRuntimeStateStale
 		s.setRecord(profileID, record)
 		return FarmRuntime{}, fmt.Errorf("%w: generation", ErrFarmRuntimeStale)
+	}
+	if s.controllerID != "" {
+		if observed.Profile.Pid != request.PID || observed.ProfileIncarnation != request.ProfileIncarnation {
+			return FarmRuntime{}, fmt.Errorf("%w: current process identity", ErrFarmRuntimeStale)
+		}
+		currentStartIdentity, identityErr := s.readProcessStartIdentity(request.PID)
+		if identityErr != nil || currentStartIdentity == "" || currentStartIdentity != request.ProcessStartIdentity {
+			return FarmRuntime{}, fmt.Errorf("%w: process start identity", ErrFarmRuntimeStale)
+		}
 	}
 	if !observed.Profile.Running {
 		record.runtime.State = FarmRuntimeStateCrashed

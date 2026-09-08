@@ -94,6 +94,15 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 	}
 	fixture.farm.records[profileID] = record
 	fixture.farm.recordsMu.Unlock()
+	launchStartIdentity := record.processStartIdentity
+	launchProfileIncarnation := record.profileIncarnation
+	stopRequests := make(chan FarmRuntimeStopRequest, 1)
+	fixture.farm.stopRequestHook = func(request FarmRuntimeStopRequest) {
+		select {
+		case stopRequests <- request:
+		default:
+		}
+	}
 	// Keep BrowserRuntime identity and Agent service identity aligned after the
 	// test fixture's default node/provider values are replaced.
 	runtime = record.runtime
@@ -180,6 +189,8 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 		SoftDraining     bool           `json:"soft_draining"`
 		Recycled         bool           `json:"recycled"`
 		Resource         map[string]any `json:"resource"`
+		RecycleSelector  map[string]any `json:"recycle_selector"`
+		RecycleLedger    map[string]any `json:"recycle_ledger_runtime"`
 	}
 	raw, err := os.ReadFile(evidenceFile)
 	if err != nil {
@@ -201,6 +212,26 @@ func TestFarmResourceRTTCrossRepo(t *testing.T) {
 	runtimeRow, ok := runtimeRows[0].(map[string]any)
 	if !ok || runtimeRow["pid"] != float64(child.Process.Pid) || runtimeRow["rss_valid"] != true || runtimeRow["rss_mb"].(float64) <= 0 {
 		t.Fatalf("invalid real PID/RSS overlay: %s", raw)
+	}
+	if runtimeRow["process_start_identity"] != launchStartIdentity || runtimeRow["profile_incarnation"] != launchProfileIncarnation {
+		t.Fatalf("Server snapshot changed Agent launch baseline: %s", raw)
+	}
+	for _, field := range []string{"pid", "process_start_identity", "profile_incarnation", "telemetry_sequence", "telemetry_observed_at"} {
+		if evidence.RecycleSelector[field] != evidence.RecycleLedger[field] {
+			t.Fatalf("Server recycle selector lost %s: %s", field, raw)
+		}
+	}
+	if evidence.RecycleLedger["process_start_identity"] != launchStartIdentity || evidence.RecycleLedger["profile_incarnation"] != launchProfileIncarnation || evidence.RecycleLedger["pid"] != float64(child.Process.Pid) {
+		t.Fatalf("latest Server recycle ledger changed Agent launch baseline: %s", raw)
+	}
+	var receivedStop FarmRuntimeStopRequest
+	select {
+	case receivedStop = <-stopRequests:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Agent did not observe strict stop request")
+	}
+	if receivedStop.PID != child.Process.Pid || receivedStop.ProcessStartIdentity != launchStartIdentity || receivedStop.ProfileIncarnation != launchProfileIncarnation || float64(receivedStop.TelemetrySequence) != evidence.RecycleSelector["telemetry_sequence"] || receivedStop.TelemetryObservedAt != evidence.RecycleSelector["telemetry_observed_at"] {
+		t.Fatalf("Agent received stop differs from authenticated Server selector: request=%#v evidence=%s", receivedStop, raw)
 	}
 	select {
 	case <-owner.Done():

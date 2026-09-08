@@ -213,11 +213,68 @@ func TestFarmStopRejectsStaleTelemetrySampleBeforeLookup(t *testing.T) {
 	_, err := service.StopRuntime(FarmRuntimeStopRequest{
 		NodeUID: "node-a", ProfileID: "profile-a", RuntimeUID: "runtime-a",
 		ProviderInstanceID: "farm-a", FencingEpoch: 7, Generation: 1,
+		PID: 42, ProcessStartIdentity: "1001", ProfileIncarnation: "incarnation-a",
 		ControllerID: "controller-a", ControllerGeneration: 3,
 		TelemetrySequence: 8, TelemetryObservedAt: "2026-09-08T00:00:08Z",
 	})
 	if !errors.Is(err, ErrFarmRuntimeStale) {
 		t.Fatalf("stale telemetry stop err=%v", err)
+	}
+}
+
+func TestFarmStopRejectsMissingMutatedAndReusedProcessIdentityBeforeStop(t *testing.T) {
+	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	fixture.farm.controllerID = "controller-a"
+	fixture.farm.controllerGeneration = 3
+	currentStart := "1000000001"
+	fixture.farm.resourceTelemetryHooks = &FarmResourceTelemetryHooks{
+		ProcessIdentity: func(int) (string, error) { return currentStart, nil },
+	}
+	runtime, err := fixture.farm.EnsureRuntime(FarmRuntimeEnsureRequest{ProfileID: "profile-1"})
+	if err != nil {
+		t.Fatalf("EnsureRuntime: %v", err)
+	}
+	record, ok := fixture.farm.currentRecord("profile-1")
+	if !ok {
+		t.Fatal("missing owned Farm record")
+	}
+	fixture.farm.latestResourceSequence = 9
+	fixture.farm.latestResourceObservedAt = "2026-09-08T00:00:09Z"
+	base := FarmRuntimeStopRequest{
+		Provider: "farm", NodeUID: runtime.NodeUID, ProfileID: runtime.ProfileID,
+		RuntimeUID: runtime.RuntimeUID, ProviderInstanceID: runtime.ProviderInstanceID,
+		FencingEpoch: runtime.FencingEpoch, Generation: runtime.Generation,
+		PID: runtime.PID, ProcessStartIdentity: record.processStartIdentity,
+		ProfileIncarnation: record.profileIncarnation,
+		ControllerID:       "controller-a", ControllerGeneration: 3,
+		TelemetrySequence: 9, TelemetryObservedAt: "2026-09-08T00:00:09Z",
+	}
+	mutations := []struct {
+		name   string
+		mutate func(*FarmRuntimeStopRequest)
+	}{
+		{"missing pid", func(value *FarmRuntimeStopRequest) { value.PID = 0 }},
+		{"missing start", func(value *FarmRuntimeStopRequest) { value.ProcessStartIdentity = "" }},
+		{"missing incarnation", func(value *FarmRuntimeStopRequest) { value.ProfileIncarnation = "" }},
+		{"mutated pid", func(value *FarmRuntimeStopRequest) { value.PID++ }},
+		{"mutated start", func(value *FarmRuntimeStopRequest) { value.ProcessStartIdentity = "1000000002" }},
+		{"mutated incarnation", func(value *FarmRuntimeStopRequest) { value.ProfileIncarnation = "foreign" }},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			request := base
+			mutation.mutate(&request)
+			if _, err := fixture.farm.StopRuntime(request); err == nil {
+				t.Fatal("mutated stop identity was accepted")
+			}
+		})
+	}
+	currentStart = "1000000003" // PID was reused after authenticated telemetry.
+	if _, err := fixture.farm.StopRuntime(base); !errors.Is(err, ErrFarmRuntimeStale) {
+		t.Fatalf("PID reuse stop err=%v", err)
+	}
+	if fixture.stopCalls.Load() != 0 {
+		t.Fatalf("runtime stop was reached for rejected process identity: %d", fixture.stopCalls.Load())
 	}
 }
 

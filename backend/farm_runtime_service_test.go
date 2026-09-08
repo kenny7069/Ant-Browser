@@ -496,6 +496,14 @@ func TestFarmRuntimeCommandHandlerPreservesP17Envelope(t *testing.T) {
 	}); !errors.Is(err, ErrFarmRuntimeCommand) {
 		t.Fatalf("unknown command payload error = %v", err)
 	}
+	if _, err := fixture.farm.HandleCommand(FarmRuntimeCommand{
+		Type:    "command",
+		NodeUID: "node-test",
+		Command: "stop_runtime",
+		Payload: map[string]any{"profile_id": "profile-1", "password": "must-not-cross-wire"},
+	}); !errors.Is(err, ErrFarmRuntimeCommand) {
+		t.Fatalf("secret-bearing stop payload error = %v", err)
+	}
 }
 
 func TestFarmRuntimeFactoryRejectsConflictingAliases(t *testing.T) {
