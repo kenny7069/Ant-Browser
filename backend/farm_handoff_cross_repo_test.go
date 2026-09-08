@@ -111,6 +111,23 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		"runtime_lease_state", "runtime_lease_fencing_epoch",
 		"runtime_lease_expires_remaining_seconds", "runtime_lease_read_error_type",
 		"runtime_db_read_error_type",
+		// Reconcile-stop progress is restricted to enum-like strings, booleans,
+		// and typed counters. Identity objects and arbitrary error text remain
+		// excluded from diagnostics.
+		"controller_a_pid", "controller_b_pid", "controller_a_generation", "controller_b_generation",
+		"controller_a_exit_signal", "runtime_process_identity_observed", "chrome_alive_before_stop",
+		"quarantine_sent", "stop_sent", "quarantine_stop_confirmed",
+		"command_observer_installed", "command_observation_count", "command_observation_order",
+		"quarantine_command_observed", "quarantine_ack_observed", "stop_command_observed", "stop_ack_observed",
+		"quarantine_request_identity_match", "stop_request_identity_match", "quarantine_stop_order_confirmed",
+		"agent_inventory_runtime_stopped", "agent_inventory_pid_zero",
+		"agent_inventory_process_identity_preserved", "agent_inventory_profile_incarnation_preserved",
+		"agent_inventory_no_replacement", "agent_inventory_original_runtime_count",
+		"replacement_runtime_count", "original_pid_absent", "runtime_db_row_present_before",
+		"runtime_db_row_absent", "runtime_db_contradiction_preserved",
+		"stale_epoch_mutation_applied", "unknown_runtime_delete_applied",
+		"mutation_applied", "mutation_rowcount", "runtime_db_fencing_epoch_before",
+		"runtime_db_fencing_epoch_after", "reconcile_case", "reconcile_action", "reconcile_status",
 		"inventory_dispatch_attempts", "inventory_list_online", "inventory_list_generation",
 		"inventory_auth_binding_generation", "inventory_sample_generation",
 		"inventory_heartbeat_age_ms", "inventory_dispatch_error_type",
@@ -164,6 +181,11 @@ func p118ScenarioBudgetFor(scenario string) (p118ScenarioBudget, error) {
 			serverTimeout:     120 * time.Second,
 			playwrightTimeout: 60 * time.Second,
 		}, nil
+	case "stale_epoch_stop", "unknown_runtime_stop":
+		// Stop fixtures do not launch a Playwright client or wait for a gateway.
+		// Keep the existing 120-second server budget and deliberately leave both
+		// the Playwright and successor-gateway budgets disabled.
+		return p118ScenarioBudget{serverTimeout: 120 * time.Second}, nil
 	default:
 		return p118ScenarioBudget{}, fmt.Errorf("unsupported P1.18 scenario budget: %q", scenario)
 	}
@@ -191,6 +213,16 @@ func TestP118ScenarioBudgetMapping(t *testing.T) {
 		want := p118ScenarioBudget{serverTimeout: 120 * time.Second, playwrightTimeout: 60 * time.Second}
 		if budget != want {
 			t.Fatalf("scenario %q budget = %#v, want %#v", scenario, budget, want)
+		}
+	}
+	for _, scenario := range []string{"stale_epoch_stop", "unknown_runtime_stop"} {
+		budget, err := p118ScenarioBudgetFor(scenario)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := p118ScenarioBudget{serverTimeout: 120 * time.Second}
+		if budget != want {
+			t.Fatalf("stop scenario %q budget = %#v, want %#v", scenario, budget, want)
 		}
 	}
 	if _, err := p118ScenarioBudgetFor("unsupported"); err == nil {
@@ -224,8 +256,38 @@ func p118AllowlistedServerOutput(output string) string {
 	lines := make([]string, 0, 2)
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.Contains(line, "Controller B failed stage=") {
-			lines = append(lines, line)
+		marker := "Controller B failed"
+		if !strings.Contains(line, marker) {
+			continue
+		}
+		fields := []string{marker}
+		for _, field := range strings.Fields(line[strings.Index(line, marker)+len(marker):]) {
+			if !strings.HasPrefix(field, "stage=") && !strings.HasPrefix(field, "error_type=") {
+				continue
+			}
+			value := strings.TrimPrefix(strings.TrimPrefix(field, "stage="), "error_type=")
+			if value == "" || len(value) > 96 {
+				continue
+			}
+			valid := true
+			for _, character := range value {
+				if !((character >= 'a' && character <= 'z') ||
+					(character >= 'A' && character <= 'Z') ||
+					(character >= '0' && character <= '9') || character == '_' || character == '-' || character == '.') {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				if strings.HasPrefix(field, "stage=") {
+					fields = append(fields, "stage="+value)
+				} else {
+					fields = append(fields, "error_type="+value)
+				}
+			}
+		}
+		if len(fields) > 1 {
+			lines = append(lines, strings.Join(fields, " "))
 		}
 	}
 	if len(lines) == 0 {
@@ -260,13 +322,18 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		serverRepo = "/Users/bot/Desktop/p18-acceptance-docs"
 	}
 	scenario := os.Getenv("P118_HANDOFF_SCENARIO")
+	stopScenario := p118StopScenario(scenario)
 	fixtureName, err := p118ScenarioFixture(scenario)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixtureScript := filepath.Join(serverRepo, "輔助程式", fixtureName)
 	playwrightScript := filepath.Join(serverRepo, "輔助程式", "p1_18_playwright_client.py")
-	for _, path := range []string{fixtureScript, playwrightScript} {
+	dependencies := []string{fixtureScript}
+	if !stopScenario {
+		dependencies = append(dependencies, playwrightScript)
+	}
+	for _, path := range dependencies {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("requested P1.18 fixture dependency is unavailable: %v", err)
 		}
@@ -300,16 +367,27 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	serverCtx, stopServer := context.WithTimeout(context.Background(), budgets.serverTimeout)
 	defer stopServer()
 	controlDBName := fmt.Sprintf("bf_p118_%x", time.Now().UnixNano())
-	serverCommand := exec.CommandContext(serverCtx, "python3", fixtureScript,
-		"--url-file", urlFile, "--gateway-file", gatewayFile,
-		"--reattach-request-file", reattachRequestFile,
-		"--old-cdp-closed-file", oldCDPClosedFile,
-		"--reattach-gateway-file", reattachGatewayFile,
-		"--done-file", doneFile, "--evidence-file", evidenceFile,
+	serverArgs := []string{
+		"--url-file", urlFile, "--evidence-file", evidenceFile,
 		"--ca-file", caFile, "--node-uid", nodeUID,
 		"--public-key", publicKey, "--profile-id", profileID,
 		"--provider-instance-id", providerID, "--fencing-epoch", fmt.Sprint(fencingEpoch),
-		"--controller-a-id", controllerA, "--controller-b-id", controllerB)
+		"--controller-a-id", controllerA, "--controller-b-id", controllerB,
+	}
+	if stopScenario {
+		// The reconcile-stop fixture has its own bounded CLI and deliberately
+		// does not accept gateway, CDP, or Playwright marker paths.
+		serverArgs = append([]string{"--scenario", scenario}, serverArgs...)
+	} else {
+		serverArgs = append(serverArgs,
+			"--gateway-file", gatewayFile,
+			"--reattach-request-file", reattachRequestFile,
+			"--old-cdp-closed-file", oldCDPClosedFile,
+			"--reattach-gateway-file", reattachGatewayFile,
+			"--done-file", doneFile,
+		)
+	}
+	serverCommand := exec.CommandContext(serverCtx, "python3", append([]string{fixtureScript}, serverArgs...)...)
 	if budgets.fixtureTimeout > 0 {
 		serverCommand.Args = append(serverCommand.Args, "--timeout", p118TimeoutSeconds(budgets.fixtureTimeout))
 	}
@@ -412,6 +490,30 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		t.Fatalf("P1.18 Agent initial authenticated connect: %v", err)
 	}
 	defer client.Close()
+	if stopScenario {
+		// Controller B's stop commands are sent only after A has ensured the
+		// runtime. Capture the Agent-owned running identity before B takes over;
+		// the post-fixture assertion below uses a fresh InventoryWithError call
+		// rather than trusting Python's projection booleans.
+		beforeInventory := waitForP118RunningFarmInventory(t, farm, profileID, 30*time.Second)
+		commandObservation := newP118StopCommandObservation(farm, profileID, beforeInventory)
+		farm.handoffValidationHook = commandObservation.observe
+		if err := waitForP118FixtureCompletion(
+			t, budgets.serverTimeout, &serverOutput, serverDone, &serverFinished, client,
+			evidenceFile, evidenceFile+".controller-a-progress.json", evidenceFile+".controller-b-progress.json",
+		); err != nil {
+			t.Fatalf(
+				"P1.18 reconcile-stop fixture failed: %v output=%s diagnostics=%s agent_transport={%s}",
+				err, p118AllowlistedServerOutput(serverOutput.String()), p118AllowlistedJSONDiagnostics(
+					evidenceFile, evidenceFile+".controller-a-progress.json", evidenceFile+".controller-b-progress.json",
+				), p118TransportDiagnostic(client),
+			)
+		}
+		assertP118HandoffEvidence(t, evidenceFile, scenario)
+		assertP118StopCommandObservation(t, commandObservation, beforeInventory)
+		assertP118StoppedFarmInventory(t, farm, beforeInventory)
+		return
+	}
 	waitForP118TextFileOrProcess(
 		t, gatewayFile, 30*time.Second, &serverOutput, serverDone, &serverFinished, client,
 	)
@@ -459,7 +561,7 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		serverFinished = true
 		t.Fatalf(
 			"P1.18 Python fixture failed: %v output=%s agent_transport={%s}",
-			err, serverOutput.String(), p118TransportDiagnostic(client),
+			err, p118AllowlistedServerOutput(serverOutput.String()), p118TransportDiagnostic(client),
 		)
 	}
 	serverFinished = true
@@ -487,7 +589,7 @@ func waitForP118TextFileOrProcess(
 			*processFinished = true
 			t.Fatalf(
 				"P1.18 fixture exited before publishing %s: %v output=%s diagnostics=%s agent_transport={%s}",
-				filepath.Base(path), err, output.String(),
+				filepath.Base(path), err, p118AllowlistedServerOutput(output.String()),
 				p118AllowlistedJSONDiagnostics(diagnosticPaths...), p118TransportDiagnostic(client),
 			)
 			return ""
@@ -498,11 +600,39 @@ func waitForP118TextFileOrProcess(
 		case <-deadline.C:
 			t.Fatalf(
 				"P1.18 fixture did not publish %s: %s diagnostics=%s agent_transport={%s}",
-				filepath.Base(path), output.String(),
+				filepath.Base(path), p118AllowlistedServerOutput(output.String()),
 				p118AllowlistedJSONDiagnostics(diagnosticPaths...), p118TransportDiagnostic(client),
 			)
 			return ""
 		}
+	}
+}
+
+func waitForP118FixtureCompletion(
+	t *testing.T,
+	timeout time.Duration,
+	output *p118SynchronizedBuffer,
+	processDone <-chan error,
+	processFinished *bool,
+	client *FarmControlWSSClient,
+	diagnosticPaths ...string,
+) error {
+	t.Helper()
+	if timeout <= 0 {
+		return fmt.Errorf("P1.18 fixture completion timeout must be positive")
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-processDone:
+		*processFinished = true
+		return err
+	case <-timer.C:
+		t.Fatalf(
+			"P1.18 fixture did not finish within %s: output=%s diagnostics=%s agent_transport={%s}",
+			timeout, p118AllowlistedServerOutput(output.String()), p118AllowlistedJSONDiagnostics(diagnosticPaths...), p118TransportDiagnostic(client),
+		)
+		return context.DeadlineExceeded
 	}
 }
 
@@ -523,7 +653,7 @@ func waitForP118TextFile(
 	}
 	t.Fatalf(
 		"P1.18 fixture did not publish %s: %s diagnostics=%s",
-		filepath.Base(path), output.String(), p118AllowlistedJSONDiagnostics(diagnosticPaths...),
+		filepath.Base(path), p118AllowlistedServerOutput(output.String()), p118AllowlistedJSONDiagnostics(diagnosticPaths...),
 	)
 	return ""
 }
@@ -539,9 +669,11 @@ func assertP118HandoffEvidence(t *testing.T, path, scenario string) {
 		validate = validateP118CrashEvidence
 	} else if scenario == "execv" {
 		validate = validateP118ExecvEvidence
+	} else if p118StopScenario(scenario) {
+		validate = validateP118StopEvidence
 	}
 	if err := validate(raw); err != nil {
-		t.Fatalf("invalid P1.18 handoff evidence: %v evidence=%s", err, raw)
+		t.Fatalf("invalid P1.18 handoff evidence: %v evidence=%s", err, p118AllowlistedJSONDiagnostic(path))
 	}
 }
 

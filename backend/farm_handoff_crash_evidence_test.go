@@ -14,6 +14,8 @@ func p118ScenarioFixture(scenario string) (string, error) {
 		return "p1_18_crash_watcher_fixture.py", nil
 	case "execv":
 		return "p1_18_execv_fencing_fixture.py", nil
+	case "stale_epoch_stop", "unknown_runtime_stop":
+		return "p1_18_reconcile_stop_fixture.py", nil
 	default:
 		return "", fmt.Errorf("unsupported P1.18 scenario: %q", scenario)
 	}
@@ -21,10 +23,12 @@ func p118ScenarioFixture(scenario string) (string, error) {
 
 func TestP118ScenarioFixtureSelection(t *testing.T) {
 	for scenario, expected := range map[string]string{
-		"":              "p1_18_handoff_fixture.py",
-		"graceful":      "p1_18_handoff_fixture.py",
-		"crash_watcher": "p1_18_crash_watcher_fixture.py",
-		"execv":         "p1_18_execv_fencing_fixture.py",
+		"":                     "p1_18_handoff_fixture.py",
+		"graceful":             "p1_18_handoff_fixture.py",
+		"crash_watcher":        "p1_18_crash_watcher_fixture.py",
+		"execv":                "p1_18_execv_fencing_fixture.py",
+		"stale_epoch_stop":     "p1_18_reconcile_stop_fixture.py",
+		"unknown_runtime_stop": "p1_18_reconcile_stop_fixture.py",
 	} {
 		actual, err := p118ScenarioFixture(scenario)
 		if err != nil || actual != expected {
