@@ -133,6 +133,21 @@ func p118AllowlistedJSONDiagnostic(path string) string {
 		"inventory_heartbeat_age_ms", "inventory_dispatch_error_type",
 		"inventory_response_ok", "inventory_count",
 		"configured_handoff_ttl_seconds", "execv_elapsed_seconds",
+		// DB-ready/node-missing evidence is deliberately limited to enum-like
+		// status, session-generation, command-count, and process-identity
+		// projections.  Never pass URLs, ports, tokens, or raw errors through
+		// the parent diagnostic path.
+		"target_node_offline", "target_node_absent", "target_session_absent",
+		"target_commands_before_reconnect", "target_commands_after_reconnect",
+		"node_exit_persisted", "controller_a_sigkill", "controller_a_cleanup_skipped",
+		"chrome_alive_during_missing_handoff", "runtime_db_status_before", "runtime_db_status_after",
+		"runtime_db_fencing_epoch_before", "runtime_db_fencing_epoch_after",
+		"missing_only_dispatched", "missing_only_inventory_requested",
+		"cas_rejected", "cas_rowcount", "next_tick_inventory_reconciled",
+		"next_tick_reconcile_outcome", "replacement_runtime", "replacement_identity_stable",
+		"target_connection_generation_before", "target_connection_generation_after",
+		"target_inventory_complete", "target_inventory_count", "target_inventory_generation",
+		"before", "after",
 	} {
 		if value, ok := source[key]; ok {
 			allowed[key] = value
@@ -186,6 +201,10 @@ func p118ScenarioBudgetFor(scenario string) (p118ScenarioBudget, error) {
 		// Keep the existing 120-second server budget and deliberately leave both
 		// the Playwright and successor-gateway budgets disabled.
 		return p118ScenarioBudget{serverTimeout: 120 * time.Second}, nil
+	case "db_ready_node_missing":
+		return p118ScenarioBudget{serverTimeout: 120 * time.Second, fixtureTimeout: 120 * time.Second}, nil
+	case "db_ready_node_missing_race":
+		return p118ScenarioBudget{serverTimeout: 120 * time.Second, fixtureTimeout: 120 * time.Second}, nil
 	default:
 		return p118ScenarioBudget{}, fmt.Errorf("unsupported P1.18 scenario budget: %q", scenario)
 	}
@@ -223,6 +242,16 @@ func TestP118ScenarioBudgetMapping(t *testing.T) {
 		want := p118ScenarioBudget{serverTimeout: 120 * time.Second}
 		if budget != want {
 			t.Fatalf("stop scenario %q budget = %#v, want %#v", scenario, budget, want)
+		}
+	}
+	for _, scenario := range []string{"db_ready_node_missing", "db_ready_node_missing_race"} {
+		budget, err := p118ScenarioBudgetFor(scenario)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := p118ScenarioBudget{serverTimeout: 120 * time.Second, fixtureTimeout: 120 * time.Second}
+		if budget != want {
+			t.Fatalf("node-missing scenario %q budget = %#v, want %#v", scenario, budget, want)
 		}
 	}
 	if _, err := p118ScenarioBudgetFor("unsupported"); err == nil {
@@ -322,6 +351,10 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		serverRepo = "/Users/bot/Desktop/p18-acceptance-docs"
 	}
 	scenario := os.Getenv("P118_HANDOFF_SCENARIO")
+	if scenario == "db_ready_node_missing" || scenario == "db_ready_node_missing_race" {
+		runP118NodeMissingScenario(t, scenario)
+		return
+	}
 	stopScenario := p118StopScenario(scenario)
 	fixtureName, err := p118ScenarioFixture(scenario)
 	if err != nil {
