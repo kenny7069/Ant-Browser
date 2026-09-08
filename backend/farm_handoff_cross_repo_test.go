@@ -281,8 +281,11 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	evidenceFile := filepath.Join(root, "p118-evidence.json")
 	caFile := filepath.Join(root, "p118-ca.pem")
 	publicKey := base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
-	budgets := p118ScenarioBudgets(scenario)
-	serverCtx, stopServer := context.WithTimeout(context.Background(), budgets.server)
+	budgets, err := p118ScenarioBudgetFor(scenario)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCtx, stopServer := context.WithTimeout(context.Background(), budgets.serverTimeout)
 	defer stopServer()
 	controlDBName := fmt.Sprintf("bf_p118_%x", time.Now().UnixNano())
 	serverCommand := exec.CommandContext(serverCtx, "python3", fixtureScript,
@@ -295,8 +298,8 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 		"--public-key", publicKey, "--profile-id", profileID,
 		"--provider-instance-id", providerID, "--fencing-epoch", fmt.Sprint(fencingEpoch),
 		"--controller-a-id", controllerA, "--controller-b-id", controllerB)
-	if budgets.fixtureSeconds > 0 {
-		serverCommand.Args = append(serverCommand.Args, "--timeout", fmt.Sprint(budgets.fixtureSeconds))
+	if budgets.fixtureTimeout > 0 {
+		serverCommand.Args = append(serverCommand.Args, "--timeout", fmt.Sprint(budgets.fixtureTimeout/time.Second))
 	}
 	serverCommand.Env = append(os.Environ(), "SCRAPER_CONTROL_DB_NAME="+controlDBName)
 	var serverOutput p118SynchronizedBuffer
@@ -400,14 +403,14 @@ func TestFarmRuntimeP118CrossRepoRealChromeHandoff(t *testing.T) {
 	waitForP118TextFileOrProcess(
 		t, gatewayFile, 30*time.Second, &serverOutput, serverDone, &serverFinished, client,
 	)
-	playwrightCtx, cancelPlaywright := context.WithTimeout(context.Background(), budgets.playwright)
+	playwrightCtx, cancelPlaywright := context.WithTimeout(context.Background(), budgets.playwrightTimeout)
 	defer cancelPlaywright()
 	playwright := exec.CommandContext(playwrightCtx, "python3", playwrightScript,
 		"--gateway-file", gatewayFile, "--reattach-request-file", reattachRequestFile,
 		"--old-cdp-closed-file", oldCDPClosedFile,
 		"--reattach-gateway-file", reattachGatewayFile, "--done-file", doneFile)
-	if budgets.successorSeconds > 0 {
-		playwright.Args = append(playwright.Args, "--successor-gateway-timeout", fmt.Sprint(budgets.successorSeconds))
+	if budgets.successorGatewayTimeout > 0 {
+		playwright.Args = append(playwright.Args, "--successor-gateway-timeout", fmt.Sprint(budgets.successorGatewayTimeout/time.Second))
 	}
 	var playwrightOutput bytes.Buffer
 	playwright.Stdout, playwright.Stderr = &playwrightOutput, &playwrightOutput
