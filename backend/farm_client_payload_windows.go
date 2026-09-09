@@ -119,7 +119,10 @@ func farmClientSecureWindowsHandle(handle windows.Handle, directory bool) bool {
 	admins, _ := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
 	seen := map[string]bool{}
 	const fileAllAccessMask windows.ACCESS_MASK = 0x001f01ff
-	wantFlags := uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
+	wantFlags := uint8(0)
+	if directory {
+		wantFlags = uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
+	}
 	for index := uint16(0); index < dacl.AceCount; index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if windows.GetAce(dacl, uint32(index), &ace) != nil || ace == nil ||

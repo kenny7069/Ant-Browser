@@ -59,13 +59,27 @@ func TestDefaultProcessTreeRSSUsesRealChildAndFailsClosedAfterExit(t *testing.T)
 	}
 	pid := cmd.Process.Pid
 	childPID := 0
-	defer func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+	stopped := false
+	stopTree := func() {
 		if childPID > 0 {
 			if child, findErr := os.FindProcess(childPID); findErr == nil {
 				_ = child.Kill()
 			}
+		}
+		_ = cmd.Process.Kill()
+		waited := make(chan struct{})
+		go func() {
+			_, _ = cmd.Process.Wait()
+			close(waited)
+		}()
+		select {
+		case <-waited:
+		case <-time.After(2 * time.Second):
+		}
+	}
+	defer func() {
+		if !stopped {
+			stopTree()
 		}
 	}()
 	deadline := time.Now().Add(3 * time.Second)
@@ -94,8 +108,8 @@ func TestDefaultProcessTreeRSSUsesRealChildAndFailsClosedAfterExit(t *testing.T)
 	if rssErr != nil || rss <= 0 {
 		t.Fatalf("real process tree RSS pid=%d child_pid=%d rss=%d err=%v", pid, childPID, rss, rssErr)
 	}
-	_ = cmd.Process.Kill()
-	_, _ = cmd.Process.Wait()
+	stopTree()
+	stopped = true
 	if _, err := defaultProcessTreeRSS(pid); err == nil {
 		t.Fatal("exited/PID-missing process produced valid RSS")
 	}

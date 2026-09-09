@@ -123,6 +123,9 @@ func writeFarmClientUpdateState(path string, value []byte, mode os.FileMode) err
 	if _, err := temporary.Write(value); err != nil || temporary.Sync() != nil || temporary.Close() != nil {
 		return ErrFarmClientUpdateApply
 	}
+	if err := setFarmClientUpdateWindowsACL(temporaryPath); err != nil {
+		return err
+	}
 	from, err := windows.UTF16PtrFromString(temporaryPath)
 	if err != nil {
 		return ErrFarmClientUpdateApply

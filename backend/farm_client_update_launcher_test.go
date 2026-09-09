@@ -103,7 +103,9 @@ func startFarmClientProbationTestProcess(t *testing.T) *farmClientLauncherProces
 
 func TestFarmClientUpdateProbationRequiresContinuousHealth(t *testing.T) {
 	process := startFarmClientProbationTestProcess(t)
-	healthPath := filepath.Join(t.TempDir(), "health")
+	stateRoot := t.TempDir()
+	healthPath := filepath.Join(stateRoot, "updates", "health")
+	config := FarmClientConfig{StateRoot: stateRoot}
 	nonce := strings.Repeat("a", 64)
 	stop := make(chan struct{})
 	go func() {
@@ -114,7 +116,7 @@ func TestFarmClientUpdateProbationRequiresContinuousHealth(t *testing.T) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				_ = os.WriteFile(healthPath, []byte(nonce), 0o600)
+				_ = WriteFarmClientUpdateHealthMarker(config, healthPath, nonce)
 			}
 		}
 	}()
