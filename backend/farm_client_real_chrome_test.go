@@ -195,7 +195,59 @@ func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed2
 	if !attest.OK || attest.Payload.Status != "applied" {
 		return fmt.Errorf("attest failed: ok=%v status=%q error=%s", attest.OK, attest.Payload.Status, attest.Error)
 	}
+	telemetry, err := readFarmClientFixtureHeartbeat(connection)
+	if err != nil {
+		return fmt.Errorf("stop telemetry: %w", err)
+	}
+	if err := connection.WriteJSON(FarmRuntimeCommand{Type: "command", NodeUID: begin.NodeUID, CorrelationID: "c1-stop", Command: "stop_runtime", Payload: FarmRuntimeStopRequest{
+		Provider: "farm", NodeUID: runtime.NodeUID, ProfileID: runtime.ProfileID, RuntimeUID: runtime.RuntimeUID,
+		ProviderInstanceID: runtime.ProviderInstanceID, FencingEpoch: runtime.FencingEpoch,
+		ConfigHash: runtime.ConfigHash, Generation: runtime.Generation, PID: runtime.PID,
+		ProcessStartIdentity: runtime.ProcessStartIdentity, ProfileIncarnation: runtime.ProfileIncarnation,
+		ControllerID: runtime.ControllerID, ControllerGeneration: runtime.ControllerGeneration,
+		TelemetrySequence: telemetry.SampleSequence, TelemetryObservedAt: telemetry.ObservedAt,
+	}}); err != nil {
+		return fmt.Errorf("stop command: %w", err)
+	}
+	stopRaw, err := readFarmClientFixtureCommandResponse(connection, "c1-stop")
+	if err != nil {
+		return fmt.Errorf("stop response: %w", err)
+	}
+	var stop struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(stopRaw, &stop); err != nil {
+		return fmt.Errorf("decode stop response: %w", err)
+	}
+	if !stop.OK {
+		return fmt.Errorf("stop failed: %s", stop.Error)
+	}
 	return nil
+}
+
+func readFarmClientFixtureHeartbeat(connection *websocket.Conn) (FarmResourceTelemetry, error) {
+	for {
+		_, raw, err := connection.ReadMessage()
+		if err != nil {
+			return FarmResourceTelemetry{}, err
+		}
+		var heartbeat struct {
+			Type        string                 `json:"type"`
+			HeartbeatID string                 `json:"heartbeat_id"`
+			Telemetry   *FarmResourceTelemetry `json:"telemetry"`
+		}
+		if err := json.Unmarshal(raw, &heartbeat); err != nil {
+			return FarmResourceTelemetry{}, err
+		}
+		if heartbeat.Type != "heartbeat" || heartbeat.HeartbeatID == "" || heartbeat.Telemetry == nil {
+			return FarmResourceTelemetry{}, fmt.Errorf("unexpected message while awaiting stop telemetry")
+		}
+		if err := connection.WriteJSON(farmControlHeartbeatAck{Type: "heartbeat_ack", HeartbeatID: heartbeat.HeartbeatID}); err != nil {
+			return FarmResourceTelemetry{}, err
+		}
+		return *heartbeat.Telemetry, nil
+	}
 }
 
 func readFarmClientFixtureCommandResponse(connection *websocket.Conn, correlationID string) ([]byte, error) {
