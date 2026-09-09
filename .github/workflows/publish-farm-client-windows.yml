@@ -1,0 +1,70 @@
+name: Publish Farm Client Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version
+        required: false
+        default: "1.5.0"
+        type: string
+  push:
+    tags: ["farm-client-v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-farm-client-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+      - name: Test Farm Client backend
+        run: go test ./backend/... -count=1
+      - name: Build dedicated artifacts
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "${{ github.ref_name }}" -replace '^farm-client-v','' }
+          ./publish/farm-client/windows/publish-windows.ps1 -Arch amd64 -Version $version
+      - name: Validate layouts and destructive-cleanup policy
+        shell: pwsh
+        run: |
+          $zip = Get-Item publish/farm-client/windows/dist/AntFarmClient-*-windows-x64.zip
+          $setup = Get-Item publish/farm-client/windows/dist/AntFarmClient-Setup-*-x64.exe
+          if (-not $zip -or -not $setup) { throw "Farm Client artifacts missing" }
+          $text = Get-Content publish/farm-client/windows/installer.nsi -Raw
+          if ($text -match '(?i)taskkill\.exe|/IM\s+xray|/IM\s+sing-box|killall|pkill') { throw "global process-name cleanup is prohibited" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ant-farm-client-windows-amd64
+          path: |
+            publish/farm-client/windows/dist/AntFarmClient-Setup-*-x64.exe
+            publish/farm-client/windows/dist/AntFarmClient-*-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/farm-client-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || gh release create "$TAG_NAME" --generate-notes
+          gh release upload "$TAG_NAME" release-artifacts/* --clobber

@@ -26,7 +26,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const FarmClientVersion = "0.1.0-dev"
+// FarmClientVersion is overridden by dedicated packaging with -ldflags -X.
+// Development and ordinary test builds retain the explicit non-release value.
+var FarmClientVersion = "0.1.0-dev"
 
 var (
 	ErrFarmClientConfig       = errors.New("invalid ant farm client config")

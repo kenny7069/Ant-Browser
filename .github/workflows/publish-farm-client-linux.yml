@@ -1,0 +1,78 @@
+name: Publish Farm Client Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version
+        required: false
+        default: "1.5.0"
+        type: string
+  push:
+    tags: ["farm-client-v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-farm-client-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test Farm Client backend
+        run: go test ./backend/... -count=1
+      - name: Build dedicated artifacts
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-${GITHUB_REF_NAME#farm-client-v}}"
+          bash publish/farm-client/linux/package.sh --arch "${{ matrix.arch }}" --version "$version"
+      - name: Validate package layouts
+        run: |
+          set -euo pipefail
+          deb="$(ls publish/farm-client/linux/dist/ant-farm-client_*_${{ matrix.arch }}.deb)"
+          archive="$(ls publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.tar.gz)"
+          dpkg-deb -I "$deb" >/dev/null
+          dpkg-deb -c "$deb" | grep -q '/opt/ant-farm-client/ant-farm-client'
+          staging="$(mktemp -d)"
+          tar -xzf "$archive" -C "$staging"
+          test -x "$staging/ant-farm-client"
+          test -x "$staging/bin/xray"
+          test -x "$staging/bin/sing-box"
+          test -f "$staging/config.example.yaml"
+          "$staging/ant-farm-client" -version | grep -Fq "\"version\":\"$version\""
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ant-farm-client-linux-${{ matrix.arch }}
+          path: |
+            publish/farm-client/linux/dist/ant-farm-client_*_${{ matrix.arch }}.deb
+            publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/farm-client-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: release-artifacts, merge-multiple: true }
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || gh release create "$TAG_NAME" --generate-notes
+          gh release upload "$TAG_NAME" release-artifacts/* --clobber

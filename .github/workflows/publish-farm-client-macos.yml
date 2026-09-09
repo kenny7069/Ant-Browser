@@ -1,0 +1,65 @@
+name: Publish Farm Client macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version
+        required: false
+        default: "1.5.0"
+        type: string
+  push:
+    tags: ["farm-client-v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-farm-client-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: macos-15-intel }
+          - { arch: arm64, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test Farm Client backend
+        run: go test ./backend/... -count=1
+      - name: Build dedicated unsigned artifact
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-${GITHUB_REF_NAME#farm-client-v}}"
+          bash publish/farm-client/macos/package.sh --arch "${{ matrix.arch }}" --version "$version"
+      - name: Validate app and signing gate
+        run: |
+          set -euo pipefail
+          app="$(ls -d publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.app)"
+          zip="$(ls publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.zip)"
+          test -x "$app/Contents/MacOS/ant-farm-client"
+          test -x "$app/Contents/Resources/bin/xray"
+          test -x "$app/Contents/Resources/bin/sing-box"
+          plutil -lint "$app/Contents/Info.plist"
+          test -f "$zip"
+          "$app/Contents/MacOS/ant-farm-client" -version | grep -Fq "\"version\":\"$version\""
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "Release tags require a later C10 Developer ID/notarization job; unsigned upload is intentionally refused."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ant-farm-client-macos-${{ matrix.arch }}-unsigned
+          path: |
+            publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.app
+            publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error

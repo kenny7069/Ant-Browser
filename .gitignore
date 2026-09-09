@@ -56,6 +56,12 @@ chrome/*
 # Publish artifacts
 publish/staging/
 publish/output/
+publish/farm-client/linux/dist/
+publish/farm-client/linux/.staging/
+publish/farm-client/macos/dist/
+publish/farm-client/macos/.staging/
+publish/farm-client/windows/dist/
+publish/farm-client/windows/.staging/
 
 # Internal docs / scratch files
 docs/*
