@@ -260,6 +260,9 @@ func (h *FarmClientHost) run(ctx context.Context, markerPath, nonce string) erro
 		ticker.Stop()
 		deadline.Stop()
 		if err := WriteFarmClientUpdateHealthMarker(h.config, markerPath, nonce); err != nil {
+			if h.log != nil {
+				h.log.Error("farm client update health marker failed", logger.F("error", err))
+			}
 			_ = h.PrepareForUpdate()
 			return h.ShutdownWithError(err)
 		}
@@ -278,6 +281,9 @@ func (h *FarmClientHost) run(ctx context.Context, markerPath, nonce string) erro
 					continue
 				}
 				if err := WriteFarmClientUpdateHealthMarker(h.config, markerPath, nonce); err != nil {
+					if h.log != nil {
+						h.log.Error("farm client update health refresh failed", logger.F("error", err))
+					}
 					_ = h.PrepareForUpdate()
 					return h.ShutdownWithError(err)
 				}

@@ -397,5 +397,21 @@ func WriteFarmClientUpdateHealthMarker(config FarmClientConfig, path, nonce stri
 	if err := secureFarmClientUpdateDirectory(root); err != nil {
 		return err
 	}
+	// The nonce is immutable for one probation process. Refreshing the existing
+	// marker's timestamp avoids replacing the same pathname every second. On
+	// Windows that replacement races the launcher's os.ReadFile handle, which
+	// intentionally does not grant FILE_SHARE_DELETE.
+	if raw, err := os.ReadFile(path); err == nil {
+		if strings.TrimSpace(string(raw)) != nonce {
+			return ErrFarmClientUpdateApply
+		}
+		now := time.Now()
+		if err := os.Chtimes(path, now, now); err != nil {
+			return errors.Join(ErrFarmClientUpdateApply, err)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return errors.Join(ErrFarmClientUpdateApply, err)
+	}
 	return writeFarmClientUpdateState(path, []byte(nonce), 0o600)
 }

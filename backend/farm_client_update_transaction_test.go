@@ -272,6 +272,21 @@ func TestFarmClientUpdateHealthMarkerCannotEscapePrivateUpdateRoot(t *testing.T)
 	if raw, err := os.ReadFile(valid); err != nil || string(raw) != nonce {
 		t.Fatalf("raw=%q err=%v", raw, err)
 	}
+	before, err := os.Stat(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := WriteFarmClientUpdateHealthMarker(config, valid, nonce); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || !after.ModTime().After(before.ModTime()) {
+		t.Fatalf("health refresh replaced the marker or did not advance mtime: before=%v after=%v", before.ModTime(), after.ModTime())
+	}
 	if err := WriteFarmClientUpdateHealthMarker(config, filepath.Join(root, "outside"), nonce); !errors.Is(err, ErrFarmClientUpdateApply) {
 		t.Fatalf("escape err=%v", err)
 	}
