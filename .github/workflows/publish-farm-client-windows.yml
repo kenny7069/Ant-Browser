@@ -92,6 +92,28 @@ jobs:
             $env:C8_AUTOSTART_METHOD = "scheduled-task-at-logon"
             go test ./backend -run '^TestFarmClientInstalledArtifactAutostartNative$' -count=1 -v
             if ($LASTEXITCODE -ne 0) { throw "native autostart E2E failed" }
+            $baseVersion = ($version -split '-')[0]
+            $parts = $baseVersion.Split('.')
+            $invalidParts = @($parts | Where-Object { $_ -notmatch '^\d+$' })
+            if ($parts.Count -ne 3 -or $invalidParts.Count -gt 0) { throw "C8 update requires a numeric semantic package version" }
+            $versionB = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"
+            $releaseA = Join-Path $env:RUNNER_TEMP "AntFarmClient-$version-windows-amd64.update.exe"
+            Copy-Item -LiteralPath (Get-Item "publish/farm-client/windows/dist/AntFarmClient-$version-windows-amd64.update.exe").FullName -Destination $releaseA -Force
+            $releaseB = Join-Path $env:RUNNER_TEMP "AntFarmClient-$versionB-windows-amd64.update.exe"
+            $env:GOOS = "windows"; $env:GOARCH = "amd64"; $env:CGO_ENABLED = "0"
+            go build -trimpath -ldflags "-s -w -X ant-chrome/backend.FarmClientVersion=$versionB" -o $releaseB ./backend/cmd/ant-farm-client
+            if ($LASTEXITCODE -ne 0) { throw "release B build failed" }
+            $env:C8_INSTALLED_UPDATE_E2E = "1"
+            $env:C8_UPDATE_INSTALLED_CLIENT = $client
+            $env:C8_UPDATE_INSTALLED_ROOT = $installRoot
+            $env:C8_UPDATE_RELEASE_A = $releaseA
+            $env:C8_UPDATE_RELEASE_B = $releaseB
+            $env:C8_UPDATE_RELEASE_A_SHA256 = (Get-FileHash -Algorithm SHA256 $releaseA).Hash.ToLowerInvariant()
+            $env:C8_UPDATE_RELEASE_B_SHA256 = (Get-FileHash -Algorithm SHA256 $releaseB).Hash.ToLowerInvariant()
+            $env:C8_UPDATE_VERSION_A = $version
+            $env:C8_UPDATE_VERSION_B = $versionB
+            go test ./backend -run '^TestFarmClientInstalledArtifactSignedUpdateRollback$' -count=1 -timeout=10m -v
+            if ($LASTEXITCODE -ne 0) { throw "installed signed update/rollback E2E failed" }
           } finally {
             $uninstaller = Join-Path $installRoot "Uninstall.exe"
             if (Test-Path $uninstaller) {

@@ -107,6 +107,9 @@ func TestFarmClientUpdateProbationRequiresContinuousHealth(t *testing.T) {
 	healthPath := filepath.Join(stateRoot, "updates", "health")
 	config := FarmClientConfig{StateRoot: stateRoot}
 	nonce := strings.Repeat("a", 64)
+	if err := WriteFarmClientUpdateHealthMarker(config, healthPath, nonce); err != nil {
+		t.Fatal(err)
+	}
 	stop := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(40 * time.Millisecond)
@@ -120,7 +123,9 @@ func TestFarmClientUpdateProbationRequiresContinuousHealth(t *testing.T) {
 			}
 		}
 	}()
-	if err := waitFarmClientUpdateProbation(context.Background(), process, healthPath, nonce, 3*time.Second, 350*time.Millisecond); err != nil {
+	// The health timeout only bounds the first authenticated marker. Once the
+	// marker is live, a longer probation is governed by continuous freshness.
+	if err := waitFarmClientUpdateProbation(context.Background(), process, healthPath, nonce, 400*time.Millisecond, 700*time.Millisecond); err != nil {
 		close(stop)
 		t.Fatal(err)
 	}

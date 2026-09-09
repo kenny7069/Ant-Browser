@@ -264,6 +264,7 @@ func waitFarmClientUpdateProbation(ctx context.Context, process *farmClientLaunc
 	}
 	healthDeadline := time.NewTimer(healthTimeout)
 	defer healthDeadline.Stop()
+	healthDeadlineChannel := healthDeadline.C
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	var probationStarted time.Time
@@ -278,7 +279,7 @@ func waitFarmClientUpdateProbation(ctx context.Context, process *farmClientLaunc
 				return ErrFarmClientUpdateApply
 			}
 			return errors.Join(ErrFarmClientUpdateApply, err)
-		case <-healthDeadline.C:
+		case <-healthDeadlineChannel:
 			return errors.Join(ErrFarmClientUpdateApply, context.DeadlineExceeded)
 		case <-ticker.C:
 			raw, err := os.ReadFile(healthPath)
@@ -291,6 +292,13 @@ func waitFarmClientUpdateProbation(ctx context.Context, process *farmClientLaunc
 				continue
 			}
 			if probationStarted.IsZero() {
+				if !healthDeadline.Stop() {
+					select {
+					case <-healthDeadline.C:
+					default:
+					}
+				}
+				healthDeadlineChannel = nil
 				probationStarted = time.Now()
 			}
 			if time.Since(probationStarted) >= probation {

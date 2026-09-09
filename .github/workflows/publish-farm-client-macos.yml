@@ -94,6 +94,26 @@ jobs:
           C8_INSTALLED_ROOT="$install_root" \
           C8_AUTOSTART_METHOD="launchagent" \
           go test ./backend -run '^TestFarmClientInstalledArtifactAutostartNative$' -count=1 -v
+          base_version="${version%%-*}"
+          IFS=. read -r major minor patch <<< "$base_version"
+          [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]]
+          version_b="$major.$minor.$((10#$patch + 1))"
+          release_a="$RUNNER_TEMP/AntFarmClient-${version}-darwin-${{ matrix.arch }}.update.bin"
+          cp "$(cd "$(dirname "$(ls publish/farm-client/macos/dist/AntFarmClient-${version}-darwin-${{ matrix.arch }}.update.bin)")" && pwd -P)/AntFarmClient-${version}-darwin-${{ matrix.arch }}.update.bin" "$release_a"
+          release_b="$RUNNER_TEMP/AntFarmClient-${version_b}-darwin-${{ matrix.arch }}.update.bin"
+          GOOS=darwin GOARCH="${{ matrix.arch }}" CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X ant-chrome/backend.FarmClientVersion=$version_b" \
+            -o "$release_b" ./backend/cmd/ant-farm-client
+          C8_INSTALLED_UPDATE_E2E=1 \
+          C8_UPDATE_INSTALLED_CLIENT="$installed_app/Contents/MacOS/ant-farm-client" \
+          C8_UPDATE_INSTALLED_ROOT="$install_root" \
+          C8_UPDATE_RELEASE_A="$release_a" \
+          C8_UPDATE_RELEASE_B="$release_b" \
+          C8_UPDATE_RELEASE_A_SHA256="$(shasum -a 256 "$release_a" | awk '{print $1}')" \
+          C8_UPDATE_RELEASE_B_SHA256="$(shasum -a 256 "$release_b" | awk '{print $1}')" \
+          C8_UPDATE_VERSION_A="$version" \
+          C8_UPDATE_VERSION_B="$version_b" \
+          go test ./backend -run '^TestFarmClientInstalledArtifactSignedUpdateRollback$' -count=1 -timeout=10m -v
       - uses: actions/upload-artifact@v4
         with:
           name: ant-farm-client-macos-${{ matrix.arch }}-unsigned
