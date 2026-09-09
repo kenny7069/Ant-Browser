@@ -40,7 +40,7 @@ jobs:
           # POSIX-only executable assumptions. Keep this native job focused on
           # the standalone Client surface; the installed-artifact steps below
           # exercise the real Windows browser and Scheduled Task backends.
-          go test ./backend -run '^(TestFarmClient(Update|Config|Identity|Autostart|Diagnostics|Packaging|Package|Release)|TestEnrollFarmClient|TestDefaultProcessTreeRSSUsesRealChildAndFailsClosedAfterExit|TestFarmClientWindowsPinnedHandleBlocksReplacement)' -count=1
+          go test ./backend -run '^(TestFarmClient(Update|Config|Identity|Autostart|Diagnostics|Packaging|Package|Release)|TestEnrollFarmClient|TestDefaultProcessTreeRSSUsesRealChildAndFailsClosedAfterExit|TestFarmClientWindowsPinnedHandleBlocksReplacement|TestStopBrowserProcessCommandTerminatesWindowsTree)' -count=1
           if ($LASTEXITCODE -ne 0) { throw "Farm Client backend tests failed" }
           go test ./backend/cmd/ant-farm-client ./backend/internal/automation -count=1
           if ($LASTEXITCODE -ne 0) { throw "Farm Client command tests failed" }
