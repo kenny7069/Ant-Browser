@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // browserRuntimeLocalProcessOwner adapts the existing stderr/debug-port
@@ -47,15 +48,16 @@ func NewBrowserRuntimeLocalProcess(spec BrowserRuntimeLaunchSpec) (*BrowserRunti
 
 	cmd := exec.Command(binaryPath, append([]string(nil), spec.Args...)...)
 	cmd.Dir = filepath.Dir(binaryPath)
+	// Stderr is copied through a Go writer so Wait cannot outrun diagnostic
+	// capture. Bound inherited pipe handles from an escaped descendant; normal
+	// ownership-aware shutdown still terminates the entire process group/tree.
+	cmd.WaitDelay = 100 * time.Millisecond
 	configureBrowserProcessCommand(cmd)
 	monitor, err := newBrowserProcessMonitor(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("browser runtime local process: stderr monitor setup failed: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		if monitor.stderr != nil {
-			_ = monitor.stderr.Close()
-		}
 		return nil, fmt.Errorf("%s", describeChromeProcessStartError(binaryPath, err))
 	}
 

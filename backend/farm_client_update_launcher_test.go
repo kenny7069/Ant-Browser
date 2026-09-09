@@ -111,7 +111,9 @@ func TestFarmClientUpdateProbationRequiresContinuousHealth(t *testing.T) {
 		t.Fatal(err)
 	}
 	stop := make(chan struct{})
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		ticker := time.NewTicker(40 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -125,11 +127,12 @@ func TestFarmClientUpdateProbationRequiresContinuousHealth(t *testing.T) {
 	}()
 	// The health timeout only bounds the first authenticated marker. Once the
 	// marker is live, a longer probation is governed by continuous freshness.
-	if err := waitFarmClientUpdateProbation(context.Background(), process, healthPath, nonce, 400*time.Millisecond, 700*time.Millisecond); err != nil {
-		close(stop)
+	err := waitFarmClientUpdateProbation(context.Background(), process, healthPath, nonce, 400*time.Millisecond, 700*time.Millisecond)
+	close(stop)
+	<-stopped
+	if err != nil {
 		t.Fatal(err)
 	}
-	close(stop)
 }
 
 func TestStopFarmClientAgentDoesNotConsumeCompletionTwice(t *testing.T) {

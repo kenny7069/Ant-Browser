@@ -1,11 +1,8 @@
 package backend
 
 import (
-	"bufio"
 	"fmt"
-	"io"
 	"net/url"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -24,10 +21,8 @@ type browserProcessExitResult struct {
 
 type browserProcessMonitor struct {
 	cmd        *exec.Cmd
-	stderr     io.ReadCloser
 	stderrTail *tailTextBuffer
-	stderrInit chan struct{}
-	stderrDone chan struct{}
+	stderr     *browserProcessStderrWriter
 	waitDone   chan struct{}
 
 	mu        sync.Mutex
@@ -39,25 +34,20 @@ func newBrowserProcessMonitor(cmd *exec.Cmd) (*browserProcessMonitor, error) {
 	if cmd == nil {
 		return nil, fmt.Errorf("browser command is nil")
 	}
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
+	if cmd.Stderr != nil {
+		return nil, fmt.Errorf("browser command stderr is already configured")
 	}
-
-	return &browserProcessMonitor{
+	monitor := &browserProcessMonitor{
 		cmd:        cmd,
-		stderr:     stderr,
 		stderrTail: newTailTextBuffer(browserStderrTailMaxLines, browserStderrTailMaxBytes),
-		stderrInit: make(chan struct{}),
-		stderrDone: make(chan struct{}),
 		waitDone:   make(chan struct{}),
-	}, nil
+	}
+	monitor.stderr = &browserProcessStderrWriter{monitor: monitor}
+	cmd.Stderr = monitor.stderr
+	return monitor, nil
 }
 
 func (m *browserProcessMonitor) Start() {
-	go m.captureStderr()
-	<-m.stderrInit
 	go m.waitForExit()
 }
 
@@ -107,46 +97,9 @@ func (m *browserProcessMonitor) SetDebugPort(port int) {
 	m.mu.Unlock()
 }
 
-func (m *browserProcessMonitor) captureStderr() {
-	defer close(m.stderrDone)
-
-	if m.stderr == nil {
-		close(m.stderrInit)
-		return
-	}
-	defer m.stderr.Close()
-
-	scanner := bufio.NewScanner(m.stderr)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	close(m.stderrInit)
-	for scanner.Scan() {
-		line := scanner.Text()
-		m.stderrTail.Append(line)
-		if port, ok := parseBrowserDebugPortFromStderrLine(line); ok {
-			m.SetDebugPort(port)
-		}
-	}
-	if err := scanner.Err(); err != nil && !shouldIgnoreBrowserStderrReadError(err) {
-		m.stderrTail.Append(fmt.Sprintf("[stderr read error] %v", err))
-	}
-}
-
-func shouldIgnoreBrowserStderrReadError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if err == io.EOF || err == os.ErrClosed {
-		return true
-	}
-
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	return strings.Contains(message, "file already closed") ||
-		strings.Contains(message, "handle is invalid")
-}
-
 func (m *browserProcessMonitor) waitForExit() {
 	err := m.cmd.Wait()
-	<-m.stderrDone
+	m.stderr.Flush()
 
 	m.mu.Lock()
 	m.result = browserProcessExitResult{
@@ -155,6 +108,57 @@ func (m *browserProcessMonitor) waitForExit() {
 	}
 	m.mu.Unlock()
 	close(m.waitDone)
+}
+
+// browserProcessStderrWriter lets os/exec own the pipe and its copy goroutine.
+// Cmd.Wait therefore cannot publish an exit result until every stderr byte has
+// reached this writer, including output from a process that exits immediately.
+type browserProcessStderrWriter struct {
+	monitor *browserProcessMonitor
+	mu      sync.Mutex
+	pending string
+}
+
+func (w *browserProcessStderrWriter) Write(value []byte) (int, error) {
+	w.mu.Lock()
+	w.pending += string(value)
+	lines := make([]string, 0, strings.Count(w.pending, "\n"))
+	for {
+		index := strings.IndexByte(w.pending, '\n')
+		if index < 0 {
+			break
+		}
+		lines = append(lines, w.pending[:index])
+		w.pending = w.pending[index+1:]
+	}
+	if len(w.pending) > 1024*1024 {
+		w.pending = w.pending[len(w.pending)-1024*1024:]
+	}
+	w.mu.Unlock()
+	for _, line := range lines {
+		w.publish(line)
+	}
+	return len(value), nil
+}
+
+func (w *browserProcessStderrWriter) Flush() {
+	w.mu.Lock()
+	line := w.pending
+	w.pending = ""
+	w.mu.Unlock()
+	if line != "" {
+		w.publish(line)
+	}
+}
+
+func (w *browserProcessStderrWriter) publish(line string) {
+	if w == nil || w.monitor == nil {
+		return
+	}
+	w.monitor.stderrTail.Append(line)
+	if port, ok := parseBrowserDebugPortFromStderrLine(line); ok {
+		w.monitor.SetDebugPort(port)
+	}
 }
 
 type tailTextBuffer struct {
