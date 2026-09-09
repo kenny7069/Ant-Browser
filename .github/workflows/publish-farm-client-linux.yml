@@ -46,6 +46,12 @@ jobs:
           npx --yes playwright@1.63.0 install --with-deps --no-shell chromium
           chrome="$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f -name chrome -path '*/chromium-*/*' -print -quit)"
           test -x "$chrome"
+          sandbox="$(dirname "$chrome")/chrome_sandbox"
+          test -f "$sandbox"
+          sudo chown root:root "$sandbox"
+          sudo chmod 4755 "$sandbox"
+          test "$(stat -c '%U:%G' "$sandbox")" = "root:root"
+          test -u "$sandbox"
           echo "C8_PLAYWRIGHT_CHROMIUM=$chrome" >> "$GITHUB_ENV"
       - name: Test Farm Client backend
         run: go test ./backend/... -count=1
