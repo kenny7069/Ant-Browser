@@ -17,7 +17,7 @@
 | C4 | Background lifecycle | per-user autostart, production controller fence, graceful ownership-aware shutdown | PASS in unit/integration/cross-build; native installed login/reboot repeats at C8 |
 | C5 | Dedicated packaging | isolated Windows setup/zip, Linux deb/tar, macOS app/zip, runtime/version/release gates | PASS; Windows native install and macOS production signing remain C8/C10 |
 | C6 | Fleet management | inventory, enrollment, named actions, pairing, telemetry, closed command surface | PASS |
-| C7 | Signed update | signed update, drain/restart/reconcile and rollback | Not started |
+| C7 | Signed update | signed update, drain/restart/reconcile, pinned execution and rollback | PASS; independent SOL-MID review found no remaining P0/P1/P2/P3 |
 | C8-C10 | Installed E2E/release | Windows, Linux, macOS, social, soak, chaos | Not started |
 
 No skipped real-browser, cross-repository, Windows, installed-artifact, soak, or
@@ -111,3 +111,20 @@ acceptance gates remain C8 and C10 respectively.
 The available live MySQL instance was not migrated as part of this gate.
 Installed-environment migration and multi-process deployment checks remain C8
 evidence and are not inferred from mocked transaction/schema tests.
+
+## C7 commands (macOS arm64 + target builds)
+
+| Command / evidence | Result |
+|---|---|
+| `go test ./backend/... -count=1` | PASS |
+| `go test -race ./backend/... -count=1` | PASS |
+| `go vet ./backend/...` | PASS |
+| Windows amd64, Linux amd64/arm64 and Darwin amd64/arm64 Client builds | PASS |
+| launcher, probation, WSS-loss preservation, activation crash/replay and pinned payload tests | PASS |
+| Server `test_control_wss_p1_7.py` | PASS, 38 passed; 1 existing environment skip |
+| Server `test_farm_admin_c6.py` | PASS, 19 tests |
+| fresh independent SOL-MID gate review | C7 PASS; no remaining P0/P1/P2/P3 |
+
+The native publish workflows execute the backend tests on each target runner;
+fresh installed upgrade/rollback, real login persistence, two-account ACL and
+true MySQL deployment races remain C8 evidence rather than inferred C7 PASS.

@@ -137,6 +137,7 @@ DEB_ROOT="$STAGE_DIR/deb"
 DEB_INSTALL_ROOT="$DEB_ROOT/opt/ant-farm-client"
 TAR_NAME="AntFarmClient-${VERSION}-linux-${ARCH}.tar.gz"
 DEB_NAME="ant-farm-client_${VERSION}_${ARCH}.deb"
+UPDATE_NAME="AntFarmClient-${VERSION}-linux-${ARCH}.update.bin"
 
 [[ -f "$XRAY_SRC" && -f "$SINGBOX_SRC" ]] || die "missing runtime binaries for $TARGET under $RUNTIME_DIR"
 [[ -f "$CONFIG_SRC" ]] || die "missing config example: $CONFIG_SRC"
@@ -181,6 +182,9 @@ else
 fi
 
 [[ -x "$CLIENT_BINARY" || -f "$CLIENT_BINARY" ]] || die "client binary was not produced: $CLIENT_BINARY"
+rm -f "$OUTPUT_DIR/$UPDATE_NAME"
+cp "$CLIENT_BINARY" "$OUTPUT_DIR/$UPDATE_NAME"
+chmod 0755 "$OUTPUT_DIR/$UPDATE_NAME"
 
 echo "[2/4] Assembling tar staging..."
 cp "$CLIENT_BINARY" "$TAR_STAGE/ant-farm-client"
@@ -217,4 +221,5 @@ dpkg-deb --build --root-owner-group "$DEB_ROOT" "$OUTPUT_DIR/$DEB_NAME" >/dev/nu
 echo "[4/4] Package complete"
 echo "  - $OUTPUT_DIR/$TAR_NAME"
 echo "  - $OUTPUT_DIR/$DEB_NAME"
+echo "  - $OUTPUT_DIR/$UPDATE_NAME (signed-manifest payload)"
 echo "  - no machine daemon or post-install registration was created"

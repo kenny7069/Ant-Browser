@@ -16,6 +16,7 @@ type FarmClientDiagnostics struct {
 	ControlConfigured    bool   `json:"control_configured"`
 	EnrollmentConfigured bool   `json:"enrollment_configured"`
 	PairingConfigured    bool   `json:"pairing_configured"`
+	UpdateConfigured     bool   `json:"update_configured"`
 	SecureIdentity       bool   `json:"secure_identity"`
 }
 
@@ -28,6 +29,7 @@ func FarmClientDiagnosticsValue(config FarmClientConfig) FarmClientDiagnostics {
 		ControlConfigured:    strings.TrimSpace(config.ControlURL) != "" || strings.TrimSpace(config.WSSURL) != "",
 		EnrollmentConfigured: strings.TrimSpace(config.EnrollmentURL) != "",
 		PairingConfigured:    strings.TrimSpace(config.PairingURL) != "",
+		UpdateConfigured:     strings.TrimSpace(config.UpdateManifestURL) != "" && strings.TrimSpace(config.UpdatePublicKey) != "",
 		SecureIdentity:       strings.TrimSpace(identity.PrivateKeyRef) != "",
 	}
 }

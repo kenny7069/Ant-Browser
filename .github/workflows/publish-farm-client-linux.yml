@@ -46,6 +46,7 @@ jobs:
           set -euo pipefail
           deb="$(ls publish/farm-client/linux/dist/ant-farm-client_*_${{ matrix.arch }}.deb)"
           archive="$(ls publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.tar.gz)"
+          update="$(ls publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.update.bin)"
           dpkg-deb -I "$deb" >/dev/null
           dpkg-deb -c "$deb" | grep -q '/opt/ant-farm-client/ant-farm-client'
           staging="$(mktemp -d)"
@@ -55,12 +56,14 @@ jobs:
           test -x "$staging/bin/sing-box"
           test -f "$staging/config.example.yaml"
           "$staging/ant-farm-client" -version | grep -Fq "\"version\":\"$version\""
+          "$update" -version | grep -Fq "\"version\":\"$version\""
       - uses: actions/upload-artifact@v4
         with:
           name: ant-farm-client-linux-${{ matrix.arch }}
           path: |
             publish/farm-client/linux/dist/ant-farm-client_*_${{ matrix.arch }}.deb
             publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.tar.gz
+            publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.update.bin
           if-no-files-found: error
 
   release:

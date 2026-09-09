@@ -44,3 +44,15 @@ func TestEnrollmentCodeReaderIsBoundedAndTrims(t *testing.T) {
 		t.Fatalf("code=%q err=%v", code, err)
 	}
 }
+
+func TestFarmAgentControlDistinguishesStopFromPreserve(t *testing.T) {
+	if farmAgentControlPreservesRuntimes(strings.NewReader("S")) {
+		t.Fatal("ordinary service stop unexpectedly preserved runtimes")
+	}
+	if !farmAgentControlPreservesRuntimes(strings.NewReader("P")) {
+		t.Fatal("update rollback did not preserve runtimes")
+	}
+	if !farmAgentControlPreservesRuntimes(strings.NewReader("")) {
+		t.Fatal("launcher death EOF did not preserve runtimes")
+	}
+}

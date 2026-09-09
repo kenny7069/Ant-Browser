@@ -18,7 +18,10 @@ type FarmClientInstanceLock struct {
 }
 
 func AcquireFarmClientInstanceLock(stateRoot string) (*FarmClientInstanceLock, error) {
-	path := filepath.Join(stateRoot, ".ant-farm-client.lock")
+	return acquireFarmClientFileLock(filepath.Join(stateRoot, ".ant-farm-client.lock"))
+}
+
+func acquireFarmClientFileLock(path string) (*FarmClientInstanceLock, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open instance lock: %v", ErrFarmClientAlreadyRun, err)

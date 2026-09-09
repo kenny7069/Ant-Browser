@@ -42,7 +42,10 @@ jobs:
         run: |
           $zip = Get-Item publish/farm-client/windows/dist/AntFarmClient-*-windows-x64.zip
           $setup = Get-Item publish/farm-client/windows/dist/AntFarmClient-Setup-*-x64.exe
-          if (-not $zip -or -not $setup) { throw "Farm Client artifacts missing" }
+          $update = Get-Item publish/farm-client/windows/dist/AntFarmClient-*-windows-amd64.update.exe
+          if (-not $zip -or -not $setup -or -not $update) { throw "Farm Client artifacts missing" }
+          $versionOutput = & $update.FullName -version
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch '"version"') { throw "Update binary failed" }
           $text = Get-Content publish/farm-client/windows/installer.nsi -Raw
           if ($text -match '(?i)taskkill\.exe|/IM\s+xray|/IM\s+sing-box|killall|pkill') { throw "global process-name cleanup is prohibited" }
       - uses: actions/upload-artifact@v4
@@ -51,6 +54,7 @@ jobs:
           path: |
             publish/farm-client/windows/dist/AntFarmClient-Setup-*-x64.exe
             publish/farm-client/windows/dist/AntFarmClient-*-windows-x64.zip
+            publish/farm-client/windows/dist/AntFarmClient-*-windows-amd64.update.exe
           if-no-files-found: error
 
   release:

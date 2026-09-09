@@ -70,7 +70,16 @@ type FarmClientConfig struct {
 	// PairingURL is the C3 signed profile-pair endpoint. Unpair uses the same
 	// origin and the sibling /unpair path; neither endpoint is stored in output.
 	PairingURL string `yaml:"pairing_url,omitempty" json:"pairing_url,omitempty"`
-	NodeName   string `yaml:"node_name,omitempty" json:"node_name,omitempty"`
+	// UpdateManifestURL serves a signed envelope; UpdatePublicKey is the pinned
+	// Ed25519 verification key. They must be configured together.
+	UpdateManifestURL     string `yaml:"update_manifest_url,omitempty" json:"update_manifest_url,omitempty"`
+	UpdatePublicKey       string `yaml:"update_public_key,omitempty" json:"update_public_key,omitempty"`
+	UpdateChannel         string `yaml:"update_channel,omitempty" json:"update_channel,omitempty"`
+	AllowUpdateDowngrade  bool   `yaml:"allow_update_downgrade,omitempty" json:"allow_update_downgrade,omitempty"`
+	UpdateCheckIntervalMs int    `yaml:"update_check_interval_ms,omitempty" json:"update_check_interval_ms,omitempty"`
+	UpdateHealthTimeoutMs int    `yaml:"update_health_timeout_ms,omitempty" json:"update_health_timeout_ms,omitempty"`
+	UpdateProbationMs     int    `yaml:"update_probation_ms,omitempty" json:"update_probation_ms,omitempty"`
+	NodeName              string `yaml:"node_name,omitempty" json:"node_name,omitempty"`
 	// AllowLoopbackHTTPEnrollment is an explicit development/test escape hatch.
 	// Production enrollment remains HTTPS-only, including loopback by default.
 	AllowLoopbackHTTPEnrollment bool `yaml:"allow_loopback_http_enrollment,omitempty" json:"allow_loopback_http_enrollment,omitempty"`
@@ -220,6 +229,28 @@ func (c *FarmClientConfig) ValidateFarmClientConfig() error {
 		}
 		c.PairingURL = pairingURL
 	}
+	updateURLConfigured := strings.TrimSpace(c.UpdateManifestURL) != ""
+	updateKeyConfigured := strings.TrimSpace(c.UpdatePublicKey) != ""
+	if updateURLConfigured != updateKeyConfigured {
+		return fmt.Errorf("%w: update URL and public key must be configured together", ErrFarmClientConfig)
+	}
+	if updateURLConfigured {
+		updateURL, err := normalizeFarmClientHTTPSURL(c.UpdateManifestURL, "update manifest")
+		if err != nil {
+			return err
+		}
+		if _, err := decodeFarmClientUpdatePublicKey(c.UpdatePublicKey); err != nil {
+			return fmt.Errorf("%w: update public key is invalid", ErrFarmClientConfig)
+		}
+		c.UpdateManifestURL = updateURL
+		c.UpdatePublicKey = strings.TrimSpace(c.UpdatePublicKey)
+		if strings.TrimSpace(c.UpdateChannel) == "" {
+			c.UpdateChannel = "stable"
+		}
+		if !farmClientUpdateChannelPattern.MatchString(c.UpdateChannel) {
+			return fmt.Errorf("%w: update channel is invalid", ErrFarmClientConfig)
+		}
+	}
 	if strings.TrimSpace(c.ProviderInstanceID) == "" {
 		c.ProviderInstanceID = "ant-farm-client-" + identity.NodeUID
 	}
@@ -245,6 +276,15 @@ func (c *FarmClientConfig) ValidateFarmClientConfig() error {
 		return err
 	}
 	if err := validateFarmClientMilliseconds(c.ReconnectMaxBackoffMs, 1, 120000, "reconnect maximum backoff"); err != nil {
+		return err
+	}
+	if err := validateFarmClientMilliseconds(c.UpdateCheckIntervalMs, 60000, 86400000, "update check interval"); err != nil {
+		return err
+	}
+	if err := validateFarmClientMilliseconds(c.UpdateHealthTimeoutMs, 10000, 600000, "update health timeout"); err != nil {
+		return err
+	}
+	if err := validateFarmClientMilliseconds(c.UpdateProbationMs, 30000, 600000, "update probation"); err != nil {
 		return err
 	}
 	if c.ReconnectMinBackoffMs > 0 && c.ReconnectMaxBackoffMs > 0 && c.ReconnectMinBackoffMs > c.ReconnectMaxBackoffMs {
@@ -381,6 +421,14 @@ func normalizeFarmClientEnrollmentURL(raw string, allowLoopbackHTTP bool) (strin
 	return parsed.String(), nil
 }
 
+func normalizeFarmClientHTTPSURL(raw, name string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
+		return "", fmt.Errorf("%w: %s URL must use https", ErrFarmClientConfig, name)
+	}
+	return parsed.String(), nil
+}
+
 func (c FarmClientConfig) identityConfig() FarmClientIdentityConfig {
 	identity := c.Identity
 	if strings.TrimSpace(c.NodeUID) != "" {
@@ -509,6 +557,27 @@ func (c FarmClientConfig) shutdownTimeout() time.Duration {
 		return time.Duration(c.ShutdownTimeoutMs) * time.Millisecond
 	}
 	return 15 * time.Second
+}
+
+func (c FarmClientConfig) updateCheckInterval() time.Duration {
+	if c.UpdateCheckIntervalMs > 0 {
+		return time.Duration(c.UpdateCheckIntervalMs) * time.Millisecond
+	}
+	return 15 * time.Minute
+}
+
+func (c FarmClientConfig) updateHealthTimeout() time.Duration {
+	if c.UpdateHealthTimeoutMs > 0 {
+		return time.Duration(c.UpdateHealthTimeoutMs) * time.Millisecond
+	}
+	return 90 * time.Second
+}
+
+func (c FarmClientConfig) updateProbation() time.Duration {
+	if c.UpdateProbationMs > 0 {
+		return time.Duration(c.UpdateProbationMs) * time.Millisecond
+	}
+	return 60 * time.Second
 }
 
 // IsLoopbackControlURL is kept public for process/integration tests and

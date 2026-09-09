@@ -506,6 +506,60 @@ func TestFarmRuntimeCommandHandlerPreservesP17Envelope(t *testing.T) {
 	}
 }
 
+func TestFarmRuntimeHandoffCompletionIsBoundToExactConnectionSnapshot(t *testing.T) {
+	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	generation, err := fixture.farm.BeginAuthenticatedControlConnection("controller-a", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewFarmRuntimeControlAdapter(fixture.farm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.health = farmClientUpdateHealthObservation{connectionGeneration: generation}
+	inventoryResponse := adapter.DispatchCommandForConnection(FarmRuntimeCommand{
+		Type: "command", NodeUID: "node-test", CorrelationID: "inventory-c7", Command: "inventory_handoff", Payload: map[string]any{},
+	}, generation)
+	snapshot, ok := inventoryResponse.Payload.(FarmRuntimeInventorySnapshot)
+	if !inventoryResponse.OK || !ok || snapshot.ConnectionGeneration != generation || len(snapshot.InventoryDigest) != 64 {
+		t.Fatalf("inventory response=%+v", inventoryResponse)
+	}
+	completion := FarmRuntimeHandoffCompletion{
+		Status: "completed", ControllerID: "controller-a", ControllerGeneration: 4,
+		ConnectionGeneration: generation, InventoryDigest: snapshot.InventoryDigest, InventoryCount: len(snapshot.Inventory),
+	}
+	response := adapter.DispatchCommandForConnection(FarmRuntimeCommand{
+		Type: "command", NodeUID: "node-test", CorrelationID: "complete-c7", Command: "handoff_reconcile_complete", Payload: completion,
+	}, generation)
+	if !response.OK || !adapter.FarmClientUpdateHealthReady() {
+		t.Fatalf("completion response=%+v ready=%v", response, adapter.FarmClientUpdateHealthReady())
+	}
+	adapter.EndControlConnection(generation)
+	if adapter.FarmClientUpdateHealthReady() {
+		t.Fatal("ended connection retained update health")
+	}
+	stale := adapter.DispatchCommandForConnection(FarmRuntimeCommand{
+		Type: "command", NodeUID: "node-test", CorrelationID: "stale-c7", Command: "handoff_reconcile_complete", Payload: completion,
+	}, generation)
+	if stale.OK || stale.Error != ErrFarmRuntimeStale.Error() {
+		t.Fatalf("stale response=%+v", stale)
+	}
+}
+
+func TestFarmRuntimeHandoffInventoryExcludesTerminalHistory(t *testing.T) {
+	inventory := []FarmRuntime{
+		{FarmRuntimeIdentity: FarmRuntimeIdentity{RuntimeUID: "starting"}, State: FarmRuntimeStateStarting},
+		{FarmRuntimeIdentity: FarmRuntimeIdentity{RuntimeUID: "idle"}, State: FarmRuntimeStateIdle},
+		{FarmRuntimeIdentity: FarmRuntimeIdentity{RuntimeUID: "stopped"}, State: FarmRuntimeStateStopped},
+		{FarmRuntimeIdentity: FarmRuntimeIdentity{RuntimeUID: "crashed"}, State: FarmRuntimeStateCrashed},
+		{FarmRuntimeIdentity: FarmRuntimeIdentity{RuntimeUID: "stale"}, State: FarmRuntimeStateStale},
+	}
+	active := farmRuntimeHandoffInventory(inventory)
+	if len(active) != 2 || active[0].RuntimeUID != "starting" || active[1].RuntimeUID != "idle" {
+		t.Fatalf("handoff inventory=%+v", active)
+	}
+}
+
 func TestFarmRuntimeFactoryRejectsConflictingAliases(t *testing.T) {
 	fixture := newFarmRuntimeTestFixture(t, "profile-1")
 	other := NewBrowserRuntimeService()

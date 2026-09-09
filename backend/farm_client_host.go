@@ -30,17 +30,22 @@ import (
 // FarmClientHost owns one composed standalone client and all resources opened
 // by its bootstrap. It exposes no private key or local profile details.
 type FarmClientHost struct {
-	config    FarmClientConfig
-	identity  FarmClientIdentity
-	lock      *FarmClientInstanceLock
-	db        *sql.DB
-	manager   *browser.Manager
-	runtime   *BrowserRuntimeService
-	farm      *FarmRuntimeService
-	adapter   *FarmRuntimeControlAdapter
-	transport *FarmControlWSSClient
-	log       *logger.Logger
-	logging   bool
+	config          FarmClientConfig
+	identity        FarmClientIdentity
+	lock            *FarmClientInstanceLock
+	db              *sql.DB
+	manager         *browser.Manager
+	runtime         *BrowserRuntimeService
+	farm            *FarmRuntimeService
+	adapter         *FarmRuntimeControlAdapter
+	transport       *FarmControlWSSClient
+	log             *logger.Logger
+	logging         bool
+	updateMu        sync.Mutex
+	updatePrepareMu sync.Mutex
+	// preserveRuntimes is set only after the update drain fence has closed the
+	// authenticated transport. Normal shutdown retains its existing behavior.
+	preserveRuntimes bool
 
 	shutdownOnce sync.Once
 	shutdownErr  error
@@ -209,6 +214,16 @@ func (h *FarmClientHost) Transport() *FarmControlWSSClient {
 // Run authenticates the WSS client and blocks until context cancellation or
 // transport termination. AutoReconnect remains enabled after a later loss.
 func (h *FarmClientHost) Run(ctx context.Context) error {
+	return h.run(ctx, "", "")
+}
+
+// RunWithUpdateHealth writes a private nonce only after the successor has an
+// authenticated heartbeat and the Server has completed inventory/reconcile.
+func (h *FarmClientHost) RunWithUpdateHealth(ctx context.Context, markerPath, nonce string) error {
+	return h.run(ctx, markerPath, nonce)
+}
+
+func (h *FarmClientHost) run(ctx context.Context, markerPath, nonce string) error {
 	if h == nil || h.transport == nil {
 		return ErrFarmControlWSSClosed
 	}
@@ -221,6 +236,52 @@ func (h *FarmClientHost) Run(ctx context.Context) error {
 		// after the Agent can still establish the authenticated session.
 		if !h.transport.config.AutoReconnect {
 			return h.ShutdownWithError(err)
+		}
+	}
+	if markerPath != "" {
+		deadline := time.NewTimer(h.config.updateHealthTimeout())
+		ticker := time.NewTicker(50 * time.Millisecond)
+		ready := false
+		for !ready {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				deadline.Stop()
+				_ = h.PrepareForUpdate()
+				return h.ShutdownWithError(ctx.Err())
+			case <-deadline.C:
+				ticker.Stop()
+				_ = h.PrepareForUpdate()
+				return h.ShutdownWithError(ErrFarmClientUpdateApply)
+			case <-ticker.C:
+				ready = h.transport.ControlRTTMilliseconds() > 0 && h.adapter != nil && h.adapter.FarmClientUpdateHealthReady()
+			}
+		}
+		ticker.Stop()
+		deadline.Stop()
+		if err := WriteFarmClientUpdateHealthMarker(h.config, markerPath, nonce); err != nil {
+			_ = h.PrepareForUpdate()
+			return h.ShutdownWithError(err)
+		}
+		healthTicker := time.NewTicker(time.Second)
+		defer healthTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return h.Shutdown()
+			case <-h.transport.Done():
+				_ = h.PrepareForUpdate()
+				return h.Shutdown()
+			case <-healthTicker.C:
+				if h.transport.ControlRTTMilliseconds() <= 0 || h.adapter == nil || !h.adapter.FarmClientUpdateHealthReady() {
+					_ = os.Remove(markerPath)
+					continue
+				}
+				if err := WriteFarmClientUpdateHealthMarker(h.config, markerPath, nonce); err != nil {
+					_ = h.PrepareForUpdate()
+					return h.ShutdownWithError(err)
+				}
+			}
 		}
 	}
 	select {
@@ -242,6 +303,8 @@ func (h *FarmClientHost) Shutdown() error {
 		return nil
 	}
 	h.shutdownOnce.Do(func() {
+		h.updatePrepareMu.Lock()
+		defer h.updatePrepareMu.Unlock()
 		deadline := time.Now().Add(h.config.shutdownTimeout())
 		if h.transport != nil {
 			_ = h.transport.Close()
@@ -251,7 +314,10 @@ func (h *FarmClientHost) Shutdown() error {
 				h.shutdownErr = errors.Join(h.shutdownErr, context.DeadlineExceeded)
 			}
 		}
-		if h.runtime != nil {
+		h.updateMu.Lock()
+		preserveRuntimes := h.preserveRuntimes
+		h.updateMu.Unlock()
+		if h.runtime != nil && !preserveRuntimes {
 			if err := h.runtime.Shutdown(); err != nil {
 				h.shutdownErr = errors.Join(h.shutdownErr, err)
 			}
@@ -277,6 +343,54 @@ func (h *FarmClientHost) Shutdown() error {
 		}
 	})
 	return h.shutdownErr
+}
+
+// PrepareForUpdate closes the Control session behind the Farm connection
+// mutation fence, then marks the subsequent host shutdown as handoff-style.
+// Existing Chrome and connector ownership is intentionally preserved for the
+// successor process to recover from the authenticated ownership store.
+func (h *FarmClientHost) PrepareForUpdate() error {
+	return h.prepareForUpdate(nil)
+}
+
+// PrepareForUpdateAndAuthorize publishes the launcher's probation phase only
+// after the command fence and WSS drain have completed. Shutdown waits on the
+// same mutex, so the process cannot exit between drain and durable authorize.
+func (h *FarmClientHost) PrepareForUpdateAndAuthorize(authorize func() error) error {
+	if authorize == nil {
+		return ErrFarmClientUpdateApply
+	}
+	return h.prepareForUpdate(authorize)
+}
+
+func (h *FarmClientHost) prepareForUpdate(authorize func() error) error {
+	if h == nil || h.farm == nil || h.transport == nil {
+		return ErrFarmClientUpdateApply
+	}
+	h.updatePrepareMu.Lock()
+	defer h.updatePrepareMu.Unlock()
+	h.updateMu.Lock()
+	h.preserveRuntimes = true
+	h.updateMu.Unlock()
+	// Close synchronously invalidates the connection through
+	// EndControlConnection, whose write lock waits for every admitted mutation.
+	// Holding that same lock here would deadlock the transport shutdown.
+	if err := h.transport.Close(); err != nil {
+		return errors.Join(ErrFarmClientUpdateApply, err)
+	}
+	deadline := time.NewTimer(h.config.shutdownTimeout())
+	defer deadline.Stop()
+	select {
+	case <-h.transport.Done():
+		if authorize != nil {
+			if err := authorize(); err != nil {
+				return errors.Join(ErrFarmClientUpdateApply, err)
+			}
+		}
+		return nil
+	case <-deadline.C:
+		return errors.Join(ErrFarmClientUpdateApply, context.DeadlineExceeded)
+	}
 }
 
 // loadFarmClientProfiles uses the canonical SQLite ProfileDAO and Manager

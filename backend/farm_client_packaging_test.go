@@ -68,6 +68,7 @@ func TestFarmClientUnixPackagingInjectsVersionAndKeepsOutputsIsolated(t *testing
 			"ant-chrome/backend.FarmClientVersion=$VERSION",
 			`OUTPUT_DIR="$SCRIPT_DIR/dist"`,
 			`STAGING_ROOT="$SCRIPT_DIR/.staging"`,
+			".update.bin",
 		} {
 			if !strings.Contains(value, requiredText) {
 				t.Fatalf("%s missing %q", relative, requiredText)
@@ -93,6 +94,7 @@ func TestFarmClientWindowsPackagingInjectsVersionAndKeepsOutputsIsolated(t *test
 		"ant-chrome/backend.FarmClientVersion=$Version",
 		`Join-Path $PSScriptRoot "dist"`,
 		`Join-Path $PSScriptRoot ".staging\windows-$Arch"`,
+		".update.exe",
 	} {
 		if !strings.Contains(value, requiredText) {
 			t.Fatalf("%s missing %q", relative, requiredText)

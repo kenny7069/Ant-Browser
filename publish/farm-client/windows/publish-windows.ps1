@@ -28,6 +28,8 @@ if (-not $SkipBuild) {
   } finally { Pop-Location }
 }
 if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) { throw "Farm Client binary missing" }
+$UpdateBinary = Join-Path $Output "AntFarmClient-$Version-windows-$Arch.update.exe"
+Copy-Item -LiteralPath $Binary -Destination $UpdateBinary -Force
 Copy-Item -LiteralPath (Join-Path $Root "bin\xray.exe") -Destination (Join-Path $Stage "bin\xray.exe")
 Copy-Item -LiteralPath (Join-Path $Root "bin\sing-box.exe") -Destination (Join-Path $Stage "bin\sing-box.exe")
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "config.example.yaml") -Destination (Join-Path $Stage "config.example.yaml")
@@ -42,4 +44,4 @@ if (-not $MakeNSIS) { throw "makensis.exe is required" }
 & $MakeNSIS.Source "/DVERSION=$Version" "/DSTAGINGDIR=$Stage" "/DOUTPUTDIR=$Output" (Join-Path $PSScriptRoot "installer.nsi")
 if ($LASTEXITCODE -ne 0) { throw "NSIS build failed" }
 if (-not $KeepStaging) { Remove-Item -LiteralPath $Stage -Recurse -Force }
-Write-Host "Generated $Zip and AntFarmClient-Setup-$Version-x64.exe"
+Write-Host "Generated $Zip, $UpdateBinary and AntFarmClient-Setup-$Version-x64.exe"

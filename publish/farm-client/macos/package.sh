@@ -132,6 +132,7 @@ STAGE_DIR="$STAGING_ROOT/$TARGET-$VERSION"
 APP_STAGE="$STAGE_DIR/Ant Farm Client.app"
 APP_EXPORT="$OUTPUT_DIR/AntFarmClient-${VERSION}-macos-${ARCH}.app"
 ZIP_NAME="AntFarmClient-${VERSION}-macos-${ARCH}.zip"
+UPDATE_NAME="AntFarmClient-${VERSION}-darwin-${ARCH}.update.bin"
 
 [[ -f "$XRAY_SRC" && -f "$SINGBOX_SRC" ]] || die "missing runtime binaries for $TARGET under $RUNTIME_DIR"
 [[ -f "$CONFIG_SRC" ]] || die "missing config example: $CONFIG_SRC"
@@ -175,6 +176,9 @@ else
 fi
 
 [[ -x "$CLIENT_BINARY" || -f "$CLIENT_BINARY" ]] || die "client binary was not produced: $CLIENT_BINARY"
+rm -f "$OUTPUT_DIR/$UPDATE_NAME"
+cp "$CLIENT_BINARY" "$OUTPUT_DIR/$UPDATE_NAME"
+chmod 0755 "$OUTPUT_DIR/$UPDATE_NAME"
 
 echo "[2/4] Assembling unsigned app bundle..."
 APP_CONTENTS="$APP_STAGE/Contents"

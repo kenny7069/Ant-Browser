@@ -475,6 +475,8 @@ func (c *FarmControlWSSClient) transportFailure(conn *websocket.Conn, err error)
 	c.connectionCancel = nil
 	c.connectionFence = 0
 	c.connecting = false
+	c.lastHeartbeatAck = time.Time{}
+	c.lastControlRTT = 0
 	if err != nil {
 		c.closeErr = err
 	}
@@ -501,6 +503,8 @@ func (c *FarmControlWSSClient) shutdown(err error) {
 		c.connectionCancel = nil
 		c.connectionFence = 0
 		c.connecting = false
+		c.lastHeartbeatAck = time.Time{}
+		c.lastControlRTT = 0
 		c.mu.Unlock()
 		if cancelConnection != nil {
 			cancelConnection()

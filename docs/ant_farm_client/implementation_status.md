@@ -9,7 +9,7 @@
 | C4 Background Lifecycle | PASS | Per-user Windows/macOS/Linux autostart, controller-fenced production WSS auth and ownership-aware SIGTERM verified |
 | C5 Packaging | PASS | Dedicated Windows/Linux/macOS artifacts, isolated workflows, pinned runtimes and unsigned-macOS release gate verified |
 | C6 Fleet Management | PASS | Admin-only inventory/actions, enrollment, pairing, telemetry fallback and closed command surface verified |
-| C7 Updater | NOT STARTED | |
+| C7 Updater | PASS | Signed manifest, immutable launcher, transactional reconcile, probation and rollback verified by independent SOL-MID review |
 | C8 Installed E2E | NOT STARTED | |
 | C9 Social/Soak/Chaos | NOT STARTED | |
 | C10 Final Release | NOT STARTED | Fresh independent acceptance required |
@@ -139,3 +139,21 @@
   attestation, telemetry, live-monitor and Queue regressions passed. Desktop
   and modal layouts were visually inspected; HTML and inline JavaScript checks
   passed. Independent SOL review returned PASS with no remaining P1/P2.
+
+## C7 implementation evidence
+
+- Added strict Ed25519 update envelopes for all five targets, offline signing,
+  non-executable staging and a private content-addressed payload store.
+- Added an immutable lifetime launcher with atomic active/previous/pending
+  activation, drain fencing, continuous probation health and rollback.
+- Successor health now requires a digest-bound inventory completion produced
+  only after Server transactional comparison with controller/runtime leases,
+  Node, all live runtime rows and profile affinity.
+- Normal service stop, update rollback and launcher-loss shutdown have distinct
+  semantics; rollback/parent loss preserve owned Chrome and connector state.
+- Updated payloads are pinned against symlink/reparse/hardlink and pathname
+  replacement according to the platform-specific boundary in architecture.
+- Full Go normal/race/vet, five target builds and focused Server suites pass.
+  Fresh independent SOL-MID review returned C7 PASS with no remaining
+  P0/P1/P2/P3 findings after fail-closed terminal-authority and current-time
+  pending-envelope expiry regressions were added.

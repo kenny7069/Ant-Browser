@@ -46,12 +46,14 @@ jobs:
           set -euo pipefail
           app="$(ls -d publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.app)"
           zip="$(ls publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.zip)"
+          update="$(ls publish/farm-client/macos/dist/AntFarmClient-*-darwin-${{ matrix.arch }}.update.bin)"
           test -x "$app/Contents/MacOS/ant-farm-client"
           test -x "$app/Contents/Resources/bin/xray"
           test -x "$app/Contents/Resources/bin/sing-box"
           plutil -lint "$app/Contents/Info.plist"
           test -f "$zip"
           "$app/Contents/MacOS/ant-farm-client" -version | grep -Fq "\"version\":\"$version\""
+          "$update" -version | grep -Fq "\"version\":\"$version\""
           if [[ "${{ github.event_name }}" == "push" ]]; then
             echo "Release tags require a later C10 Developer ID/notarization job; unsigned upload is intentionally refused."
             exit 1
@@ -62,4 +64,5 @@ jobs:
           path: |
             publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.app
             publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.zip
+            publish/farm-client/macos/dist/AntFarmClient-*-darwin-${{ matrix.arch }}.update.bin
           if-no-files-found: error

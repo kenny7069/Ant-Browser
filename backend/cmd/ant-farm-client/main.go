@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -45,6 +47,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	showVersion := flags.Bool("version", false, "print version, GOOS and GOARCH")
 	enroll := flags.Bool("enroll", false, "enroll once; reads the one-time code from stdin")
 	diagnostics := flags.Bool("diagnostics", false, "print the secret-free diagnostics allowlist")
+	farmAgent := flags.Bool("farm-agent", false, "internal supervised Agent process")
+	updateHealthFile := flags.String("update-health-file", "", "internal signed-update health marker")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -72,20 +76,51 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runEnrollment(path, stdin, stdout, stderr)
 	}
 	if flags.NArg() > 0 {
+		if flags.Arg(0) == "update" {
+			return runUpdateCommand(path, flags.Args(), stdout, stderr)
+		}
 		if flags.Arg(0) == "autostart" {
 			return runAutostartCommand(path, flags.Args(), stdout, stderr)
 		}
 		return runProfileCommand(path, flags.Args(), stdin, stdout, stderr)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	executable, _ := os.Executable()
+	if !*farmAgent {
+		if err := backend.RunFarmClientLauncher(ctx, path, filepath.Clean(executable), stdout, stderr); err != nil && ctx.Err() == nil {
+			if errors.Is(err, backend.ErrFarmClientAlreadyRun) {
+				fmt.Fprintln(stderr, backend.ErrFarmClientAlreadyRun.Error())
+				return 1
+			}
+			fmt.Fprintln(stderr, "ant-farm-client: launcher stopped")
+			return 1
+		}
+		return 0
 	}
 	host, err := backend.NewFarmClientHost(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "ant-farm-client: startup failed: %v\n", err)
 		return 1
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if err := host.Run(ctx); err != nil && ctx.Err() == nil {
-		fmt.Fprintf(stderr, "ant-farm-client: stopped: %v\n", err)
+	// The immutable launcher owns the write end of this anonymous pipe. A
+	// deliberate service stop sends 'S'. Update rollback sends 'P', while EOF
+	// means the parent died. Both preserve live Browser runtimes for recovery.
+	go func() {
+		if farmAgentControlPreservesRuntimes(stdin) {
+			_ = host.PrepareForUpdate()
+		}
+		stop()
+	}()
+	go backend.RunFarmClientUpdateSupervisor(ctx, host, path, filepath.Clean(executable))
+	var runErr error
+	if *updateHealthFile != "" {
+		runErr = host.RunWithUpdateHealth(ctx, filepath.Clean(*updateHealthFile), os.Getenv("ANT_FARM_CLIENT_UPDATE_HEALTH_NONCE"))
+	} else {
+		runErr = host.Run(ctx)
+	}
+	if runErr != nil && ctx.Err() == nil {
+		fmt.Fprintf(stderr, "ant-farm-client: stopped: %v\n", runErr)
 		_ = host.Shutdown()
 		return 1
 	}
@@ -93,6 +128,44 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ant-farm-client: shutdown failed: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+func farmAgentControlPreservesRuntimes(reader io.Reader) bool {
+	var decision [1]byte
+	_, err := io.ReadFull(reader, decision[:])
+	return err != nil || decision[0] != 'S'
+}
+
+func runUpdateCommand(configPath string, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 2 || (args[1] != "check" && args[1] != "stage") {
+		fmt.Fprintln(stderr, "ant-farm-client: invalid update command")
+		return 2
+	}
+	config, err := backend.LoadFarmClientConfig(configPath)
+	if err != nil || config.ValidateFarmClientConfig() != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: update configuration is invalid")
+		return 1
+	}
+	status := "available"
+	var version, target string
+	if args[1] == "check" {
+		candidate, checkErr := backend.CheckFarmClientUpdate(context.Background(), nil, config, backend.FarmClientVersion, time.Now())
+		if checkErr != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: update check failed")
+			return 1
+		}
+		version, target = candidate.Manifest.Version, candidate.Target
+	} else {
+		staged, stageErr := backend.FetchAndStageFarmClientUpdate(context.Background(), nil, config, backend.FarmClientVersion, time.Now())
+		if stageErr != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: update stage failed")
+			return 1
+		}
+		version, target, status = staged.Candidate.Manifest.Version, staged.Candidate.Target, "staged"
+	}
+	value, _ := json.Marshal(map[string]string{"status": status, "version": version, "target": target})
+	fmt.Fprintln(stdout, string(value))
 	return 0
 }
 

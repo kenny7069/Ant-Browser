@@ -2,6 +2,8 @@ package backend
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -164,6 +166,13 @@ func farmRuntimeWirePayload(payload any) (any, error) {
 	case FarmRuntimeInventorySnapshot:
 		return typed, nil
 	case *FarmRuntimeInventorySnapshot:
+		if typed == nil {
+			return nil, nil
+		}
+		return typed, nil
+	case FarmRuntimeHandoffCompletion:
+		return typed, nil
+	case *FarmRuntimeHandoffCompletion:
 		if typed == nil {
 			return nil, nil
 		}
@@ -361,7 +370,62 @@ type FarmRuntimeReconcileRequest struct {
 // The legacy inventory command remains a plain list for P1.12 compatibility.
 type FarmRuntimeInventorySnapshot struct {
 	ConnectionGeneration uint64        `json:"connection_generation"`
+	InventoryDigest      string        `json:"inventory_digest"`
 	Inventory            []FarmRuntime `json:"inventory"`
+}
+
+// FarmRuntimeHandoffCompletion is the Server's explicit receipt that it has
+// processed one exact inventory snapshot on the current authenticated WSS
+// generation. Result runtime UIDs are intentionally not compared with source
+// UIDs: a legitimate reconcile may replace a runtime.
+type FarmRuntimeHandoffCompletion struct {
+	Status               string `json:"status"`
+	ControllerID         string `json:"controller_id"`
+	ControllerGeneration uint64 `json:"controller_generation"`
+	ConnectionGeneration uint64 `json:"connection_generation"`
+	InventoryDigest      string `json:"inventory_digest"`
+	InventoryCount       int    `json:"inventory_count"`
+}
+
+func farmRuntimeInventoryDigest(inventory []FarmRuntime) string {
+	type sourceIdentity struct {
+		NodeUID              string `json:"node_uid"`
+		ProfileID            string `json:"profile_id"`
+		RuntimeUID           string `json:"runtime_uid"`
+		ProviderInstanceID   string `json:"provider_instance_id"`
+		FencingEpoch         uint64 `json:"fencing_epoch"`
+		ConfigHash           string `json:"config_hash,omitempty"`
+		Generation           uint64 `json:"generation"`
+		ProcessStartIdentity string `json:"process_start_identity,omitempty"`
+		ProfileIncarnation   string `json:"profile_incarnation,omitempty"`
+	}
+	items := make([]sourceIdentity, 0, len(inventory))
+	for _, runtime := range inventory {
+		items = append(items, sourceIdentity{
+			NodeUID: runtime.NodeUID, ProfileID: runtime.ProfileID, RuntimeUID: runtime.RuntimeUID,
+			ProviderInstanceID: runtime.ProviderInstanceID, FencingEpoch: runtime.FencingEpoch,
+			ConfigHash: runtime.ConfigHash, Generation: runtime.Generation,
+			ProcessStartIdentity: runtime.ProcessStartIdentity, ProfileIncarnation: runtime.ProfileIncarnation,
+		})
+	}
+	sort.Slice(items, func(left, right int) bool {
+		leftValue, _ := json.Marshal(items[left])
+		rightValue, _ := json.Marshal(items[right])
+		return bytes.Compare(leftValue, rightValue) < 0
+	})
+	encoded, _ := json.Marshal(items)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func farmRuntimeHandoffInventory(inventory []FarmRuntime) []FarmRuntime {
+	active := make([]FarmRuntime, 0, len(inventory))
+	for _, runtime := range inventory {
+		if runtime.State == FarmRuntimeStateStarting || runtime.State == FarmRuntimeStateIdle {
+			active = append(active, runtime)
+		}
+	}
+	return active
 }
 
 // FarmRuntimeControllerBindingRequest projects the newly authenticated
@@ -1711,7 +1775,7 @@ func (s *FarmRuntimeService) validateCommand(command FarmRuntimeCommand) error {
 		return fmt.Errorf("%w: command is required", ErrFarmRuntimeCommand)
 	}
 	switch strings.TrimSpace(command.Command) {
-	case "ensure_runtime", "runtime_status", "stop_runtime", "inventory", "inventory_handoff", "attest_runtime", "prepare_adopt_runtime", "adopt_runtime", "quarantine_runtime", "stop_runtime_handoff", "reconcile_runtime":
+	case "ensure_runtime", "runtime_status", "stop_runtime", "inventory", "inventory_handoff", "handoff_reconcile_complete", "attest_runtime", "prepare_adopt_runtime", "adopt_runtime", "quarantine_runtime", "stop_runtime_handoff", "reconcile_runtime":
 		return nil
 	default:
 		return fmt.Errorf("%w: unknown command", ErrFarmRuntimeCommand)
@@ -1843,11 +1907,31 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 			response.Error = farmRuntimeWireError(err)
 			return response, nil
 		}
+		inventory = farmRuntimeHandoffInventory(inventory)
 		response.OK = true
 		response.Payload = FarmRuntimeInventorySnapshot{
 			ConnectionGeneration: s.ConnectionGeneration(),
+			InventoryDigest:      farmRuntimeInventoryDigest(inventory),
 			Inventory:            inventory,
 		}
+	case "handoff_reconcile_complete":
+		var request FarmRuntimeHandoffCompletion
+		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
+			return FarmRuntimeCommandResponse{}, err
+		}
+		controllerID, controllerGeneration := s.controllerBinding()
+		if request.Status != "completed" || request.ControllerID != controllerID || request.ControllerGeneration != controllerGeneration ||
+			request.ConnectionGeneration == 0 || request.ConnectionGeneration != s.ConnectionGeneration() || request.InventoryCount < 0 ||
+			len(request.InventoryDigest) != sha256.Size*2 || request.InventoryDigest != strings.ToLower(request.InventoryDigest) {
+			response.Error = farmRuntimeWireError(ErrFarmRuntimeStale)
+			return response, nil
+		}
+		if _, err := hex.DecodeString(request.InventoryDigest); err != nil {
+			response.Error = farmRuntimeWireError(ErrFarmRuntimeStale)
+			return response, nil
+		}
+		response.OK = true
+		response.Payload = request
 	case "prepare_adopt_runtime":
 		var request FarmRuntimeHandoffRequest
 		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
@@ -1930,7 +2014,17 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 // WSS transport. It deliberately delegates all lifecycle work to the shared
 // FarmRuntimeService; the adapter owns no process, CDP, or proxy state.
 type FarmRuntimeControlAdapter struct {
-	service *FarmRuntimeService
+	service  *FarmRuntimeService
+	healthMu sync.Mutex
+	health   farmClientUpdateHealthObservation
+}
+
+type farmClientUpdateHealthObservation struct {
+	connectionGeneration uint64
+	inventorySeen        bool
+	inventoryDigest      string
+	inventoryCount       int
+	completionSeen       bool
 }
 
 func NewFarmRuntimeControlAdapter(service *FarmRuntimeService) (*FarmRuntimeControlAdapter, error) {
@@ -1971,7 +2065,59 @@ func (adapter *FarmRuntimeControlAdapter) DispatchCommandForConnection(command F
 	if !service.connectionIsCurrent(connectionGeneration) {
 		return FarmRuntimeCommandResponse{Type: "command_response", NodeUID: service.nodeUID, CorrelationID: command.CorrelationID, Error: farmRuntimeWireError(ErrFarmRuntimeStale)}
 	}
-	return adapter.DispatchCommand(command)
+	response := adapter.DispatchCommand(command)
+	if response.OK {
+		adapter.observeFarmClientUpdateHealth(connectionGeneration, name, response.Payload)
+	}
+	return response
+}
+
+func (adapter *FarmRuntimeControlAdapter) observeFarmClientUpdateHealth(connectionGeneration uint64, command string, payload any) {
+	adapter.healthMu.Lock()
+	defer adapter.healthMu.Unlock()
+	if adapter.health.connectionGeneration != connectionGeneration {
+		return
+	}
+	switch command {
+	case "inventory":
+		inventory, ok := payload.([]FarmRuntime)
+		if !ok {
+			return
+		}
+		adapter.health.inventorySeen = true
+		adapter.health.inventoryDigest = farmRuntimeInventoryDigest(inventory)
+		adapter.health.inventoryCount = len(inventory)
+		adapter.health.completionSeen = false
+	case "inventory_handoff":
+		snapshot, ok := payload.(FarmRuntimeInventorySnapshot)
+		if !ok {
+			return
+		}
+		adapter.health.inventorySeen = true
+		adapter.health.inventoryDigest = snapshot.InventoryDigest
+		adapter.health.inventoryCount = len(snapshot.Inventory)
+		adapter.health.completionSeen = false
+	case "handoff_reconcile_complete":
+		completion, ok := payload.(FarmRuntimeHandoffCompletion)
+		if ok && completion.Status == "completed" && completion.ConnectionGeneration == connectionGeneration &&
+			completion.InventoryDigest == adapter.health.inventoryDigest && completion.InventoryCount == adapter.health.inventoryCount {
+			adapter.health.completionSeen = true
+		}
+	}
+}
+
+// FarmClientUpdateHealthReady reports only protocol progress needed by the
+// updater. It exposes no runtime identity or local process detail.
+func (adapter *FarmRuntimeControlAdapter) FarmClientUpdateHealthReady() bool {
+	if adapter == nil {
+		return false
+	}
+	adapter.healthMu.Lock()
+	defer adapter.healthMu.Unlock()
+	if !adapter.health.inventorySeen {
+		return false
+	}
+	return adapter.health.completionSeen
 }
 
 // ResourceTelemetry is the authenticated heartbeat projection used by the
@@ -1998,12 +2144,26 @@ func (adapter *FarmRuntimeControlAdapter) BeginAuthenticatedControlConnection(co
 	if adapter == nil || adapter.service == nil {
 		return 0, ErrFarmRuntimeServiceUnavailable
 	}
-	return adapter.service.BeginAuthenticatedControlConnection(controllerID, controllerGeneration)
+	generation, err := adapter.service.BeginAuthenticatedControlConnection(controllerID, controllerGeneration)
+	if err != nil {
+		return 0, err
+	}
+	adapter.healthMu.Lock()
+	adapter.health = farmClientUpdateHealthObservation{
+		connectionGeneration: generation,
+	}
+	adapter.healthMu.Unlock()
+	return generation, nil
 }
 
 func (adapter *FarmRuntimeControlAdapter) EndControlConnection(connectionGeneration uint64) {
 	if adapter != nil && adapter.service != nil {
 		adapter.service.EndControlConnection(connectionGeneration)
+		adapter.healthMu.Lock()
+		if adapter.health.connectionGeneration == connectionGeneration {
+			adapter.health = farmClientUpdateHealthObservation{}
+		}
+		adapter.healthMu.Unlock()
 	}
 }
 

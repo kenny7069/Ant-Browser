@@ -473,6 +473,77 @@ func TestFarmClientRunKeepsReconnectSupervisorAliveAfterInitialDialFailure(t *te
 	}
 }
 
+func TestFarmClientPrepareForUpdatePreservesRuntimeAdmissionForSuccessor(t *testing.T) {
+	runtimeService, farmService, adapter := newFarmClientTestStack(t)
+	key := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	transport, err := NewFarmControlWSSClient(FarmControlWSSClientConfig{
+		URL: "ws://127.0.0.1:1", NodeUID: "node-a", PrivateKey: key,
+		HandshakeTimeout: 20 * time.Millisecond, AutoReconnect: true,
+	}, adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := &FarmClientHost{
+		config: FarmClientConfig{ShutdownTimeoutMs: 500}, runtime: runtimeService,
+		farm: farmService, adapter: adapter, transport: transport,
+	}
+	if err := host.PrepareForUpdate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeService.startAdmissionClosed() {
+		t.Fatal("update shutdown closed runtime admission instead of preserving ownership for successor")
+	}
+	if err := runtimeService.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFarmClientProbationWSSLossPreservesRuntimeGeneration(t *testing.T) {
+	runtimeService, farmService, adapter := newFarmClientTestStack(t)
+	key := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	transport, err := NewFarmControlWSSClient(FarmControlWSSClientConfig{
+		URL: "ws://127.0.0.1:1", NodeUID: "node-a", PrivateKey: key,
+		HandshakeTimeout: 20 * time.Millisecond, AutoReconnect: true,
+	}, adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := t.TempDir()
+	config := FarmClientConfig{StateRoot: stateRoot, ShutdownTimeoutMs: 500, UpdateHealthTimeoutMs: 1000}
+	host := &FarmClientHost{config: config, runtime: runtimeService, farm: farmService, adapter: adapter, transport: transport}
+	generation := farmService.ConnectionGeneration()
+	adapter.healthMu.Lock()
+	adapter.health = farmClientUpdateHealthObservation{connectionGeneration: generation, inventorySeen: true, completionSeen: true}
+	adapter.healthMu.Unlock()
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Model a marker that was earned immediately before the WSS disappeared.
+	transport.mu.Lock()
+	transport.lastControlRTT = time.Millisecond
+	transport.mu.Unlock()
+	updateRoot, err := farmClientUpdateRoot(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(updateRoot, "health-probation-loss")
+	if err := host.RunWithUpdateHealth(context.Background(), marker, strings.Repeat("c", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if runtimeService.startAdmissionClosed() {
+		t.Fatal("WSS loss during probation shut down Browser ownership")
+	}
+	if farmService.ConnectionGeneration() != generation {
+		t.Fatalf("runtime generation changed from %d to %d", generation, farmService.ConnectionGeneration())
+	}
+	if err := runtimeService.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFarmClientRealWSSReconnectHeartbeatAndInventory(t *testing.T) {
 	var first atomic.Bool
 	firstStarted := make(chan struct{}, 1)
