@@ -24,8 +24,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: amd64, runner: ubuntu-24.04 }
-          - { arch: arm64, runner: ubuntu-24.04-arm }
+          - { arch: amd64, runner: ubuntu-22.04, variant: ubuntu-22.04-amd64 }
+          - { arch: amd64, runner: ubuntu-24.04, variant: ubuntu-24.04-amd64 }
+          - { arch: arm64, runner: ubuntu-24.04-arm, variant: ubuntu-24.04-arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -57,9 +58,40 @@ jobs:
           test -f "$staging/config.example.yaml"
           "$staging/ant-farm-client" -version | grep -Fq "\"version\":\"$version\""
           "$update" -version | grep -Fq "\"version\":\"$version\""
+      - name: Exercise installed Debian artifact with real Chrome
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-${GITHUB_REF_NAME#farm-client-v}}"
+          artifact="$(ls publish/farm-client/linux/dist/ant-farm-client_${version}_${{ matrix.arch }}.deb)"
+          artifact_sha="$(sha256sum "$artifact" | awk '{print $1}')"
+          chrome="$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+          test -n "$chrome"
+          sudo dpkg -i "$artifact"
+          cleanup_package() {
+            sudo dpkg -r ant-farm-client >/dev/null 2>&1 || true
+          }
+          trap cleanup_package EXIT
+          C8_INSTALLED_ARTIFACT_E2E=1 \
+          C8_INSTALLED_CLIENT="/opt/ant-farm-client/ant-farm-client" \
+          C8_INSTALLED_ROOT="/opt/ant-farm-client" \
+          C8_RELEASE_ARTIFACT="$artifact" \
+          C8_RELEASE_ARTIFACT_SHA256="$artifact_sha" \
+          C8_INSTALLED_VERSION="$version" \
+          C8_REAL_CHROME_CORE="$chrome" \
+          go test ./backend -run '^TestFarmClientInstalledArtifactRealChrome$' -count=1 -v
+          C8_INSTALLED_AUTOSTART_E2E=1 \
+          C8_INSTALLED_CLIENT="/opt/ant-farm-client/ant-farm-client" \
+          C8_INSTALLED_ROOT="/opt/ant-farm-client" \
+          C8_AUTOSTART_METHOD="systemd-user" \
+          go test ./backend -run '^TestFarmClientInstalledArtifactAutostartNative$' -count=1 -v
+          sudo dpkg -r ant-farm-client
+          trap - EXIT
+          test ! -e /opt/ant-farm-client/ant-farm-client
       - uses: actions/upload-artifact@v4
         with:
-          name: ant-farm-client-linux-${{ matrix.arch }}
+          name: ant-farm-client-linux-${{ matrix.variant }}
           path: |
             publish/farm-client/linux/dist/ant-farm-client_*_${{ matrix.arch }}.deb
             publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.tar.gz
@@ -72,7 +104,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
-        with: { path: release-artifacts, merge-multiple: true }
+        with:
+          path: release-artifacts
+          pattern: ant-farm-client-linux-ubuntu-24.04-*
+          merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}

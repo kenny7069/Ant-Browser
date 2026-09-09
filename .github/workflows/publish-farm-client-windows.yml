@@ -48,6 +48,43 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch '"version"') { throw "Update binary failed" }
           $text = Get-Content publish/farm-client/windows/installer.nsi -Raw
           if ($text -match '(?i)taskkill\.exe|/IM\s+xray|/IM\s+sing-box|killall|pkill') { throw "global process-name cleanup is prohibited" }
+      - name: Exercise installed NSIS artifact with real Chrome
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "${{ github.ref_name }}" -replace '^farm-client-v','' }
+          $artifact = Get-Item "publish/farm-client/windows/dist/AntFarmClient-Setup-$version-x64.exe"
+          $artifactSha = (Get-FileHash -Algorithm SHA256 $artifact.FullName).Hash.ToLowerInvariant()
+          $installRoot = Join-Path $env:ProgramFiles "Ant Farm Client"
+          $client = Join-Path $installRoot "ant-farm-client.exe"
+          $chrome = Join-Path $env:ProgramFiles "Google/Chrome/Application/chrome.exe"
+          if (-not (Test-Path $chrome)) { throw "native Google Chrome is required" }
+          $install = Start-Process -FilePath $artifact.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($install.ExitCode -ne 0 -or -not (Test-Path $client)) { throw "NSIS install failed" }
+          try {
+            $env:C8_INSTALLED_ARTIFACT_E2E = "1"
+            $env:C8_INSTALLED_CLIENT = $client
+            $env:C8_INSTALLED_ROOT = $installRoot
+            $env:C8_RELEASE_ARTIFACT = $artifact.FullName
+            $env:C8_RELEASE_ARTIFACT_SHA256 = $artifactSha
+            $env:C8_INSTALLED_VERSION = $version
+            $env:C8_REAL_CHROME_CORE = $chrome
+            go test ./backend -run '^TestFarmClientInstalledArtifactRealChrome$' -count=1 -v
+            if ($LASTEXITCODE -ne 0) { throw "installed artifact E2E failed" }
+            $env:C8_INSTALLED_AUTOSTART_E2E = "1"
+            $env:C8_AUTOSTART_METHOD = "scheduled-task-at-logon"
+            go test ./backend -run '^TestFarmClientInstalledArtifactAutostartNative$' -count=1 -v
+            if ($LASTEXITCODE -ne 0) { throw "native autostart E2E failed" }
+          } finally {
+            $uninstaller = Join-Path $installRoot "Uninstall.exe"
+            if (Test-Path $uninstaller) {
+              $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
+              if ($uninstall.ExitCode -ne 0) { throw "NSIS uninstall failed" }
+            }
+          }
+          if (Test-Path $client) { throw "installed executable remained after uninstall" }
       - uses: actions/upload-artifact@v4
         with:
           name: ant-farm-client-windows-amd64

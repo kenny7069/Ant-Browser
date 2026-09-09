@@ -18,7 +18,8 @@
 | C5 | Dedicated packaging | isolated Windows setup/zip, Linux deb/tar, macOS app/zip, runtime/version/release gates | PASS; Windows native install and macOS production signing remain C8/C10 |
 | C6 | Fleet management | inventory, enrollment, named actions, pairing, telemetry, closed command surface | PASS |
 | C7 | Signed update | signed update, drain/restart/reconcile, pinned execution and rollback | PASS; independent SOL-MID review found no remaining P0/P1/P2/P3 |
-| C8-C10 | Installed E2E/release | Windows, Linux, macOS, social, soak, chaos | Not started |
+| C8 | Installed artifact process boundary | artifact hash/path/native target, real Chrome, persistence, native autostart | IN PROGRESS; macOS arm64 sub-gates PASS locally |
+| C8-C10 | Remaining installed E2E/release | reboot/login, update/rollback, proxy/CDP/Playwright, external Server, all native targets, social/soak/chaos | Not started / not inferred |
 
 No skipped real-browser, cross-repository, Windows, installed-artifact, soak, or
 chaos test may be counted as release acceptance.
@@ -128,3 +129,18 @@ evidence and are not inferred from mocked transaction/schema tests.
 The native publish workflows execute the backend tests on each target runner;
 fresh installed upgrade/rollback, real login persistence, two-account ACL and
 true MySQL deployment races remain C8 evidence rather than inferred C7 PASS.
+
+## C8 commands (installed artifact)
+
+| Command / evidence | Result |
+|---|---|
+| package macOS arm64 1.5.1, install the produced ZIP outside the working tree, bind SHA/version/native target, then run `TestFarmClientInstalledArtifactRealChrome` | PASS; artifact SHA-256 `0865350ef3f6809987f8bf54db0fa93101b3777959c01bbb394c0fa16ea55e0e` |
+| installed 1.5.1 arm64 Client → authenticated WSS → real Chrome ensure/attest → page-target CDP `40+2` → ordinary stop → installed CLI Profile persistence | PASS on local Apple Silicon |
+| `TestFarmClientInstalledArtifactAutostartNative` against the installed app | PASS; real LaunchAgent install/active/remove, no registration left behind |
+| Windows NSIS, Ubuntu 22.04/24.04 amd64, Ubuntu arm64 and macOS Intel workflow executions | REQUIRED; workflow gates implemented, not yet executed here |
+| fresh login/reboot, signed update/rollback, proxy, Playwright/CDP gateway beyond the direct probe, and external Server enrollment/reconcile | REQUIRED; not yet implemented/executed as installed evidence |
+
+The C8 test rejects development versions, mismatched artifact hashes, a target
+different from the native Go runtime, executables outside the declared install
+root, and executables inside the source working tree. Source tests, target
+cross-builds and package-layout inspection remain insufficient for C8 PASS.

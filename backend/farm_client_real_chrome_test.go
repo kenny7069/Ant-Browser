@@ -69,7 +69,7 @@ func TestFarmClientHostRealChromeEnsureAttest(t *testing.T) {
 		}
 		defer connection.Close()
 		incarnation, _ := farmClientProfileIncarnation(profileID, profile.IncarnationID)
-		serverDone <- runFarmClientRealChromeWSSFixture(connection, key.Public().(ed25519.PublicKey), profileID, incarnation)
+		serverDone <- runFarmClientRealChromeWSSFixture(connection, key.Public().(ed25519.PublicKey), profileID, incarnation, nil)
 	}))
 	defer server.Close()
 	clientConfig := FarmClientConfig{
@@ -115,7 +115,7 @@ func TestFarmClientHostRealChromeEnsureAttest(t *testing.T) {
 	}
 }
 
-func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed25519.PublicKey, profileID, pairingIncarnation string) error {
+func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed25519.PublicKey, profileID, pairingIncarnation string, afterEnsure func(FarmRuntime) error) error {
 	var begin farmControlAuthBegin
 	if err := connection.ReadJSON(&begin); err != nil {
 		return fmt.Errorf("auth begin: %w", err)
@@ -160,6 +160,11 @@ func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed2
 	var runtime FarmRuntime
 	if err := json.Unmarshal(ensure.Payload, &runtime); err != nil {
 		return fmt.Errorf("decode ensure runtime: %w", err)
+	}
+	if afterEnsure != nil {
+		if err := afterEnsure(runtime); err != nil {
+			return err
+		}
 	}
 	policy := FarmAttestationPolicy{AllowedDomains: []string{}, Locale: "zh-TW", Timezone: "Asia/Hong_Kong", WebRTCMode: "disable_non_proxied_udp"}
 	runtimeConfig := FarmAttestationRuntime{AllowedDomains: []string{}, Locale: policy.Locale, Timezone: policy.Timezone, WebRTCMode: policy.WebRTCMode, Proxy: FarmAttestationProxy{}}

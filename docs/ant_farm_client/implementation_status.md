@@ -10,7 +10,7 @@
 | C5 Packaging | PASS | Dedicated Windows/Linux/macOS artifacts, isolated workflows, pinned runtimes and unsigned-macOS release gate verified |
 | C6 Fleet Management | PASS | Admin-only inventory/actions, enrollment, pairing, telemetry fallback and closed command surface verified |
 | C7 Updater | PASS | Signed manifest, immutable launcher, transactional reconcile, probation and rollback verified by independent SOL-MID review |
-| C8 Installed E2E | NOT STARTED | |
+| C8 Installed E2E | IN PROGRESS | Artifact-bound native runner added; macOS arm64 installed real-Chrome and LaunchAgent sub-gates pass locally |
 | C9 Social/Soak/Chaos | NOT STARTED | |
 | C10 Final Release | NOT STARTED | Fresh independent acceptance required |
 
@@ -157,3 +157,29 @@
   Fresh independent SOL-MID review returned C7 PASS with no remaining
   P0/P1/P2/P3 findings after fail-closed terminal-authority and current-time
   pending-envelope expiry regressions were added.
+
+## C8 implementation evidence
+
+- Added an opt-in process-boundary gate that requires an immutable release
+  artifact SHA-256, a non-development version and a native executable under an
+  install root outside the source working tree. A skipped test cannot count as
+  installed evidence.
+- The installed executable performs authenticated WSS ensure and attestation
+  against real Chrome, executes a loopback page-target CDP evaluation, then is
+  restarted as a CLI to prove canonical Profile persistence across the process
+  boundary.
+- Added a separate native per-user autostart gate that refuses to replace an
+  existing registration and verifies install, active status and complete
+  removal using LaunchAgent, systemd-user or Scheduled Task as appropriate.
+- Publish workflows now install the produced ZIP, Debian package or NSIS setup
+  before running these gates. Linux includes Ubuntu 22.04/24.04 amd64 and a
+  native arm64 runner; the expected autostart method is fail-closed.
+- Local Apple Silicon evidence passed from the unsigned 1.5.1 ZIP with SHA-256
+  `0865350ef3f6809987f8bf54db0fa93101b3777959c01bbb394c0fa16ea55e0e`:
+  real Chrome launch/attestation/direct CDP/Profile persistence and real LaunchAgent
+  install/active/remove all passed. The test registration was removed and the
+  installed test app was moved to Trash.
+- C8 remains in progress. Fresh login/reboot, installed signed update/rollback,
+  proxy and Playwright/CDP gateway (beyond the direct CDP probe), external Server enrollment/reconcile,
+  Windows, Linux and Intel macOS executions remain required native evidence.
+  Unsigned macOS evidence does not satisfy C10 signing/notarization.
