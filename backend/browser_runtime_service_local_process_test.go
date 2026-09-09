@@ -41,7 +41,7 @@ func localProcessMonitor(t *testing.T, process *BrowserRuntimeProcess) *browserP
 
 func waitForLocalDebugPort(t *testing.T, monitor *browserProcessMonitor, want int) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if got, ok := monitor.DebugPort(); ok && got == want {
 			return
@@ -53,7 +53,7 @@ func waitForLocalDebugPort(t *testing.T, monitor *browserProcessMonitor, want in
 
 func TestBrowserRuntimeLocalProcessFactoryCapturesStderrAndReapsOnce(t *testing.T) {
 	const debugPort = 9771
-	script := writeLocalProcessScript(t, fmt.Sprintf("printf 'DevTools listening on http://127.0.0.1:%d\\n' >&2\nprintf 'local-stderr-tail\\n' >&2\nwhile :; do :; done\n", debugPort))
+	script := writeLocalProcessScript(t, fmt.Sprintf("printf 'DevTools listening on http://127.0.0.1:%d\\n' >&2\nprintf 'local-stderr-tail\\n' >&2\nwhile :; do sleep 1; done\n", debugPort))
 	process, err := NewBrowserRuntimeLocalProcess(BrowserRuntimeLaunchSpec{ChromeBinaryPath: script})
 	if err != nil {
 		t.Fatalf("NewBrowserRuntimeLocalProcess: %v", err)

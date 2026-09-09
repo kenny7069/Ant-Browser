@@ -3,34 +3,96 @@ package backend
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
+const farmResourceTelemetryHelperRole = "ANT_FARM_RESOURCE_TELEMETRY_HELPER_ROLE"
+
+func TestFarmResourceTelemetryProcessHelper(t *testing.T) {
+	role := os.Getenv(farmResourceTelemetryHelperRole)
+	if role == "" {
+		return
+	}
+	if role == "leaf" {
+		time.Sleep(30 * time.Second)
+		return
+	}
+	if role != "parent" {
+		t.Fatalf("unknown helper role %q", role)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(executable, "-test.run=^TestFarmResourceTelemetryProcessHelper$")
+	child.Env = append(os.Environ(), farmResourceTelemetryHelperRole+"=leaf")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := os.Getenv("ANT_FARM_RESOURCE_TELEMETRY_HELPER_READY")
+	if err := os.WriteFile(readyPath, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		_ = child.Process.Kill()
+		t.Fatal(err)
+	}
+	_ = child.Wait()
+}
+
 func TestDefaultProcessTreeRSSUsesRealChildAndFailsClosedAfterExit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real OS process proof")
 	}
-	cmd := exec.Command("sh", "-c", "sleep 30 & wait")
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(executable, "-test.run=^TestFarmResourceTelemetryProcessHelper$")
+	cmd.Env = append(os.Environ(), farmResourceTelemetryHelperRole+"=parent", "ANT_FARM_RESOURCE_TELEMETRY_HELPER_READY="+readyPath)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	pid := cmd.Process.Pid
-	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
+	childPID := 0
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		if childPID > 0 {
+			if child, findErr := os.FindProcess(childPID); findErr == nil {
+				_ = child.Kill()
+			}
+		}
+	}()
 	deadline := time.Now().Add(3 * time.Second)
-	var rss int64
-	var err error
 	for time.Now().Before(deadline) {
-		rss, err = defaultProcessTreeRSS(pid)
-		if err == nil && rss > 0 {
+		if raw, readErr := os.ReadFile(readyPath); readErr == nil {
+			childPID, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
+			if childPID > 0 {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		t.Fatal("process tree helper did not publish its child PID")
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	var rss int64
+	var rssErr error
+	for time.Now().Before(deadline) {
+		rss, rssErr = defaultProcessTreeRSS(pid)
+		if rssErr == nil && rss > 0 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if err != nil || rss <= 0 {
-		t.Fatalf("real process tree RSS pid=%d rss=%d err=%v", pid, rss, err)
+	if rssErr != nil || rss <= 0 {
+		t.Fatalf("real process tree RSS pid=%d child_pid=%d rss=%d err=%v", pid, childPID, rss, rssErr)
 	}
 	_ = cmd.Process.Kill()
 	_, _ = cmd.Process.Wait()

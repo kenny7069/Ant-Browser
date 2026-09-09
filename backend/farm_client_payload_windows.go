@@ -111,16 +111,19 @@ func farmClientSecureWindowsHandle(handle windows.Handle, directory bool) bool {
 	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
 		return false
 	}
-	dacl, present, err := descriptor.DACL()
-	if err != nil || !present || dacl == nil || dacl.AceCount != 3 {
+	dacl, defaulted, err := descriptor.DACL()
+	if err != nil || dacl == nil || defaulted || dacl.AceCount != 3 {
 		return false
 	}
 	system, _ := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
 	admins, _ := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
 	seen := map[string]bool{}
+	const fileAllAccessMask windows.ACCESS_MASK = 0x001f01ff
+	wantFlags := uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
 	for index := uint16(0); index < dacl.AceCount; index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
-		if windows.GetAce(dacl, uint32(index), &ace) != nil || ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
+		if windows.GetAce(dacl, uint32(index), &ace) != nil || ace == nil ||
+			ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != wantFlags || ace.Mask != fileAllAccessMask {
 			return false
 		}
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))

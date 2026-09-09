@@ -263,7 +263,7 @@ func defaultProcessTreeRSS(pid int) (int64, error) {
 		return 0, fmt.Errorf("invalid process id")
 	}
 	if runtime.GOOS == "windows" {
-		return 0, fmt.Errorf("process rss unsupported")
+		return platformProcessTreeRSS(pid)
 	}
 	output, err := exec.Command("ps", "-axo", "pid=,ppid=,rss=").Output()
 	if err != nil {

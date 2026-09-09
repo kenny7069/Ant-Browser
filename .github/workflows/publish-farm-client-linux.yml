@@ -37,6 +37,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install native Chromium on arm64
+        if: matrix.arch == 'arm64'
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pw-browsers
+        run: |
+          set -euo pipefail
+          npx --yes playwright@1.63.0 install --with-deps --no-shell chromium
+          chrome="$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f -name chrome -path '*/chromium-*/*' -print -quit)"
+          test -x "$chrome"
+          echo "C8_PLAYWRIGHT_CHROMIUM=$chrome" >> "$GITHUB_ENV"
       - name: Test Farm Client backend
         run: go test ./backend/... -count=1
       - name: Build dedicated artifacts
@@ -78,7 +88,7 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
           artifact="$(realpath "$(ls publish/farm-client/linux/dist/ant-farm-client_${version}_${{ matrix.arch }}.deb)")"
           artifact_sha="$(sha256sum "$artifact" | awk '{print $1}')"
-          chrome="$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+          chrome="${C8_PLAYWRIGHT_CHROMIUM:-$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)}"
           test -n "$chrome"
           sudo dpkg -i "$artifact"
           cleanup_package() {

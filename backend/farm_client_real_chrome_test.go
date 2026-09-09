@@ -146,13 +146,17 @@ func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed2
 	}}); err != nil {
 		return fmt.Errorf("ensure command: %w", err)
 	}
+	ensureRaw, err := readFarmClientFixtureCommandResponse(connection, "c1-ensure")
+	if err != nil {
+		return fmt.Errorf("ensure response: %w", err)
+	}
 	var ensure struct {
 		OK      bool            `json:"ok"`
 		Payload json.RawMessage `json:"payload"`
 		Error   string          `json:"error"`
 	}
-	if err := connection.ReadJSON(&ensure); err != nil {
-		return fmt.Errorf("ensure response: %w", err)
+	if err := json.Unmarshal(ensureRaw, &ensure); err != nil {
+		return fmt.Errorf("decode ensure response: %w", err)
 	}
 	if !ensure.OK {
 		return fmt.Errorf("ensure failed: %s", ensure.Error)
@@ -174,6 +178,10 @@ func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed2
 	}}); err != nil {
 		return fmt.Errorf("attest command: %w", err)
 	}
+	attestRaw, err := readFarmClientFixtureCommandResponse(connection, "c1-attest")
+	if err != nil {
+		return fmt.Errorf("attest response: %w", err)
+	}
 	var attest struct {
 		OK      bool   `json:"ok"`
 		Error   string `json:"error"`
@@ -181,13 +189,46 @@ func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed2
 			Status string `json:"status"`
 		} `json:"payload"`
 	}
-	if err := connection.ReadJSON(&attest); err != nil {
-		return fmt.Errorf("attest response: %w", err)
+	if err := json.Unmarshal(attestRaw, &attest); err != nil {
+		return fmt.Errorf("decode attest response: %w", err)
 	}
 	if !attest.OK || attest.Payload.Status != "applied" {
 		return fmt.Errorf("attest failed: ok=%v status=%q error=%s", attest.OK, attest.Payload.Status, attest.Error)
 	}
 	return nil
+}
+
+func readFarmClientFixtureCommandResponse(connection *websocket.Conn, correlationID string) ([]byte, error) {
+	for {
+		_, raw, err := connection.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		var header struct {
+			Type          string `json:"type"`
+			CorrelationID string `json:"correlation_id"`
+			HeartbeatID   string `json:"heartbeat_id"`
+		}
+		if err := json.Unmarshal(raw, &header); err != nil {
+			return nil, err
+		}
+		switch header.Type {
+		case "heartbeat":
+			if header.HeartbeatID == "" {
+				return nil, fmt.Errorf("heartbeat omitted identity")
+			}
+			if err := connection.WriteJSON(farmControlHeartbeatAck{Type: "heartbeat_ack", HeartbeatID: header.HeartbeatID}); err != nil {
+				return nil, err
+			}
+		case "command_response":
+			if header.CorrelationID != correlationID {
+				return nil, fmt.Errorf("command response correlation = %q, want %q", header.CorrelationID, correlationID)
+			}
+			return raw, nil
+		default:
+			return nil, fmt.Errorf("unexpected client message type %q", header.Type)
+		}
+	}
 }
 
 func seedFarmClientChromeDB(t *testing.T, path string, profile BrowserProfile, core browser.Core) {

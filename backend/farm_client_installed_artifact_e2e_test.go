@@ -134,11 +134,13 @@ func TestFarmClientInstalledArtifactRealChrome(t *testing.T) {
 	case err := <-serverDone:
 		if err != nil {
 			_ = command.Process.Kill()
-			t.Fatalf("installed real Chrome flow: %v; stderr=%s", err, stderr.String())
+			logRaw, _ := os.ReadFile(filepath.Join(clientConfig.StateRoot, "logs", "ant-farm-client.log"))
+			t.Fatalf("installed real Chrome flow: %v; stderr=%s; log=%s", err, stderr.String(), logRaw)
 		}
 	case <-ctx.Done():
 		_ = command.Process.Kill()
-		t.Fatalf("installed real Chrome flow timed out: %v; stderr=%s", ctx.Err(), stderr.String())
+		logRaw, _ := os.ReadFile(filepath.Join(clientConfig.StateRoot, "logs", "ant-farm-client.log"))
+		t.Fatalf("installed real Chrome flow timed out: %v; stderr=%s; log=%s", ctx.Err(), stderr.String(), logRaw)
 	}
 	if runtime.GOOS == "windows" {
 		_ = command.Process.Kill()

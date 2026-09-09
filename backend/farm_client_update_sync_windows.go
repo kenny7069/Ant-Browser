@@ -89,8 +89,8 @@ func setFarmClientUpdateWindowsACL(path string) error {
 		return ErrFarmClientUpdateUnavailable
 	}
 	owner, _, ownerErr := descriptor.Owner()
-	dacl, present, daclErr := descriptor.DACL()
-	if ownerErr != nil || daclErr != nil || !present || dacl == nil {
+	dacl, defaulted, daclErr := descriptor.DACL()
+	if ownerErr != nil || daclErr != nil || dacl == nil || defaulted {
 		return ErrFarmClientUpdateUnavailable
 	}
 	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,

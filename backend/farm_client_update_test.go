@@ -187,10 +187,7 @@ func TestFarmClientUpdateStagesVerifiedArtifactWithoutExecutePermission(t *testi
 	if err != nil || string(value) != string(artifact) {
 		t.Fatalf("read err=%v value=%q", err, value)
 	}
-	info, err := os.Stat(staged.Path)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("mode=%v err=%v", info.Mode().Perm(), err)
-	}
+	assertFarmClientStagedFileSecurity(t, staged.Path)
 	if filepath.Ext(staged.Path) != ".bin" {
 		t.Fatalf("path=%q", staged.Path)
 	}
@@ -239,7 +236,7 @@ func TestFarmClientUpdateConfigPinsKeyAndHTTPSAsOnePolicy(t *testing.T) {
 	}
 	base := func() FarmClientConfig {
 		return FarmClientConfig{
-			ApplicationRoot: "/tmp/app", StateRoot: "/tmp/state",
+			ApplicationRoot: t.TempDir(), StateRoot: t.TempDir(),
 			ControlURL: "wss://control.example.invalid/ws",
 			Identity:   FarmClientIdentityConfig{NodeUID: "node-a", PrivateKey: base64.StdEncoding.EncodeToString(make([]byte, ed25519.SeedSize))},
 		}
