@@ -10,7 +10,7 @@
 | C5 Packaging | PASS | Dedicated Windows/Linux/macOS artifacts, isolated workflows, pinned runtimes and unsigned-macOS release gate verified |
 | C6 Fleet Management | PASS | Admin-only inventory/actions, enrollment, pairing, telemetry fallback and closed command surface verified |
 | C7 Updater | PASS | Signed manifest, immutable launcher, transactional reconcile, probation and rollback verified by independent SOL-MID review |
-| C8 Installed E2E | IN PROGRESS | Five native basic matrices pass installed package, real Chrome/CDP, strict stop, persistence, per-user autostart and uninstall; reboot/update/proxy/external-Server gates remain |
+| C8 Installed E2E | IN PROGRESS | Five native basic matrices pass; installed signed update/rollback harness passes locally and is wired into all native jobs, whose new results are pending; reboot/proxy/external-Server gates remain |
 | C9 Social/Soak/Chaos | NOT STARTED | |
 | C10 Final Release | NOT STARTED | Fresh independent acceptance required |
 

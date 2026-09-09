@@ -35,6 +35,16 @@ exercise the real per-user registration backend. It refuses to overwrite a
 pre-existing registration, waits for an active native registration, removes
 it and proves no installed/active state remains.
 
+`TestFarmClientInstalledArtifactSignedUpdateRollback` runs the installed
+immutable launcher against real A/B native payloads copied outside the source
+tree. It verifies both payload versions, target and SHA-256, consumes a real
+Ed25519-signed five-target manifest over disposable trusted HTTPS, and requires
+authenticated heartbeat plus authoritative empty-inventory reconcile before
+B can survive probation. It then serves a two-policy-authorized downgrade to
+A, withholds Server reconcile completion, proves A is not committed, and
+requires the stable B slot to reconnect healthy after automatic rollback. No
+test writes activation state or invokes local activation/health/commit APIs.
+
 The manual publish workflows now consume the artifact they just produced:
 
 - Windows executes the NSIS setup, runs installed tests under Program Files,
@@ -79,10 +89,18 @@ DACL handling, staged-artifact ACL publication, Windows task XML decoding,
 Windows tree termination and Unix process-group cleanup. Source normal/race,
 vet and Windows cross-compilation passed after those fixes.
 
+The installed signed-update harness passed locally on Apple Silicon at commit
+`fd31252`, using native versions 1.5.1 and 1.5.2 outside the checkout. The
+upgrade committed B only after reconcile and continuous probation; the failed
+downgrade returned to stable B. The same commit adds this gate to all five
+native publish jobs. Those new native job results remain pending and are not
+pre-claimed as acceptance evidence.
+
 ## Remaining acceptance
 
 C8 is not PASS until native evidence also covers fresh login/reboot and
-reconnect/reconcile, installed signed update and rollback, proxy and full
+reconnect/reconcile, the new installed signed update/rollback gate on all five
+targets, proxy and full
 Playwright/CDP gateway paths beyond the direct probe, enrollment against an
 authorized external Server, native DPAPI/Keychain/Secret Service behavior,
 Linux X11/Wayland plus headed/headless coverage, and the remaining two-account,
