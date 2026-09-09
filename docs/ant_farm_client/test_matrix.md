@@ -15,7 +15,8 @@
 | C2 | Enrollment/security | one-time/expiry/replay/key storage/diagnostics | PASS on macOS arm64; target-OS native rerun required at C8 |
 | C3 | Profile pairing | CRUD/readiness/pair/unpair/same-ID ABA | PASS on macOS arm64; target-OS installed rerun required at C8 |
 | C4 | Background lifecycle | per-user autostart, production controller fence, graceful ownership-aware shutdown | PASS in unit/integration/cross-build; native installed login/reboot repeats at C8 |
-| C5-C7 | Package/fleet/update | dedicated artifacts, fleet operations, signed update/rollback | Not started |
+| C5 | Dedicated packaging | isolated Windows setup/zip, Linux deb/tar, macOS app/zip, runtime/version/release gates | PASS; Windows native install and macOS production signing remain C8/C10 |
+| C6-C7 | Fleet/update | fleet operations, signed update/rollback | Not started |
 | C8-C10 | Installed E2E/release | Windows, Linux, macOS, social, soak, chaos | Not started |
 
 No skipped real-browser, cross-repository, Windows, installed-artifact, soak, or
@@ -72,3 +73,22 @@ opt-in test programs are present and are not counted as executed on macOS.
 | Server Control WSS + Queue + Farm/auth/schema suites | 177 PASS, 2 existing skips |
 | C1 real Chrome Host regression | PASS |
 | C3 cross-repository TLS WSS/real Chrome profile-translation regression | PASS |
+
+## C5 commands (macOS arm64 + Linux containers)
+
+| Command / evidence | Result |
+|---|---|
+| `go test ./backend/... -count=1` | PASS |
+| `go test -race ./backend/... -count=1` | PASS |
+| `go vet ./backend/...` | PASS |
+| `bash -n publish/farm-client/{linux,macos}/package.sh` and Ruby YAML parse of three workflows | PASS |
+| `tools/runtime/verify-runtime.sh` for darwin-arm64, linux-amd64 and linux-arm64 | PASS |
+| native macOS arm64 `package.sh --arch arm64 --version 1.5.0` | PASS; versioned `.app`/`.zip`, plist and three Mach-O architectures verified |
+| Ubuntu target containers package and inspect Linux amd64/arm64 tar + deb | PASS; packaged binaries executed and reported exact version/GOARCH |
+| Darwin amd64 and Windows amd64 Client cross-builds with release version injection | PASS |
+| packaging policy/schema tests | PASS; isolated paths, dedicated tags/names, strict secure-reference examples, no global process cleanup |
+
+Windows NSIS execution requires the existing `windows-2022` workflow and is
+not counted as an installed-artifact pass here. macOS artifacts are explicitly
+not Developer ID signed or notarized and cannot be externally released; those
+acceptance gates remain C8 and C10 respectively.

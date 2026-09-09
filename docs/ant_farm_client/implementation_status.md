@@ -7,7 +7,7 @@
 | C2 Enrollment | PASS | One-time HTTPS API, response-loss confirmation, secure per-OS identity, CLI bootstrap and secret-free diagnostics verified |
 | C3 Profile Pairing | PASS | Canonical SQLite CRUD/open, signed one-time pairing, durable ABA fence and Server↔Ant ID translation verified |
 | C4 Background Lifecycle | PASS | Per-user Windows/macOS/Linux autostart, controller-fenced production WSS auth and ownership-aware SIGTERM verified |
-| C5 Packaging | NOT STARTED | |
+| C5 Packaging | PASS | Dedicated Windows/Linux/macOS artifacts, isolated workflows, pinned runtimes and unsigned-macOS release gate verified |
 | C6 Fleet Management | NOT STARTED | |
 | C7 Updater | NOT STARTED | |
 | C8 Installed E2E | NOT STARTED | |
@@ -92,3 +92,26 @@
   tests, real Chrome Host and cross-repository real Chrome tests passed.
 - Native login/reboot and installed-artifact repetitions remain mandatory C8
   evidence and are not inferred from cross-builds.
+
+## C5 completion evidence
+
+- Added isolated `publish/farm-client/{windows,linux,macos}` packaging and
+  `farm-client-v*` workflows. They cannot match the Desktop `v*` release and
+  never write into the Desktop staging/output trees.
+- Linux produces versioned amd64/arm64 `.deb` and `.tar.gz` packages with the
+  verified xray + sing-box runtime pair. Both architectures were assembled in
+  target-architecture Ubuntu containers and their packaged Client binaries
+  executed with the injected `1.5.0` version.
+- macOS produces versioned Intel/Apple Silicon `.app` and `.zip` artifacts.
+  The Apple Silicon package was assembled and inspected natively; its Client,
+  xray and sing-box binaries are arm64 and its plist/version are valid.
+- macOS output has no Developer ID/notarization acceptance. Tag-triggered
+  publication fails closed until C10 adds hardened-runtime signing,
+  notarization, stapling and Gatekeeper verification.
+- Windows produces a separate setup and zip under Program Files/Local AppData
+  semantics. Its installer stops only the exact installed Client executable,
+  contains no global xray/sing-box process-name cleanup, preserves per-user
+  state, and has a Windows 2022 native build/validation workflow.
+- Full Go tests, full race tests, vet, package-policy tests, workflow YAML,
+  shell syntax, runtime hashes and five target Client builds passed. Native
+  Windows installer execution and installed upgrade/uninstall remain C8.
