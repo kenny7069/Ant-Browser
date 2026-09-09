@@ -8,7 +8,7 @@
 | C3 Profile Pairing | PASS | Canonical SQLite CRUD/open, signed one-time pairing, durable ABA fence and Server↔Ant ID translation verified |
 | C4 Background Lifecycle | PASS | Per-user Windows/macOS/Linux autostart, controller-fenced production WSS auth and ownership-aware SIGTERM verified |
 | C5 Packaging | PASS | Dedicated Windows/Linux/macOS artifacts, isolated workflows, pinned runtimes and unsigned-macOS release gate verified |
-| C6 Fleet Management | NOT STARTED | |
+| C6 Fleet Management | PASS | Admin-only inventory/actions, enrollment, pairing, telemetry fallback and closed command surface verified |
 | C7 Updater | NOT STARTED | |
 | C8 Installed E2E | NOT STARTED | |
 | C9 Social/Soak/Chaos | NOT STARTED | |
@@ -115,3 +115,27 @@
 - Full Go tests, full race tests, vet, package-policy tests, workflow YAML,
   shell syntax, runtime hashes and five target Client builds passed. Native
   Windows installer execution and installed upgrade/uninstall remain C8.
+
+## C6 completion evidence
+
+- Added an admin-only Fleet page and named APIs for Nodes, Enrollment,
+  Versions, Pairing, Updates and Diagnostics. The inventory combines durable
+  Control-plane state with live WSS telemetry and degrades to durable data when
+  a session is offline.
+- Added transactional rename, drain, resume, disable, enable, revoke, update
+  channel and unpair operations. Admin unpair restores the tenant profile to
+  the local provider, clears only its opaque Farm locator, disables affinity
+  and revokes an unused grant in one MySQL transaction.
+- Drain is serialized against new runtime commands while preserving liveness.
+  Resume, disable and revoke fence authentication/commands and close the exact
+  Control session plus tracked CDP tunnels before the durable state write;
+  persistent Chrome runtimes are not killed.
+- The Server and Agent retain the same finite Control command allowlist. No
+  generic command, shell, PowerShell, Bash or upload-and-run API/UI was added.
+- Enrollment responses are non-cacheable, secrets are cleared on dialog close,
+  expiry, page hide and backgrounding, and unknown Node subresources return
+  stable 404 responses.
+- Fleet, Control WSS, CDP gateway, auth, schema, enrollment, pairing, runtime,
+  attestation, telemetry, live-monitor and Queue regressions passed. Desktop
+  and modal layouts were visually inspected; HTML and inline JavaScript checks
+  passed. Independent SOL review returned PASS with no remaining P1/P2.

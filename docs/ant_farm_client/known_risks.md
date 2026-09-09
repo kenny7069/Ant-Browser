@@ -26,3 +26,7 @@
 | Windows NSIS cannot execute on the macOS development host | C5 adds a dedicated Windows 2022 build/layout/policy workflow; fresh install, upgrade and uninstall are mandatory C8 evidence |
 | macOS C5 packages are not Developer ID signed or notarized | The macOS tag workflow refuses unsigned publication; C10 must add hardened-runtime signing, notarization, stapling and Gatekeeper acceptance before external release |
 | Platform release jobs can produce partial non-macOS assets before C10 | Do not treat a `farm-client-v*` tag as a production release until the C10 unified release gate validates every required artifact and compatibility hash |
+| Fleet live telemetry can disappear when a Control session drops | C6 falls back to durable inventory and labels freshness; C8 must verify reconnect and stale-state behavior against an installed fleet |
+| Fleet update status is present before the signed updater exists | C6 reports the durable `unknown` state and update channel; C7 owns signed manifests, state transitions and rollback |
+| Admin transitions can race commands or accepted CDP tunnels | Resolved in C6 with a per-Node transition/command lane, authentication fence, identity-safe tunnel registry and cancellation/capacity behavior tests |
+| C6 schema migrations were verified without mutating the available live database | Run additive migration and rollback checks in the authorized installed C8 environment before production rollout |

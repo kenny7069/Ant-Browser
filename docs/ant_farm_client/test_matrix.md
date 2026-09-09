@@ -16,7 +16,8 @@
 | C3 | Profile pairing | CRUD/readiness/pair/unpair/same-ID ABA | PASS on macOS arm64; target-OS installed rerun required at C8 |
 | C4 | Background lifecycle | per-user autostart, production controller fence, graceful ownership-aware shutdown | PASS in unit/integration/cross-build; native installed login/reboot repeats at C8 |
 | C5 | Dedicated packaging | isolated Windows setup/zip, Linux deb/tar, macOS app/zip, runtime/version/release gates | PASS; Windows native install and macOS production signing remain C8/C10 |
-| C6-C7 | Fleet/update | fleet operations, signed update/rollback | Not started |
+| C6 | Fleet management | inventory, enrollment, named actions, pairing, telemetry, closed command surface | PASS |
+| C7 | Signed update | signed update, drain/restart/reconcile and rollback | Not started |
 | C8-C10 | Installed E2E/release | Windows, Linux, macOS, social, soak, chaos | Not started |
 
 No skipped real-browser, cross-repository, Windows, installed-artifact, soak, or
@@ -92,3 +93,21 @@ Windows NSIS execution requires the existing `windows-2022` workflow and is
 not counted as an installed-artifact pass here. macOS artifacts are explicitly
 not Developer ID signed or notarized and cannot be externally released; those
 acceptance gates remain C8 and C10 respectively.
+
+## C6 commands (Server)
+
+| Command / evidence | Result |
+|---|---|
+| `python3 輔助程式/test_farm_admin_c6.py` | PASS, 19 tests |
+| `python3 輔助程式/test_control_wss_p1_7.py` | PASS, 25 tests; 1 existing environment skip |
+| `python3 輔助程式/test_cdp_gateway_p1_14.py` | PASS, 9 tests |
+| auth, Control schema, enrollment and Node enrollment suites | PASS, 140 checks/tests; 1 existing environment skip |
+| resource RTT, pairing, runtime control/authority and attestation suites | PASS |
+| live-monitor Farm provider and Queue browser-Farm integration | PASS |
+| Python compile, HTML parse, inline `node --check`, `git diff --check` | PASS |
+| desktop inventory and enrollment-modal visual inspection | PASS |
+| independent SOL P1/P2 review after cancellation/race hardening | PASS |
+
+The available live MySQL instance was not migrated as part of this gate.
+Installed-environment migration and multi-process deployment checks remain C8
+evidence and are not inferred from mocked transaction/schema tests.
