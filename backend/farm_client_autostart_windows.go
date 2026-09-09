@@ -119,7 +119,14 @@ func (m *farmClientWindowsAutostart) Status() (FarmClientAutostartStatus, error)
 	if err != nil {
 		return FarmClientAutostartStatus{Method: "scheduled-task-at-logon"}, nil
 	}
-	active := strings.Contains(strings.ToLower(farmClientWindowsCommandText(output)), "<enabled>true</enabled>")
+	normalized := strings.ToLower(farmClientWindowsCommandText(output))
+	if !strings.Contains(normalized, "<task") || !strings.Contains(normalized, "<settings") {
+		return FarmClientAutostartStatus{}, fmt.Errorf("%w: invalid scheduled task XML", ErrFarmClientAutostart)
+	}
+	// Task Scheduler omits Enabled when its schema-default value is true.
+	// An explicit false on either the task settings or its logon trigger is
+	// therefore the only disabled representation returned by /Query /XML.
+	active := !strings.Contains(normalized, "<enabled>false</enabled>")
 	return FarmClientAutostartStatus{Installed: true, Active: active, Method: "scheduled-task-at-logon"}, nil
 }
 
