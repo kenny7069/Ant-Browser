@@ -63,6 +63,10 @@ func TestBrowserRuntimeLocalProcessFactoryCapturesStderrAndReapsOnce(t *testing.
 	}
 	monitor := localProcessMonitor(t, process)
 	waitForLocalDebugPort(t, monitor, debugPort)
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(monitor.stderrTail.String(), "local-stderr-tail") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if tail := monitor.stderrTail.String(); !strings.Contains(tail, "local-stderr-tail") {
 		t.Fatalf("stderr tail = %q, want fixture marker", tail)
 	}

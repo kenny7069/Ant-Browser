@@ -74,7 +74,7 @@ jobs:
           set -euo pipefail
           version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
           if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
-          artifact="$(ls publish/farm-client/macos/dist/AntFarmClient-${version}-macos-${{ matrix.arch }}.zip)"
+          artifact="$(cd "$(dirname "$(ls publish/farm-client/macos/dist/AntFarmClient-${version}-macos-${{ matrix.arch }}.zip)")" && pwd -P)/AntFarmClient-${version}-macos-${{ matrix.arch }}.zip"
           install_root="$RUNNER_TEMP/AntFarmClient-C8-Installed"
           mkdir -p "$install_root"
           ditto -x -k "$artifact" "$install_root"

@@ -76,7 +76,7 @@ jobs:
           set -euo pipefail
           version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
           if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
-          artifact="$(ls publish/farm-client/linux/dist/ant-farm-client_${version}_${{ matrix.arch }}.deb)"
+          artifact="$(realpath "$(ls publish/farm-client/linux/dist/ant-farm-client_${version}_${{ matrix.arch }}.deb)")"
           artifact_sha="$(sha256sum "$artifact" | awk '{print $1}')"
           chrome="$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
           test -n "$chrome"
