@@ -4,11 +4,15 @@ package backend
 
 import (
 	"errors"
+	"fmt"
 	"golang.org/x/sys/windows"
 	"os"
 	"path/filepath"
+	"time"
 	"unsafe"
 )
+
+const farmClientUpdateWindowsReplaceRetryWindow = 500 * time.Millisecond
 
 func farmClientUpdateWindowsSecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
@@ -138,8 +142,15 @@ func writeFarmClientUpdateState(path string, value []byte, mode os.FileMode) err
 	if err != nil {
 		return ErrFarmClientUpdateApply
 	}
-	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
-		return ErrFarmClientUpdateApply
+	deadline := time.Now().Add(farmClientUpdateWindowsReplaceRetryWindow)
+	for {
+		err = windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+		if err == nil {
+			return nil
+		}
+		if (!errors.Is(err, windows.ERROR_SHARING_VIOLATION) && !errors.Is(err, windows.ERROR_LOCK_VIOLATION)) || !time.Now().Before(deadline) {
+			return errors.Join(ErrFarmClientUpdateApply, fmt.Errorf("replace farm client update state: %w", err))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return nil
 }
