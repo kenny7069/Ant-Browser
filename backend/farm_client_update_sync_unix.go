@@ -43,6 +43,21 @@ func secureFarmClientUpdateFilePlatform(path string) error {
 	return nil
 }
 
+func secureFarmClientStagedFilePlatform(path string) error {
+	if err := os.Chmod(path, 0o600); err != nil {
+		return ErrFarmClientUpdateUnavailable
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return ErrFarmClientUpdateUnavailable
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) {
+		return ErrFarmClientUpdateUnavailable
+	}
+	return nil
+}
+
 func syncFarmClientUpdateDirectory(path string) error {
 	directory, err := os.Open(path)
 	if err != nil {

@@ -95,6 +95,7 @@ func TestFarmClientInstalledArtifactRealChrome(t *testing.T) {
 	key := newFarmClientTestPrivateKey(t)
 
 	serverDone := make(chan error, 1)
+	var launchedRuntime FarmRuntime
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		connection, upgradeErr := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(writer, request, nil)
 		if upgradeErr != nil {
@@ -103,7 +104,10 @@ func TestFarmClientInstalledArtifactRealChrome(t *testing.T) {
 		}
 		defer connection.Close()
 		incarnation, _ := farmClientProfileIncarnation(profileID, profile.IncarnationID)
-		serverDone <- runFarmClientRealChromeWSSFixture(connection, key.Public().(ed25519.PublicKey), profileID, incarnation, probeC8ChromeCDP)
+		serverDone <- runFarmClientRealChromeWSSFixture(connection, key.Public().(ed25519.PublicKey), profileID, incarnation, func(runtime FarmRuntime) error {
+			launchedRuntime = runtime
+			return probeC8ChromeCDP(runtime)
+		})
 	}))
 	defer server.Close()
 
@@ -155,6 +159,13 @@ func TestFarmClientInstalledArtifactRealChrome(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		_ = command.Process.Kill()
 		t.Fatal("installed client did not stop within 10 seconds")
+	}
+	shutdownDeadline := time.Now().Add(10 * time.Second)
+	for launchedRuntime.PID > 0 && isProcessAlive(launchedRuntime.PID) && time.Now().Before(shutdownDeadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if launchedRuntime.PID > 0 && isProcessAlive(launchedRuntime.PID) {
+		t.Fatalf("installed client shutdown left Chrome pid %d running", launchedRuntime.PID)
 	}
 	listOutput, err := exec.Command(executable, "-config", configPath, "profiles", "list").Output()
 	if err != nil || !bytes.Contains(listOutput, []byte(profileID)) {

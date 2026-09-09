@@ -52,6 +52,10 @@ jobs:
           sudo chmod 4755 "$sandbox"
           test "$(stat -c '%U:%G' "$sandbox")" = "root:root"
           test -u "$sandbox"
+          smoke_profile="$RUNNER_TEMP/chromium-arm64-smoke"
+          mkdir -p "$smoke_profile"
+          timeout 30s "$chrome" --headless=new --no-first-run --no-default-browser-check \
+            --disable-background-networking --user-data-dir="$smoke_profile" --dump-dom about:blank
           echo "C8_PLAYWRIGHT_CHROMIUM=$chrome" >> "$GITHUB_ENV"
       - name: Test Farm Client backend
         run: go test ./backend/... -count=1

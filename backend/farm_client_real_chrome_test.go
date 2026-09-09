@@ -195,27 +195,6 @@ func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed2
 	if !attest.OK || attest.Payload.Status != "applied" {
 		return fmt.Errorf("attest failed: ok=%v status=%q error=%s", attest.OK, attest.Payload.Status, attest.Error)
 	}
-	if err := connection.WriteJSON(FarmRuntimeCommand{Type: "command", NodeUID: begin.NodeUID, CorrelationID: "c1-stop", Command: "stop_runtime", Payload: FarmRuntimeStopRequest{
-		NodeUID: runtime.NodeUID, ProfileID: runtime.ProfileID, RuntimeUID: runtime.RuntimeUID,
-		ProviderInstanceID: runtime.ProviderInstanceID, FencingEpoch: runtime.FencingEpoch,
-		ConfigHash: runtime.ConfigHash, Generation: runtime.Generation,
-	}}); err != nil {
-		return fmt.Errorf("stop command: %w", err)
-	}
-	stopRaw, err := readFarmClientFixtureCommandResponse(connection, "c1-stop")
-	if err != nil {
-		return fmt.Errorf("stop response: %w", err)
-	}
-	var stop struct {
-		OK    bool   `json:"ok"`
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal(stopRaw, &stop); err != nil {
-		return fmt.Errorf("decode stop response: %w", err)
-	}
-	if !stop.OK {
-		return fmt.Errorf("stop failed: %s", stop.Error)
-	}
 	return nil
 }
 

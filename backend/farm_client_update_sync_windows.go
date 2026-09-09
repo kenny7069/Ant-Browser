@@ -83,6 +83,10 @@ func secureFarmClientUpdateFilePlatform(path string) error {
 	return nil
 }
 
+func secureFarmClientStagedFilePlatform(path string) error {
+	return secureFarmClientUpdateFilePlatform(path)
+}
+
 func setFarmClientUpdateWindowsACL(path string) error {
 	descriptor, err := farmClientUpdateWindowsSecurityDescriptor()
 	if err != nil {

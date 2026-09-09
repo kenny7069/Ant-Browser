@@ -433,6 +433,10 @@ func StageFarmClientUpdate(
 	} else if err := os.Rename(temporaryPath, finalPath); err != nil {
 		return FarmClientStagedUpdate{}, ErrFarmClientUpdateUnavailable
 	}
+	if err := secureFarmClientStagedFilePlatform(finalPath); err != nil {
+		_ = os.Remove(finalPath)
+		return FarmClientStagedUpdate{}, ErrFarmClientUpdateUnavailable
+	}
 	if err := syncFarmClientUpdateDirectory(stagingRoot); err != nil {
 		_ = os.Remove(finalPath)
 		return FarmClientStagedUpdate{}, ErrFarmClientUpdateUnavailable
