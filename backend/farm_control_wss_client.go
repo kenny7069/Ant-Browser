@@ -595,16 +595,11 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn, connectionCtx cont
 			go func(command FarmRuntimeCommand) {
 				defer func() { <-c.commandSlots }()
 				if command.Command == "open_cdp_tunnel" {
-					// CDP is a separate WebSocket message relay.  It must be
-					// opened only after the shared runtime service proves current
-					// ownership; the helper sends the compact command response
-					// after the outbound tunnel receives its ready handshake.
-					service := c.adapter.service
-					service.connectionOperationMu.RLock()
-					if connectionCtx.Err() == nil && service.connectionIsCurrent(connectionFence) {
-						c.handleOpenCDPCommand(conn, command)
-					}
-					service.connectionOperationMu.RUnlock()
+					// The tunnel handshake is network I/O and must be cancelled by
+					// this authenticated connection, not by the client-global
+					// lifetime.  Never hold the connection ownership lock across
+					// that handshake: reconnect must be able to invalidate it.
+					c.handleOpenCDPCommand(connectionCtx, connectionFence, conn, command)
 					return
 				}
 				// Runtime calls retain their existing service ownership/bounds.

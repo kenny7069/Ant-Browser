@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,43 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+func TestFarmControlCDPStaleAcceptedCommandReturnsCorrelatedFailure(t *testing.T) {
+	controlConn, controlPeer, closeControl := newCDPRelaySocketPair(t)
+	defer closeControl()
+	fixture := newFarmRuntimeTestFixture(t, "profile-1")
+	currentFence := fixture.farm.BeginControlConnection()
+	adapter, err := NewFarmRuntimeControlAdapter(fixture.farm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	defer cancelClient()
+	client := &FarmControlWSSClient{
+		config: FarmControlWSSClientConfig{
+			NodeUID: "node-test", MaxMessageBytes: maxFarmControlMessageBytes,
+			CommandTimeout: time.Second,
+		},
+		adapter: adapter, ctx: clientCtx,
+	}
+	command := FarmRuntimeCommand{
+		Type: "command", NodeUID: "node-test", CorrelationID: "stale-cdp",
+		Command: "open_cdp_tunnel", Payload: map[string]any{},
+	}
+	client.handleOpenCDPCommand(context.Background(), currentFence-1, controlConn, command)
+	_ = controlPeer.SetReadDeadline(time.Now().Add(time.Second))
+	_, raw, err := controlPeer.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response FarmRuntimeCommandResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.CorrelationID != command.CorrelationID || response.OK || response.Error != ErrFarmRuntimeStale.Error() {
+		t.Fatalf("stale CDP response=%+v", response)
+	}
+}
 
 func newCDPRelaySocketPair(t *testing.T) (*websocket.Conn, *websocket.Conn, func()) {
 	t.Helper()

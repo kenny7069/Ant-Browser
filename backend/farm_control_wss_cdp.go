@@ -271,7 +271,24 @@ func (c *FarmControlWSSClient) writeCDPResponse(conn *websocket.Conn, command Fa
 	}
 }
 
-func (c *FarmControlWSSClient) handleOpenCDPCommand(conn *websocket.Conn, command FarmRuntimeCommand) {
+func (c *FarmControlWSSClient) handleOpenCDPCommand(
+	connectionCtx context.Context,
+	connectionFence uint64,
+	conn *websocket.Conn,
+	command FarmRuntimeCommand,
+) {
+	if connectionCtx == nil || connectionCtx.Err() != nil || !c.adapter.service.connectionIsCurrent(connectionFence) {
+		// A command already accepted from the wire must never disappear without
+		// either a correlated response or a terminal transport event.  Closing a
+		// cancelled connection is safer than writing a stale response onto a
+		// replacement session.
+		if connectionCtx != nil && connectionCtx.Err() == nil {
+			c.writeCDPResponse(conn, command, false, nil, ErrFarmRuntimeStale)
+		} else if conn != nil {
+			_ = conn.Close()
+		}
+		return
+	}
 	request, err := farmCDPDecodeRequest(command.Payload)
 	if err != nil {
 		c.writeCDPResponse(conn, command, false, nil, err)
@@ -282,12 +299,28 @@ func (c *FarmControlWSSClient) handleOpenCDPCommand(conn *websocket.Conn, comman
 		c.writeCDPResponse(conn, command, false, nil, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.ctx, c.config.CommandTimeout)
+	ctx, cancel := context.WithTimeout(connectionCtx, c.config.CommandTimeout)
 	tunnelConn, err := c.dialCDPTunnel(ctx, request)
 	cancel()
 	if err != nil {
 		c.adapter.CloseCDPTunnel(request.SessionID, browserConn)
+		if connectionCtx.Err() != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return
+		}
 		c.writeCDPResponse(conn, command, false, nil, ErrFarmControlWSSProtocol)
+		return
+	}
+	if connectionCtx.Err() != nil || !c.adapter.service.connectionIsCurrent(connectionFence) {
+		_ = tunnelConn.Close()
+		c.adapter.CloseCDPTunnel(request.SessionID, browserConn)
+		if connectionCtx.Err() == nil {
+			c.writeCDPResponse(conn, command, false, nil, ErrFarmRuntimeStale)
+		} else if conn != nil {
+			_ = conn.Close()
+		}
 		return
 	}
 	session := newFarmControlCDPSession(browserConn, tunnelConn)
