@@ -24,6 +24,15 @@ func TestFarmClientAutostartWindowsDecodesScheduledTaskXML(t *testing.T) {
 	if got := farmClientWindowsCommandText(withoutBOM); got != want {
 		t.Fatalf("decoded BOM-less scheduled task XML = %q, want %q", got, want)
 	}
+	bigEndian := make([]byte, 0, len(units)*2)
+	for _, unit := range units {
+		var pair [2]byte
+		binary.BigEndian.PutUint16(pair[:], unit)
+		bigEndian = append(bigEndian, pair[:]...)
+	}
+	if got := farmClientWindowsCommandText(bigEndian); got != want {
+		t.Fatalf("decoded big-endian scheduled task XML = %q, want %q", got, want)
+	}
 	if got := farmClientWindowsCommandText([]byte(want)); got != want {
 		t.Fatalf("plain scheduled task XML = %q, want %q", got, want)
 	}

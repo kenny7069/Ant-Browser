@@ -134,13 +134,16 @@ func farmClientWindowsCommandText(value []byte) string {
 		utf16Encoded = true
 	}
 	if !utf16Encoded {
-		oddZeros := 0
-		for index := 1; index < len(value); index += 2 {
-			if value[index] == 0 {
-				oddZeros++
+		zeros := [2]int{}
+		for index, item := range value {
+			if item == 0 {
+				zeros[index%2]++
 			}
 		}
-		utf16Encoded = oddZeros >= len(value)/4
+		utf16Encoded = zeros[0] >= len(value)/4 || zeros[1] >= len(value)/4
+		if zeros[0] > zeros[1] {
+			order = binary.BigEndian
+		}
 	}
 	if !utf16Encoded {
 		return string(value)

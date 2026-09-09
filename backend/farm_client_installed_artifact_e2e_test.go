@@ -241,6 +241,9 @@ func TestFarmClientInstalledArtifactAutostartNative(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
+			if diagnostic := c8NativeAutostartDiagnostic(); diagnostic != "" {
+				t.Fatalf("native autostart did not become active: %+v %s", status, diagnostic)
+			}
 			t.Fatalf("native autostart did not become active: %+v", status)
 		}
 		time.Sleep(200 * time.Millisecond)
