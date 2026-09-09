@@ -1,3 +1,5 @@
+//go:build !windows
+
 package backend
 
 // P1.18 DB-ready/node-missing evidence and opt-in cross-repository runner.

@@ -48,13 +48,19 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
           bash publish/farm-client/linux/package.sh --arch "${{ matrix.arch }}" --version "$version"
       - name: Validate package layouts
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
+          if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
           deb="$(ls publish/farm-client/linux/dist/ant-farm-client_*_${{ matrix.arch }}.deb)"
           archive="$(ls publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.tar.gz)"
           update="$(ls publish/farm-client/linux/dist/AntFarmClient-*-linux-${{ matrix.arch }}.update.bin)"
           dpkg-deb -I "$deb" >/dev/null
-          dpkg-deb -c "$deb" | grep -q '/opt/ant-farm-client/ant-farm-client'
+          # Do not use grep -q under pipefail: its early close makes dpkg's
+          # tar writer report EPIPE even when the expected path is present.
+          dpkg-deb -c "$deb" | grep -F '/opt/ant-farm-client/ant-farm-client' >/dev/null
           staging="$(mktemp -d)"
           tar -xzf "$archive" -C "$staging"
           test -x "$staging/ant-farm-client"

@@ -1,3 +1,5 @@
+//go:build !windows
+
 package backend
 
 // P1.18 config-mismatch evidence contract.  The validator is intentionally

@@ -47,8 +47,12 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
           bash publish/farm-client/macos/package.sh --arch "${{ matrix.arch }}" --version "$version"
       - name: Validate app and signing gate
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
+          if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
           app="$(ls -d publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.app)"
           zip="$(ls publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.zip)"
           update="$(ls publish/farm-client/macos/dist/AntFarmClient-*-darwin-${{ matrix.arch }}.update.bin)"
