@@ -47,6 +47,7 @@ func NewBrowserRuntimeLocalProcess(spec BrowserRuntimeLaunchSpec) (*BrowserRunti
 
 	cmd := exec.Command(binaryPath, append([]string(nil), spec.Args...)...)
 	cmd.Dir = filepath.Dir(binaryPath)
+	configureBrowserProcessCommand(cmd)
 	monitor, err := newBrowserProcessMonitor(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("browser runtime local process: stderr monitor setup failed: %w", err)

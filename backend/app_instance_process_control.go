@@ -23,6 +23,9 @@ func stopBrowserProcessCommand(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
+	if handled, err := stopBrowserProcessGroup(cmd); handled {
+		return err
+	}
 
 	if stdruntime.GOOS == "windows" {
 		pid := cmd.Process.Pid
