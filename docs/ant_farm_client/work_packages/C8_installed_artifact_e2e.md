@@ -95,9 +95,10 @@ upgrade committed B only after reconcile and continuous probation; the failed
 downgrade returned to stable B. The same commit adds this gate to all five
 native publish jobs. Those new native job results remain pending and are not
 pre-claimed as acceptance evidence. Follow-up `f24f9c5` makes test-marker
-cleanup deterministic, preserves stderr from immediately exiting processes,
-and uses a fingerprint-scoped temporary current-user trust entry for the
-Go 1.22 Windows/macOS runners that predate platform `SSL_CERT_FILE` overrides.
+cleanup deterministic and preserves stderr from immediately exiting processes.
+The release workflows pin Go 1.27 so the disposable local TLS root is supplied
+through `SSL_CERT_FILE` on every platform without mutating the runner's OS
+trust store or triggering interactive certificate prompts.
 
 ## Remaining acceptance
 

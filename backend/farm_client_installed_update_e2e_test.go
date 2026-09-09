@@ -10,7 +10,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -161,6 +160,10 @@ func TestFarmClientInstalledArtifactSignedUpdateRollback(t *testing.T) {
 	if os.Getenv("C8_INSTALLED_UPDATE_E2E") != "1" {
 		t.Skip("set C8_INSTALLED_UPDATE_E2E=1 on a native installed-artifact host")
 	}
+	if (runtime.GOOS == "windows" || runtime.GOOS == "darwin") &&
+		(!goversion.IsValid(runtime.Version()) || goversion.Compare(runtime.Version(), "go1.27") < 0) {
+		t.Fatalf("C8 installed update E2E on %s requires Go 1.27+ for disposable SSL_CERT_FILE trust; runtime=%s", runtime.GOOS, runtime.Version())
+	}
 	installed := requireC8UpdatePath(t, "C8_UPDATE_INSTALLED_CLIENT")
 	installRoot := requireC8UpdateRoot(t, "C8_UPDATE_INSTALLED_ROOT")
 	releaseA := requireC8UpdatePath(t, "C8_UPDATE_RELEASE_A")
@@ -236,7 +239,6 @@ func TestFarmClientInstalledArtifactSignedUpdateRollback(t *testing.T) {
 	if err := os.WriteFile(trustRoot, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: artifactServer.Certificate().Raw}), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	installC8LegacyPlatformTrustRoot(t, trustRoot, artifactServer.Certificate().Raw)
 	manifestA, err := buildC8UpdateManifest(versionA, a, true, artifactServer.URL+"/artifact-a", updateSignerPrivate)
 	if err != nil {
 		t.Fatal(err)
@@ -394,46 +396,6 @@ func TestFarmClientInstalledArtifactSignedUpdateRollback(t *testing.T) {
 		t.Fatalf("final activation=%+v", activation)
 	}
 	t.Logf("C8 installed signed update evidence: A=%s, B committed then failed A downgrade rolled back to B", versionA)
-}
-
-// Go 1.27 added SSL_CERT_FILE overrides on Windows and macOS. The release
-// workflows still exercise the module's Go 1.22 floor, so those two native
-// jobs temporarily trust this random test certificate in the current-user
-// store and remove that exact fingerprint during cleanup.
-func installC8LegacyPlatformTrustRoot(t *testing.T, certificatePath string, certificateRaw []byte) {
-	t.Helper()
-	if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
-		return
-	}
-	if goversion.IsValid(runtime.Version()) && goversion.Compare(runtime.Version(), "go1.27") >= 0 {
-		return
-	}
-	digest := sha1.Sum(certificateRaw) // OS certificate stores identify entries by SHA-1 thumbprint.
-	thumbprint := strings.ToUpper(hex.EncodeToString(digest[:]))
-	var add, remove *exec.Cmd
-	if runtime.GOOS == "windows" {
-		add = exec.Command("certutil.exe", "-user", "-addstore", "Root", certificatePath)
-		remove = exec.Command("certutil.exe", "-user", "-delstore", "Root", thumbprint)
-	} else {
-		keychainRaw, err := exec.Command("security", "default-keychain", "-d", "user").Output()
-		if err != nil {
-			t.Fatalf("locate user keychain: %v", err)
-		}
-		keychain := strings.Trim(strings.TrimSpace(string(keychainRaw)), "\"")
-		if keychain == "" {
-			t.Fatal("default user keychain is empty")
-		}
-		add = exec.Command("security", "add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k", keychain, certificatePath)
-		remove = exec.Command("security", "delete-certificate", "-Z", thumbprint, keychain)
-	}
-	if output, err := add.CombinedOutput(); err != nil {
-		t.Fatalf("install temporary current-user test trust root: %v: %s", err, strings.TrimSpace(string(output)))
-	}
-	t.Cleanup(func() {
-		if output, err := remove.CombinedOutput(); err != nil {
-			t.Errorf("remove temporary current-user test trust root %s: %v: %s", thumbprint, err, strings.TrimSpace(string(output)))
-		}
-	})
 }
 
 func requireC8UpdatePath(t *testing.T, name string) string {
