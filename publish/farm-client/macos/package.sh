@@ -169,7 +169,10 @@ else
   echo "[1/4] Building Wails-free Farm Client ($TARGET)..."
   (
     cd "$ROOT_DIR"
-    GOOS=darwin GOARCH="$ARCH" CGO_ENABLED=0 go build -trimpath \
+    # The macOS identity store is backed by Security.framework and is guarded
+    # by the `darwin && cgo` build tag.  A CGO-disabled package silently links
+    # the fail-closed fallback, making first-run enrollment impossible.
+    GOOS=darwin GOARCH="$ARCH" CGO_ENABLED=1 go build -trimpath \
       -ldflags "-s -w -X ant-chrome/backend.FarmClientVersion=$VERSION" \
       -o "$CLIENT_BINARY" ./backend/cmd/ant-farm-client
   )
