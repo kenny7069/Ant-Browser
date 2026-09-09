@@ -4,6 +4,7 @@ package backend
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/xml"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf16"
 )
 
 const farmClientScheduledTaskName = "Ant Farm Client"
@@ -117,6 +119,38 @@ func (m *farmClientWindowsAutostart) Status() (FarmClientAutostartStatus, error)
 	if err != nil {
 		return FarmClientAutostartStatus{Method: "scheduled-task-at-logon"}, nil
 	}
-	active := strings.Contains(strings.ToLower(string(output)), "<enabled>true</enabled>")
+	active := strings.Contains(strings.ToLower(farmClientWindowsCommandText(output)), "<enabled>true</enabled>")
 	return FarmClientAutostartStatus{Installed: true, Active: active, Method: "scheduled-task-at-logon"}, nil
+}
+
+func farmClientWindowsCommandText(value []byte) string {
+	if len(value) < 2 {
+		return string(value)
+	}
+	var order binary.ByteOrder = binary.LittleEndian
+	utf16Encoded := value[0] == 0xff && value[1] == 0xfe
+	if value[0] == 0xfe && value[1] == 0xff {
+		order = binary.BigEndian
+		utf16Encoded = true
+	}
+	if !utf16Encoded {
+		oddZeros := 0
+		for index := 1; index < len(value); index += 2 {
+			if value[index] == 0 {
+				oddZeros++
+			}
+		}
+		utf16Encoded = oddZeros >= len(value)/4
+	}
+	if !utf16Encoded {
+		return string(value)
+	}
+	if value[0] == 0xff && value[1] == 0xfe || value[0] == 0xfe && value[1] == 0xff {
+		value = value[2:]
+	}
+	units := make([]uint16, len(value)/2)
+	for index := range units {
+		units[index] = order.Uint16(value[index*2 : index*2+2])
+	}
+	return string(utf16.Decode(units))
 }
