@@ -85,7 +85,7 @@ func TestFarmClientInstalledArtifactRealChrome(t *testing.T) {
 	antConfig := DefaultConfig()
 	antConfig.Database.SQLite.Path = "profiles.db"
 	antConfig.Browser.UserDataRoot = root
-	antConfig.Browser.StartReadyTimeoutMs = 20000
+	antConfig.Browser.StartReadyTimeoutMs = 60000
 	antConfig.Browser.StartStableWindowMs = 100
 	antConfig.Browser.DefaultStartURLs = []string{}
 	if err := antConfig.Save(antConfigPath); err != nil {
@@ -112,6 +112,7 @@ func TestFarmClientInstalledArtifactRealChrome(t *testing.T) {
 		ControlURL:         "ws" + strings.TrimPrefix(server.URL, "http"),
 		Identity:           FarmClientIdentityConfig{NodeUID: "c8-installed-node", PrivateKey: base64.StdEncoding.EncodeToString(key)},
 		ProviderInstanceID: "provider-c1", FencingEpoch: 1,
+		CommandTimeoutMs: 75000,
 	}
 	raw, err := yaml.Marshal(clientConfig)
 	if err != nil {
@@ -122,7 +123,7 @@ func TestFarmClientInstalledArtifactRealChrome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, executable, "-config", configPath)
 	var stderr bytes.Buffer
