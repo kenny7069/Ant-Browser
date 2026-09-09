@@ -9,7 +9,11 @@ import (
 
 // Profile 浏览器配置文件
 type Profile struct {
-	ProfileId          string   `json:"profileId"`
+	ProfileId string `json:"profileId"`
+	// IncarnationID is an immutable, canonical SQLite generation identifier.
+	// It is not exposed through the desktop/profile API; C3 hashes it into the
+	// Server pairing token so delete/recreate with the same ProfileId is fenced.
+	IncarnationID      string   `json:"-"`
 	ProfileName        string   `json:"profileName"`
 	UserDataDir        string   `json:"userDataDir"`
 	CoreId             string   `json:"coreId"`

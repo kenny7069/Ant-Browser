@@ -65,7 +65,10 @@ type FarmClientConfig struct {
 	// EnrollmentURL is used only by the explicit first-run enrollment command.
 	// The one-time code is never stored in this config.
 	EnrollmentURL string `yaml:"enrollment_url,omitempty" json:"enrollment_url,omitempty"`
-	NodeName      string `yaml:"node_name,omitempty" json:"node_name,omitempty"`
+	// PairingURL is the C3 signed profile-pair endpoint. Unpair uses the same
+	// origin and the sibling /unpair path; neither endpoint is stored in output.
+	PairingURL string `yaml:"pairing_url,omitempty" json:"pairing_url,omitempty"`
+	NodeName   string `yaml:"node_name,omitempty" json:"node_name,omitempty"`
 	// AllowLoopbackHTTPEnrollment is an explicit development/test escape hatch.
 	// Production enrollment remains HTTPS-only, including loopback by default.
 	AllowLoopbackHTTPEnrollment bool `yaml:"allow_loopback_http_enrollment,omitempty" json:"allow_loopback_http_enrollment,omitempty"`
@@ -203,6 +206,17 @@ func (c *FarmClientConfig) ValidateFarmClientConfig() error {
 			return err
 		}
 		c.EnrollmentURL = enrollmentURL
+	}
+	if strings.TrimSpace(c.PairingURL) != "" {
+		pairingURL, err := normalizeFarmClientEnrollmentURL(c.PairingURL, c.AllowLoopbackHTTPEnrollment)
+		if err != nil {
+			return fmt.Errorf("%w: pairing URL is invalid", ErrFarmClientConfig)
+		}
+		parsed, _ := url.Parse(pairingURL)
+		if parsed == nil || !strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/pair") {
+			return fmt.Errorf("%w: pairing URL must end in /pair", ErrFarmClientConfig)
+		}
+		c.PairingURL = pairingURL
 	}
 	if strings.TrimSpace(c.ProviderInstanceID) == "" {
 		c.ProviderInstanceID = "ant-farm-client-" + identity.NodeUID

@@ -41,6 +41,8 @@ func TestFarmClientHostRealChromeEnsureAttest(t *testing.T) {
 	}
 	profile := BrowserProfile{
 		ProfileId: profileID, ProfileName: "C1 real Chrome", CoreId: "chrome", UserDataDir: profileDir,
+		CreatedAt:          "2026-09-09T00:00:00Z",
+		IncarnationID:      "c1-fixed-profile-generation",
 		RestoreLastSession: "never",
 		FingerprintArgs:    []string{"--lang=zh-TW", "--timezone=Asia/Hong_Kong", "--disable-non-proxied-udp"},
 		LaunchArgs:         []string{"--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-background-networking"},
@@ -66,7 +68,8 @@ func TestFarmClientHostRealChromeEnsureAttest(t *testing.T) {
 			return
 		}
 		defer connection.Close()
-		serverDone <- runFarmClientRealChromeWSSFixture(connection, key.Public().(ed25519.PublicKey), profileID)
+		incarnation, _ := farmClientProfileIncarnation(profileID, profile.IncarnationID)
+		serverDone <- runFarmClientRealChromeWSSFixture(connection, key.Public().(ed25519.PublicKey), profileID, incarnation)
 	}))
 	defer server.Close()
 	clientConfig := FarmClientConfig{
@@ -112,7 +115,7 @@ func TestFarmClientHostRealChromeEnsureAttest(t *testing.T) {
 	}
 }
 
-func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed25519.PublicKey, profileID string) error {
+func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed25519.PublicKey, profileID, pairingIncarnation string) error {
 	var begin farmControlAuthBegin
 	if err := connection.ReadJSON(&begin); err != nil {
 		return fmt.Errorf("auth begin: %w", err)
@@ -139,7 +142,7 @@ func runFarmClientRealChromeWSSFixture(connection *websocket.Conn, publicKey ed2
 	}
 	if err := connection.WriteJSON(FarmRuntimeCommand{Type: "command", NodeUID: begin.NodeUID, CorrelationID: "c1-ensure", Command: "ensure_runtime", Payload: map[string]any{
 		"node_uid": begin.NodeUID, "profile_id": profileID, "provider_instance_id": "provider-c1", "fencing_epoch": 1,
-		"config_hash": "config-c1-real", "launch_mode": FarmRuntimeLaunchModeDirectNoProxy,
+		"config_hash": "config-c1-real", "launch_mode": FarmRuntimeLaunchModeDirectNoProxy, "pairing_incarnation": pairingIncarnation,
 	}}); err != nil {
 		return fmt.Errorf("ensure command: %w", err)
 	}

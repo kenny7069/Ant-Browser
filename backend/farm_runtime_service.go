@@ -223,6 +223,9 @@ type FarmRuntimeServiceConfig struct {
 	// existing local binding before lifecycle work starts. A nil verifier makes
 	// authenticated proxy mode fail closed.
 	ProxyBindingVerifier func(profileID string, binding FarmRuntimeProxyBinding) error
+	// ProfilePairingVerifier validates the durable C3 local-profile incarnation
+	// before an authenticated Server command may create/reuse a runtime.
+	ProfilePairingVerifier func(profileID, incarnation string) error
 	// ProxyRuntimeCleanup is only supplied by the Wails-free factory that owns
 	// the connector managers. It must be a no-op for App-shared services.
 	ProxyRuntimeCleanup func()
@@ -249,6 +252,7 @@ type FarmRuntimeServiceFactoryConfig struct {
 	CDPOpenHook              func(stage string)
 	AttestationStateProvider func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 	ProxyBindingVerifier     func(profileID string, binding FarmRuntimeProxyBinding) error
+	ProfilePairingVerifier   func(profileID, incarnation string) error
 	ProxyRuntimeCleanup      func()
 	ResourceTelemetryHooks   *FarmResourceTelemetryHooks
 	OwnershipStore           FarmRuntimeOwnershipStore
@@ -262,6 +266,7 @@ type FarmRuntimeServiceFactoryConfig struct {
 type FarmRuntimeEnsureRequest struct {
 	NodeUID            string                   `json:"node_uid,omitempty"`
 	ProfileID          string                   `json:"profile_id"`
+	PairingIncarnation string                   `json:"pairing_incarnation,omitempty"`
 	RuntimeUID         string                   `json:"runtime_uid,omitempty"`
 	ProviderInstanceID string                   `json:"provider_instance_id,omitempty"`
 	FencingEpoch       uint64                   `json:"fencing_epoch,omitempty"`
@@ -487,6 +492,7 @@ type FarmRuntimeService struct {
 	cdpOpenHook                 func(stage string)
 	attestationStateProvider    func(FarmRuntimeIdentity) (FarmAttestationLaunchState, error)
 	proxyBindingVerifier        func(profileID string, binding FarmRuntimeProxyBinding) error
+	profilePairingVerifier      func(profileID, incarnation string) error
 	proxyRuntimeCleanup         func()
 	resourceTelemetryHooks      *FarmResourceTelemetryHooks
 	connectionMu                sync.Mutex
@@ -605,6 +611,7 @@ func NewFarmRuntimeService(options FarmRuntimeServiceConfig) (*FarmRuntimeServic
 		attestation:              NewFarmAttestationAgent(),
 		attestationStateProvider: options.AttestationStateProvider,
 		proxyBindingVerifier:     options.ProxyBindingVerifier,
+		profilePairingVerifier:   options.ProfilePairingVerifier,
 		proxyRuntimeCleanup:      options.ProxyRuntimeCleanup,
 		resourceTelemetryHooks:   options.ResourceTelemetryHooks,
 		ownershipStore:           options.OwnershipStore,
@@ -711,6 +718,7 @@ func NewFarmRuntimeServiceForHost(options FarmRuntimeServiceFactoryConfig) (*Far
 		CDPOpenHook:              options.CDPOpenHook,
 		AttestationStateProvider: options.AttestationStateProvider,
 		ProxyBindingVerifier:     verifier,
+		ProfilePairingVerifier:   options.ProfilePairingVerifier,
 		ProxyRuntimeCleanup:      runtimeService.CleanupOwnedProxyRuntimes,
 		ResourceTelemetryHooks:   options.ResourceTelemetryHooks,
 		OwnershipStore:           options.OwnershipStore,
@@ -1767,6 +1775,12 @@ func (s *FarmRuntimeService) HandleCommand(command FarmRuntimeCommand) (FarmRunt
 		var request FarmRuntimeEnsureRequest
 		if err := decodeFarmCommandPayload(command.Payload, &request); err != nil {
 			return FarmRuntimeCommandResponse{}, err
+		}
+		if s.profilePairingVerifier != nil {
+			if err := s.profilePairingVerifier(request.ProfileID, strings.TrimSpace(request.PairingIncarnation)); err != nil {
+				response.Error = farmRuntimeWireError(ErrFarmRuntimeStale)
+				return response, nil
+			}
 		}
 		// The command surface is the Control WSS boundary. It accepts only an
 		// explicit direct mode or an explicit secret-free binding to the local

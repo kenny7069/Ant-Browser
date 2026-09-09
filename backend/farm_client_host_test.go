@@ -85,6 +85,28 @@ func TestFarmClientNegativeConfigMatrix(t *testing.T) {
 	}
 }
 
+func TestFarmClientPairingURLRequiresTLSAndPairPath(t *testing.T) {
+	base := FarmClientConfig{
+		ApplicationRoot: t.TempDir(), StateRoot: filepath.Join(t.TempDir(), "state"),
+		ControlURL: "ws://127.0.0.1:1", NodeUID: "node-a",
+	}
+	invalid := base
+	invalid.PairingURL = "https://controller.example/api/farm/not-pairing"
+	if err := invalid.ValidateFarmClientConfig(); !errors.Is(err, ErrFarmClientConfig) {
+		t.Fatalf("wrong pairing path error=%v", err)
+	}
+	insecure := base
+	insecure.PairingURL = "http://controller.example/api/farm/pair"
+	if err := insecure.ValidateFarmClientConfig(); !errors.Is(err, ErrFarmClientConfig) {
+		t.Fatalf("insecure pairing URL error=%v", err)
+	}
+	valid := base
+	valid.PairingURL = "https://controller.example/api/farm/pair"
+	if err := valid.ValidateFarmClientConfig(); err != nil {
+		t.Fatalf("valid pairing URL error=%v", err)
+	}
+}
+
 func TestFarmClientIdentityValidationDoesNotExposeKey(t *testing.T) {
 	seed := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
 	encoded := base64.StdEncoding.EncodeToString(seed)
@@ -153,7 +175,7 @@ func TestFarmClientOwnershipKeyUsesDomainSeparatedHKDF(t *testing.T) {
 	}
 }
 
-func TestFarmClientProfileLoaderIsReadOnlyAndFailsClosed(t *testing.T) {
+func TestFarmClientProfileLoaderUsesExistingSQLiteAndFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	cfg := DefaultConfig()
 	cfg.Database.SQLite.Path = "missing.db"
@@ -201,17 +223,17 @@ func TestFarmClientProfileLoaderIsReadOnlyAndFailsClosed(t *testing.T) {
 	}
 }
 
-func TestFarmClientSQLiteReadOnlyDSNEscapesPathCharacters(t *testing.T) {
-	dsn := farmClientSQLiteReadOnlyDSN("/tmp/farm client #1?.sqlite")
+func TestFarmClientSQLiteDSNEscapesPathCharacters(t *testing.T) {
+	dsn := farmClientSQLiteDSN("/tmp/farm client #1?.sqlite")
 	for _, escaped := range []string{"%20", "%23", "%3F"} {
 		if !strings.Contains(strings.ToUpper(dsn), escaped) {
 			t.Fatalf("DSN %q does not escape %s", dsn, escaped)
 		}
 	}
-	if !strings.HasSuffix(dsn, "?mode=ro") {
-		t.Fatalf("DSN %q missing read-only query", dsn)
+	if !strings.HasSuffix(dsn, "?mode=rw") {
+		t.Fatalf("DSN %q missing existing-store read/write query", dsn)
 	}
-	windowsDSN := farmClientSQLiteReadOnlyDSN(`C:\Farm Client\profiles #1?.db`)
+	windowsDSN := farmClientSQLiteDSN(`C:\Farm Client\profiles #1?.db`)
 	if strings.Contains(windowsDSN, `\`) || !strings.Contains(strings.ToUpper(windowsDSN), "%23") {
 		t.Fatalf("Windows path was not normalized/escaped: %q", windowsDSN)
 	}

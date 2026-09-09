@@ -6,6 +6,7 @@ package backend
 
 import (
 	"ant-chrome/backend/internal/browser"
+	"ant-chrome/backend/internal/database"
 	"ant-chrome/backend/internal/logger"
 	"context"
 	"crypto/ed25519"
@@ -33,6 +34,7 @@ type FarmClientHost struct {
 	identity  FarmClientIdentity
 	lock      *FarmClientInstanceLock
 	db        *sql.DB
+	manager   *browser.Manager
 	runtime   *BrowserRuntimeService
 	farm      *FarmRuntimeService
 	adapter   *FarmRuntimeControlAdapter
@@ -143,6 +145,9 @@ func NewFarmClientHostWithIdentityStore(configPath string, suppliedIdentityStore
 		FencingEpoch:             cfg.FencingEpoch,
 		OwnershipStore:           ownershipStore,
 		AttestationStateProvider: newFarmClientAttestationProvider(runtimeService, capture),
+		ProfilePairingVerifier: func(profileID, incarnation string) error {
+			return farmClientValidateProfilePairing(manager, profileID, incarnation)
+		},
 	})
 	if err != nil {
 		_ = db.Close()
@@ -171,7 +176,7 @@ func NewFarmClientHostWithIdentityStore(configPath string, suppliedIdentityStore
 	log.Info("standalone farm client started", logger.F("version", FarmClientVersion), logger.F("goos", FarmClientVersionInfoValue().GOOS), logger.F("goarch", FarmClientVersionInfoValue().GOARCH))
 	cleanupLock = false
 	return &FarmClientHost{
-		config: cfg, identity: identity, lock: lock, db: db,
+		config: cfg, identity: identity, lock: lock, db: db, manager: manager,
 		runtime: runtimeService, farm: farmService, adapter: adapter,
 		transport: transport, log: log, logging: true,
 	}, nil
@@ -275,8 +280,9 @@ func (h *FarmClientHost) Shutdown() error {
 }
 
 // loadFarmClientProfiles uses the canonical SQLite ProfileDAO and Manager
-// InitData path. It deliberately does not fall back to YAML profiles when the
-// SQLite store is unreadable.
+// InitData path. C3 opens the existing database read/write so profile creation
+// uses the same DAO as Ant; it never creates a second profile store and still
+// fails closed instead of creating a missing/corrupt database.
 func (h *FarmClientHost) ShutdownWithError(runErr error) error {
 	if err := h.Shutdown(); err != nil {
 		return errors.Join(runErr, err)
@@ -318,20 +324,20 @@ func loadFarmClientProfiles(cfg *Config, appRoot string) (*sql.DB, *browser.Mana
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, nil, fmt.Errorf("%w: sqlite database file is missing", ErrFarmClientProfileStore)
 	}
-	dsn := farmClientSQLiteReadOnlyDSN(dbPath)
-	db, err := sql.Open("sqlite", dsn)
+	canonicalDB, err := database.NewDB(dbPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: open sqlite store: %v", ErrFarmClientProfileStore, err)
 	}
+	db := canonicalDB.GetConn()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if err := db.Ping(); err != nil {
+	if err := canonicalDB.Migrate(); err != nil {
 		_ = db.Close()
-		return nil, nil, fmt.Errorf("%w: open sqlite store: %v", ErrFarmClientProfileStore, err)
+		return nil, nil, fmt.Errorf("%w: migrate sqlite store: %v", ErrFarmClientProfileStore, err)
 	}
-	if _, err := db.Exec("PRAGMA query_only=ON"); err != nil {
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
 		_ = db.Close()
-		return nil, nil, fmt.Errorf("%w: configure sqlite read-only mode: %v", ErrFarmClientProfileStore, err)
+		return nil, nil, fmt.Errorf("%w: configure sqlite busy timeout: %v", ErrFarmClientProfileStore, err)
 	}
 	closeOnError := true
 	defer func() {
@@ -398,10 +404,10 @@ func loadFarmClientProfiles(cfg *Config, appRoot string) (*sql.DB, *browser.Mana
 	return db, manager, nil
 }
 
-func farmClientSQLiteReadOnlyDSN(path string) string {
+func farmClientSQLiteDSN(path string) string {
 	normalized := strings.ReplaceAll(filepath.ToSlash(filepath.Clean(path)), `\`, "/")
 	uri := url.URL{Scheme: "file", Path: normalized}
-	uri.RawQuery = "mode=ro"
+	uri.RawQuery = "mode=rw"
 	return uri.String()
 }
 

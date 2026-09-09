@@ -71,6 +71,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if *enroll {
 		return runEnrollment(path, stdin, stdout, stderr)
 	}
+	if flags.NArg() > 0 {
+		return runProfileCommand(path, flags.Args(), stdin, stdout, stderr)
+	}
 	host, err := backend.NewFarmClientHost(path)
 	if err != nil {
 		fmt.Fprintf(stderr, "ant-farm-client: startup failed: %v\n", err)
@@ -88,6 +91,72 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func runProfileCommand(configPath string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	host, err := backend.NewFarmClientHost(configPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: profile command unavailable")
+		return 1
+	}
+	defer host.Shutdown()
+	write := func(value any) int {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: output failed")
+			return 1
+		}
+		fmt.Fprintln(stdout, string(encoded))
+		return 0
+	}
+	if len(args) == 2 && args[0] == "profiles" && args[1] == "list" {
+		profiles, err := host.ProfileList()
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: profile list failed")
+			return 1
+		}
+		return write(profiles)
+	}
+	if len(args) == 3 && args[0] == "profiles" && args[1] == "create" {
+		profile, err := host.ProfileCreate(args[2])
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: profile create failed")
+			return 1
+		}
+		return write(profile)
+	}
+	if len(args) == 3 && args[0] == "profiles" && args[1] == "open" {
+		profile, err := host.ProfileOpen(args[2])
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: profile open failed")
+			return 1
+		}
+		return write(profile)
+	}
+	if len(args) == 2 && args[0] == "pair" {
+		pairingCode, err := readSecretLine(stdin, stderr, "Pairing code: ")
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: pairing code is required")
+			return 1
+		}
+		result, err := host.PairProfile(context.Background(), args[1], pairingCode, nil)
+		pairingCode = ""
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: pairing failed")
+			return 1
+		}
+		return write(result)
+	}
+	if len(args) == 2 && args[0] == "unpair" {
+		result, err := host.UnpairProfile(context.Background(), args[1], nil)
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: unpair failed")
+			return 1
+		}
+		return write(result)
+	}
+	fmt.Fprintln(stderr, "ant-farm-client: invalid profile command")
+	return 2
 }
 
 func runEnrollment(configPath string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -137,8 +206,12 @@ func runEnrollment(configPath string, stdin io.Reader, stdout, stderr io.Writer)
 }
 
 func readEnrollmentCode(input io.Reader, prompt io.Writer) (string, error) {
+	return readSecretLine(input, prompt, "Enrollment code: ")
+}
+
+func readSecretLine(input io.Reader, prompt io.Writer, label string) (string, error) {
 	if file, ok := input.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
-		fmt.Fprint(prompt, "Enrollment code: ")
+		fmt.Fprint(prompt, label)
 		raw, err := term.ReadPassword(int(file.Fd()))
 		fmt.Fprintln(prompt)
 		if err != nil {

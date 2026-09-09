@@ -188,10 +188,16 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 		t.Fatal(err)
 	}
 	const (
-		nodeUID    = "node-p112-cross"
-		providerID = "provider-p112-cross"
-		profileID  = "p112-cross-isolated"
+		nodeUID         = "node-p112-cross"
+		providerID      = "provider-p112-cross"
+		profileID       = "p112-cross-isolated"
+		serverProfileID = "41"
 	)
+	const profileIncarnationID = "p112-cross-profile-generation"
+	pairingIncarnation, err := farmClientProfileIncarnation(profileID, profileIncarnationID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	urlFile := filepath.Join(t.TempDir(), "control-wss.url")
 	evidenceFile := filepath.Join(t.TempDir(), "p112-evidence.json")
 	caFile := filepath.Join(t.TempDir(), "p112-ca.pem")
@@ -202,7 +208,9 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 		"--url-file", urlFile, "--evidence-file", evidenceFile,
 		"--ca-file", caFile,
 		"--node-uid", nodeUID, "--public-key", publicKey,
-		"--profile-id", profileID, "--provider-instance-id", providerID,
+		"--profile-id", serverProfileID, "--ant-profile-id", profileID,
+		"--pairing-incarnation", pairingIncarnation, "--skip-stop",
+		"--provider-instance-id", providerID,
 		"--fencing-epoch", "1")
 	var serverOutput bytes.Buffer
 	serverCommand.Stdout = &serverOutput
@@ -242,7 +250,8 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 	cfg.Browser.Cores = []browser.Core{{CoreId: "chrome", CorePath: coreRoot, IsDefault: true}}
 	profile := BrowserProfile{
 		ProfileId: profileID, ProfileName: "P1.12 cross-repo isolated", CoreId: "chrome",
-		UserDataDir: filepath.Join(t.TempDir(), "isolated-profile"),
+		IncarnationID: profileIncarnationID,
+		UserDataDir:   filepath.Join(t.TempDir(), "isolated-profile"),
 		// This contradictory value must never reach the direct/no-proxy launch.
 		ProxyConfig: "http://user:secret@example.invalid:8080", RestoreLastSession: "never",
 		LaunchArgs: []string{"--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"},
@@ -272,6 +281,11 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 	defer service.Shutdown()
 	farm, err := NewFarmRuntimeService(FarmRuntimeServiceConfig{
 		BrowserRuntimeService: service, NodeUID: nodeUID, ProviderInstanceID: providerID, FencingEpoch: 1,
+		ProfilePairingVerifier: func(localProfileID, incarnation string) error {
+			manager := browser.NewManager(cfg, cfg.Browser.UserDataRoot)
+			manager.Profiles[profileID] = &profile
+			return farmClientValidateProfilePairing(manager, localProfileID, incarnation)
+		},
 		AttestationStateProvider: func(identity FarmRuntimeIdentity) (FarmAttestationLaunchState, error) {
 			// Observe the shared launch plan and runtime, never request fields.
 			// Empty locale/timezone report that no overrides were configured.
@@ -326,11 +340,14 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := client.Connect(nil); err != nil {
-		t.Fatalf("real Go Agent authenticated connect: %v", err)
+		time.Sleep(200 * time.Millisecond)
+		evidenceRaw, _ := os.ReadFile(evidenceFile)
+		t.Fatalf("real Go Agent authenticated connect: %v output=%s evidence=%s", err, serverOutput.String(), evidenceRaw)
 	}
 	defer client.Close()
 	if err := serverCommand.Wait(); err != nil {
-		t.Fatalf("Python ControlWSS fixture: %v output=%s", err, serverOutput.String())
+		evidenceRaw, _ := os.ReadFile(evidenceFile)
+		t.Fatalf("Python ControlWSS fixture: %v output=%s evidence=%s", err, serverOutput.String(), evidenceRaw)
 	}
 	select {
 	case <-client.Done():
@@ -338,6 +355,9 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 		t.Fatal("Agent connection did not close after strict stop/fixture cleanup")
 	}
 	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
 	launchMu.Lock()
@@ -349,13 +369,15 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 	select {
 	case <-process.owner.Done():
 	case <-time.After(3 * time.Second):
-		t.Fatal("strict stop did not reap real Chrome")
+		t.Fatal("isolated C3 fixture shutdown did not reap real Chrome")
 	}
 	var evidence struct {
-		Accepted   bool   `json:"accepted"`
-		ConfigHash string `json:"verified_config_hash"`
-		PolicyHash string `json:"verified_policy_hash"`
-		Commands   []struct {
+		Accepted               bool   `json:"accepted"`
+		ConfigHash             string `json:"verified_config_hash"`
+		PolicyHash             string `json:"verified_policy_hash"`
+		ServerRuntimeProfileID string `json:"server_runtime_profile_id"`
+		AntProfileID           string `json:"ant_profile_id"`
+		Commands               []struct {
 			Command string         `json:"command"`
 			OK      bool           `json:"ok"`
 			Error   any            `json:"error"`
@@ -369,16 +391,22 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 	if err := json.Unmarshal(raw, &evidence); err != nil {
 		t.Fatal(err)
 	}
-	if !evidence.Accepted || len(evidence.Commands) != 4 {
+	if !evidence.Accepted || len(evidence.Commands) != 3 {
 		t.Fatalf("cross-repo evidence not accepted: %s", raw)
 	}
 	if len(evidence.ConfigHash) != 64 || evidence.PolicyHash == "" {
 		t.Fatalf("Server hashes were not verified: %s", raw)
 	}
-	wantCommands := []string{"ensure_runtime", "attest_runtime", "runtime_status", "stop_runtime"}
+	if evidence.ServerRuntimeProfileID != serverProfileID || evidence.AntProfileID != profileID {
+		t.Fatalf("C3 Server/Ant profile identity translation failed: %s", raw)
+	}
+	wantCommands := []string{"ensure_runtime", "attest_runtime", "runtime_status"}
 	for index, command := range evidence.Commands {
 		if command.Command != wantCommands[index] || !command.OK {
 			t.Fatalf("cross-repo command %d = %+v", index, command)
+		}
+		if localProfile, ok := command.Payload["profile_id"]; ok && fmt.Sprint(localProfile) != profileID {
+			t.Fatalf("Agent command %d did not use Ant local profile identity: %+v", index, command)
 		}
 	}
 	if status := evidence.Commands[2].Payload; status["state"] != "idle" || status["debug_ready"] != true || status["launch_mode"] != FarmRuntimeLaunchModeDirectNoProxy {
@@ -388,9 +416,9 @@ func TestFarmRuntimeP112CrossRepoRealChrome(t *testing.T) {
 		t.Fatalf("cross-repo evidence leaked forbidden proxy data: %s", raw)
 	}
 	if port, ok := evidence.Commands[2].Payload["debug_port"].(float64); !ok || port <= 0 || canConnectDebugPort(int(port), 150*time.Millisecond) {
-		t.Fatal("strict stop did not close the real Chrome debugging endpoint")
+		t.Fatal("isolated C3 fixture shutdown did not close the real Chrome debugging endpoint")
 	}
-	t.Logf("cross-repo TLS WSS / Ed25519 / real Chrome / verified readiness / strict stop evidence: %s", raw)
+	t.Logf("cross-repo TLS WSS / Ed25519 / C3 profile translation / real Chrome readiness evidence: %s", raw)
 }
 
 // TestFarmRuntimeP114CrossRepoRealChromeCDPGateway is the opt-in production

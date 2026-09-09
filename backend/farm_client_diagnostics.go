@@ -15,6 +15,7 @@ type FarmClientDiagnostics struct {
 	Architecture         string `json:"architecture"`
 	ControlConfigured    bool   `json:"control_configured"`
 	EnrollmentConfigured bool   `json:"enrollment_configured"`
+	PairingConfigured    bool   `json:"pairing_configured"`
 	SecureIdentity       bool   `json:"secure_identity"`
 }
 
@@ -26,6 +27,7 @@ func FarmClientDiagnosticsValue(config FarmClientConfig) FarmClientDiagnostics {
 		Architecture:         runtime.GOARCH,
 		ControlConfigured:    strings.TrimSpace(config.ControlURL) != "" || strings.TrimSpace(config.WSSURL) != "",
 		EnrollmentConfigured: strings.TrimSpace(config.EnrollmentURL) != "",
+		PairingConfigured:    strings.TrimSpace(config.PairingURL) != "",
 		SecureIdentity:       strings.TrimSpace(identity.PrivateKeyRef) != "",
 	}
 }
