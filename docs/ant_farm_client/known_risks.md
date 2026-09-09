@@ -21,4 +21,5 @@
 | Enrollment limiter is process-local | Safe for the current single-process server; C6 multi-worker/replica deployment must use a shared gateway/limiter before scale-out |
 | Windows DPAPI and Linux Secret Service cannot execute on macOS | Native opt-in tests and cross-builds are present; execute them again in C8 installed-artifact workflows on each target OS |
 | Pairing replay rows are retained indefinitely | Request IDs are 128-bit, signed and rate-limited; add bounded audited retention before fleet-scale C6 rollout |
-| The production Python Control WSS auth acknowledgement does not yet publish controller lease identity required by the current Agent | C4/C6 must wire the active controller ID/generation; C3 cross-repo uses an explicit isolated fixture owner and does not count that as production lifecycle acceptance |
+| Production Control WSS lacked controller lease identity in auth acknowledgement | Resolved in C4: startup acquires the shared factory lease first and WSS fails closed when its exact ID/generation is unavailable |
+| Native autostart behavior cannot be executed on all target OSes from macOS | C4 has platform descriptor tests and five target builds; C8 must prove real login/reboot/start/stop/remove on Windows, Linux and both macOS architectures |

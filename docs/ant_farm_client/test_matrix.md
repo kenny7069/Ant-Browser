@@ -14,7 +14,8 @@
 | C1 | Core regression | full test, full race, vet, Windows cross-build | PASS |
 | C2 | Enrollment/security | one-time/expiry/replay/key storage/diagnostics | PASS on macOS arm64; target-OS native rerun required at C8 |
 | C3 | Profile pairing | CRUD/readiness/pair/unpair/same-ID ABA | PASS on macOS arm64; target-OS installed rerun required at C8 |
-| C4-C7 | Lifecycle/package/update | platform services, signed update, rollback | Not started |
+| C4 | Background lifecycle | per-user autostart, production controller fence, graceful ownership-aware shutdown | PASS in unit/integration/cross-build; native installed login/reboot repeats at C8 |
+| C5-C7 | Package/fleet/update | dedicated artifacts, fleet operations, signed update/rollback | Not started |
 | C8-C10 | Installed E2E/release | Windows, Linux, macOS, social, soak, chaos | Not started |
 
 No skipped real-browser, cross-repository, Windows, installed-artifact, soak, or
@@ -60,3 +61,14 @@ opt-in test programs are present and are not counted as executed on macOS.
 | `P112_CROSS_REPO_REAL_CHROME=1 P112_SERVER_REPO=/Users/bot/Desktop/dev-auto-scraper P112_REAL_CHROME_CORE=/Applications go test ./backend -run '^TestFarmRuntimeP112CrossRepoRealChrome$' -count=1 -v` | PASS; Server ID `41` mapped to a distinct Ant local ID |
 | Server Farm/enrollment/auth/schema/runtime-control suites | 129 PASS, 1 existing skip |
 | Python compile and `git diff --check` in both repositories | PASS |
+
+## C4 commands (macOS arm64)
+
+| Command | Result |
+|---|---|
+| `go test ./backend/... -count=1` | PASS |
+| focused autostart/WSS/SIGTERM `go test -race` and `go vet ./backend/...` | PASS |
+| Windows amd64, Linux amd64/arm64 and macOS amd64/arm64 Client builds | PASS |
+| Server Control WSS + Queue + Farm/auth/schema suites | 177 PASS, 2 existing skips |
+| C1 real Chrome Host regression | PASS |
+| C3 cross-repository TLS WSS/real Chrome profile-translation regression | PASS |

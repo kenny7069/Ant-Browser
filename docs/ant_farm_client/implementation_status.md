@@ -6,7 +6,7 @@
 | C1 Standalone Host | PASS | Wails-free host, strict config, lock, canonical SQLite manager, WSS, real Chrome attestation and shutdown verified |
 | C2 Enrollment | PASS | One-time HTTPS API, response-loss confirmation, secure per-OS identity, CLI bootstrap and secret-free diagnostics verified |
 | C3 Profile Pairing | PASS | Canonical SQLite CRUD/open, signed one-time pairing, durable ABA fence and Server↔Ant ID translation verified |
-| C4 Background Lifecycle | NOT STARTED | |
+| C4 Background Lifecycle | PASS | Per-user Windows/macOS/Linux autostart, controller-fenced production WSS auth and ownership-aware SIGTERM verified |
 | C5 Packaging | NOT STARTED | |
 | C6 Fleet Management | NOT STARTED | |
 | C7 Updater | NOT STARTED | |
@@ -74,3 +74,21 @@
   a distinct local Ant profile for real Chrome launch, attestation and status.
 - Full Go tests, focused race, vet, Server Farm/auth/schema suites and real
   Chrome acceptance passed on macOS arm64.
+
+## C4 completion evidence
+
+- Added `autostart install|remove|status` with safe output and strict absolute
+  executable/config validation.
+- Windows uses a least-privilege, interactive-token Scheduled Task at logon;
+  macOS uses a user LaunchAgent; Linux prefers `systemd --user` and falls back
+  to XDG desktop-session autostart. No machine service or global process-name
+  termination is used.
+- Registration files are owner-only and atomically published; symlinked
+  destination directories and partial registration failures fail closed.
+- Server startup now acquires its existing controller lease before Control WSS
+  and publishes that exact ID/generation in node authentication. Missing or
+  invalid lease identity rejects the connection and returns the node offline.
+- Full Go/race/vet, Windows/Linux/macOS builds, 177 Server farm/control/Queue
+  tests, real Chrome Host and cross-repository real Chrome tests passed.
+- Native login/reboot and installed-artifact repetitions remain mandatory C8
+  evidence and are not inferred from cross-builds.
