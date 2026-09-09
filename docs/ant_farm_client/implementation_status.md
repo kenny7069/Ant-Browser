@@ -5,7 +5,7 @@
 | C0 Baseline / Branch | PASS | Pinned pair, ownership, risks, matrix, and regressions reviewed |
 | C1 Standalone Host | PASS | Wails-free host, strict config, lock, canonical SQLite manager, WSS, real Chrome attestation and shutdown verified |
 | C2 Enrollment | PASS | One-time HTTPS API, response-loss confirmation, secure per-OS identity, CLI bootstrap and secret-free diagnostics verified |
-| C3 Profile Pairing | NOT STARTED | Explicit local/server mapping required |
+| C3 Profile Pairing | PASS | Canonical SQLite CRUD/open, signed one-time pairing, durable ABA fence and Server↔Ant ID translation verified |
 | C4 Background Lifecycle | NOT STARTED | |
 | C5 Packaging | NOT STARTED | |
 | C6 Fleet Management | NOT STARTED | |
@@ -54,3 +54,23 @@
 - Full Go tests/race/vet, macOS native Keychain, real Chrome acceptance,
   Windows/Linux/macOS builds, Server enrollment/P1.6/auth/WSS/schema suites and
   security hardening passed. Target-OS native execution repeats in C8.
+
+## C3 completion evidence
+
+- Added safe CLI operations over the canonical Ant SQLite Manager: list,
+  create, open, pair and unpair. Pairing secrets are read from no-echo terminal
+  or bounded stdin and no `farm_profiles.json` exists.
+- Added immutable SQLite `incarnation_id` migration/backfill/direct-insert
+  trigger and a domain-separated pairing incarnation, so a deleted/recreated
+  same-ID profile fails closed before any runtime observation or launch.
+- Added signed, one-time, node-bound Server pairing grants with exact replay,
+  expiry, response-loss confirmation and one cross-database transaction for
+  tenant profile plus Control affinity updates.
+- Server affinity stores only the local ID/incarnation and safe projection;
+  `farm_storage_key` remains an independently generated opaque locator.
+- Added strict recursive Server↔Ant profile identity translation for ensure,
+  attestation, status and stop identities, with contradiction rejection.
+- Cross-repository TLS WSS acceptance proved Server profile `41` translated to
+  a distinct local Ant profile for real Chrome launch, attestation and status.
+- Full Go tests, focused race, vet, Server Farm/auth/schema suites and real
+  Chrome acceptance passed on macOS arm64.
