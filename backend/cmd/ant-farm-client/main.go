@@ -72,6 +72,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runEnrollment(path, stdin, stdout, stderr)
 	}
 	if flags.NArg() > 0 {
+		if flags.Arg(0) == "autostart" {
+			return runAutostartCommand(path, flags.Args(), stdout, stderr)
+		}
 		return runProfileCommand(path, flags.Args(), stdin, stdout, stderr)
 	}
 	host, err := backend.NewFarmClientHost(path)
@@ -88,6 +91,53 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if err := host.Shutdown(); err != nil {
 		fmt.Fprintf(stderr, "ant-farm-client: shutdown failed: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runAutostartCommand(configPath string, args []string, stdout, stderr io.Writer) int {
+	if len(args) != 2 {
+		fmt.Fprintln(stderr, "ant-farm-client: invalid autostart command")
+		return 2
+	}
+	config, err := backend.LoadFarmClientConfig(configPath)
+	if err != nil || config.ValidateFarmClientConfig() != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: autostart configuration is invalid")
+		return 1
+	}
+	switch args[1] {
+	case "install":
+		executable, err := os.Executable()
+		if err != nil || backend.InstallFarmClientAutostart(executable, configPath) != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: autostart install failed")
+			return 1
+		}
+	case "remove":
+		if backend.RemoveFarmClientAutostart() != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: autostart remove failed")
+			return 1
+		}
+	case "status":
+		status, err := backend.FarmClientAutostartStatusValue()
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: autostart status unavailable")
+			return 1
+		}
+		encoded, _ := json.Marshal(status)
+		fmt.Fprintln(stdout, string(encoded))
+		return 0
+	default:
+		fmt.Fprintln(stderr, "ant-farm-client: invalid autostart command")
+		return 2
+	}
+	status, err := backend.FarmClientAutostartStatusValue()
+	if err != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: autostart status unavailable")
+		return 1
+	}
+	encoded, _ := json.Marshal(status)
+	if _, err := fmt.Fprintln(stdout, string(encoded)); err != nil {
 		return 1
 	}
 	return 0
