@@ -9,10 +9,14 @@ on:
         default: "1.5.0"
         type: string
   push:
+    branches: ["farm-client-dev"]
     tags: ["farm-client-v*"]
 
 permissions:
   contents: write
+
+env:
+  FARM_CLIENT_CI_VERSION: "1.5.1"
 
 concurrency:
   group: publish-farm-client-windows-${{ github.ref }}
@@ -35,7 +39,7 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "${{ github.ref_name }}" -replace '^farm-client-v','' }
+          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } elseif ($env:GITHUB_REF -like "refs/tags/farm-client-v*") { "${{ github.ref_name }}" -replace '^farm-client-v','' } else { $env:FARM_CLIENT_CI_VERSION }
           ./publish/farm-client/windows/publish-windows.ps1 -Arch amd64 -Version $version
       - name: Validate layouts and destructive-cleanup policy
         shell: pwsh
@@ -54,7 +58,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
-          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "${{ github.ref_name }}" -replace '^farm-client-v','' }
+          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } elseif ($env:GITHUB_REF -like "refs/tags/farm-client-v*") { "${{ github.ref_name }}" -replace '^farm-client-v','' } else { $env:FARM_CLIENT_CI_VERSION }
           $artifact = Get-Item "publish/farm-client/windows/dist/AntFarmClient-Setup-$version-x64.exe"
           $artifactSha = (Get-FileHash -Algorithm SHA256 $artifact.FullName).Hash.ToLowerInvariant()
           $installRoot = Join-Path $env:ProgramFiles "Ant Farm Client"

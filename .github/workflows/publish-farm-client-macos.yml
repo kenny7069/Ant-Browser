@@ -9,10 +9,14 @@ on:
         default: "1.5.0"
         type: string
   push:
+    branches: ["farm-client-dev"]
     tags: ["farm-client-v*"]
 
 permissions:
   contents: write
+
+env:
+  FARM_CLIENT_CI_VERSION: "1.5.1"
 
 concurrency:
   group: publish-farm-client-macos-${{ github.ref }}
@@ -39,7 +43,8 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${INPUT_VERSION:-${GITHUB_REF_NAME#farm-client-v}}"
+          version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
+          if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
           bash publish/farm-client/macos/package.sh --arch "${{ matrix.arch }}" --version "$version"
       - name: Validate app and signing gate
         run: |
@@ -54,7 +59,7 @@ jobs:
           test -f "$zip"
           "$app/Contents/MacOS/ant-farm-client" -version | grep -Fq "\"version\":\"$version\""
           "$update" -version | grep -Fq "\"version\":\"$version\""
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${{ startsWith(github.ref, 'refs/tags/farm-client-v') }}" == "true" ]]; then
             echo "Release tags require a later C10 Developer ID/notarization job; unsigned upload is intentionally refused."
             exit 1
           fi
@@ -63,7 +68,8 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${INPUT_VERSION:-${GITHUB_REF_NAME#farm-client-v}}"
+          version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
+          if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
           artifact="$(ls publish/farm-client/macos/dist/AntFarmClient-${version}-macos-${{ matrix.arch }}.zip)"
           install_root="$RUNNER_TEMP/AntFarmClient-C8-Installed"
           mkdir -p "$install_root"
