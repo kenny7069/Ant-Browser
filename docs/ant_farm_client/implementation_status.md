@@ -10,7 +10,7 @@
 | C5 Packaging | PASS | Dedicated Windows/Linux/macOS artifacts, isolated workflows, pinned runtimes and unsigned-macOS release gate verified |
 | C6 Fleet Management | PASS | Admin-only inventory/actions, enrollment, pairing, telemetry fallback and closed command surface verified |
 | C7 Updater | PASS | Signed manifest, immutable launcher, transactional reconcile, probation and rollback verified by independent SOL-MID review |
-| C8 Installed E2E | IN PROGRESS | Artifact-bound native runner added; macOS arm64 installed real-Chrome and LaunchAgent sub-gates pass locally |
+| C8 Installed E2E | IN PROGRESS | Five native basic matrices pass installed package, real Chrome/CDP, strict stop, persistence, per-user autostart and uninstall; reboot/update/proxy/external-Server gates remain |
 | C9 Social/Soak/Chaos | NOT STARTED | |
 | C10 Final Release | NOT STARTED | Fresh independent acceptance required |
 
@@ -179,7 +179,18 @@
   real Chrome launch/attestation/direct CDP/Profile persistence and real LaunchAgent
   install/active/remove all passed. The test registration was removed and the
   installed test app was moved to Trash.
+- Commit `0841cd5ed8d9bfd34b2bd2f5d8f7b2d878aa8030` passed the native basic
+  matrix: Linux run [34342453176](https://github.com/kenny7069/Ant-Browser/actions/runs/34342453176)
+  (Ubuntu 22.04/24.04 amd64 and Ubuntu 24.04 arm64), macOS run
+  [34342453223](https://github.com/kenny7069/Ant-Browser/actions/runs/34342453223)
+  (Intel and Apple Silicon), and Windows run
+  [34342453165](https://github.com/kenny7069/Ant-Browser/actions/runs/34342453165). These runs install the produced packages, execute real
+  Chrome/CDP plus strict telemetry-fenced stop, prove Profile persistence,
+  exercise native per-user autostart registration/removal, uninstall, and
+  verify package layout. Windows additionally executes explicit ACL and native
+  process-tree gates; Linux arm64 uses a verified setuid Chromium sandbox.
 - C8 remains in progress. Fresh login/reboot, installed signed update/rollback,
-  proxy and Playwright/CDP gateway (beyond the direct CDP probe), external Server enrollment/reconcile,
-  Windows, Linux and Intel macOS executions remain required native evidence.
+  proxy and Playwright/CDP gateway (beyond the direct CDP probe), external
+  Server enrollment/reconcile, native identity stores, Linux display modes and
+  the remaining two-account/deployment-race/soak checks remain required.
   Unsigned macOS evidence does not satisfy C10 signing/notarization.
