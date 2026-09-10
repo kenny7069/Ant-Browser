@@ -83,13 +83,14 @@ jobs:
           artifact_sha="$(shasum -a 256 "$artifact" | awk '{print $1}')"
           C8_INSTALLED_ARTIFACT_E2E=1 \
           C8_INSTALLED_RECONNECT_RECONCILE_E2E=1 \
+          C8_INSTALLED_NATIVE_IDENTITY_E2E=1 \
           C8_INSTALLED_CLIENT="$installed_app/Contents/MacOS/ant-farm-client" \
           C8_INSTALLED_ROOT="$install_root" \
           C8_RELEASE_ARTIFACT="$artifact" \
           C8_RELEASE_ARTIFACT_SHA256="$artifact_sha" \
           C8_INSTALLED_VERSION="$version" \
           C8_REAL_CHROME_CORE="/Applications" \
-          go test ./backend -run '^TestFarmClientInstalledArtifact(RealChrome|ReconnectReconcile)$' -count=1 -v
+          go test ./backend -run '^TestFarmClientInstalledArtifact(RealChrome|ReconnectReconcile|NativeEnrollmentIdentity)$' -count=1 -timeout=3m -v
           C8_INSTALLED_AUTOSTART_E2E=1 \
           C8_INSTALLED_CLIENT="$installed_app/Contents/MacOS/ant-farm-client" \
           C8_INSTALLED_ROOT="$install_root" \

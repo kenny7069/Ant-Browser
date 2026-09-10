@@ -297,7 +297,10 @@ func TestFarmClientInstalledArtifactReconnectReconcile(t *testing.T) {
 		ControlURL:         "ws" + strings.TrimPrefix(server.URL, "http"),
 		Identity:           FarmClientIdentityConfig{NodeUID: nodeUID, PrivateKey: base64.StdEncoding.EncodeToString(key)},
 		ProviderInstanceID: providerInstanceID, FencingEpoch: 1,
-		CommandTimeoutMs: 75000, HeartbeatIntervalMs: 100,
+		// Windows may spend several seconds synchronously stopping Chrome's
+		// process tree. Keep the ACK deadline (4x interval) above that bounded
+		// stop while retaining the deliberately fast reconnect backoff below.
+		CommandTimeoutMs: 75000, HeartbeatIntervalMs: 2000,
 		ReconnectMinBackoffMs: 50, ReconnectMaxBackoffMs: 500,
 	}
 	configRaw, err := yaml.Marshal(clientConfig)

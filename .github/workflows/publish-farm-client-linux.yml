@@ -69,6 +69,10 @@ jobs:
           echo "CHROME_DEVEL_SANDBOX=$sandbox" >> "$GITHUB_ENV"
       - name: Test Farm Client backend
         run: go test ./backend/... -count=1
+      - name: Install Secret Service test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus-daemon gnome-keyring
       - name: Build dedicated artifacts
         env:
           INPUT_VERSION: ${{ inputs.version }}
@@ -124,6 +128,23 @@ jobs:
           C8_INSTALLED_VERSION="$version" \
           C8_REAL_CHROME_CORE="$chrome" \
           go test ./backend -run '^TestFarmClientInstalledArtifact(RealChrome|ReconnectReconcile)$' -count=1 -v
+          native_home="$(mktemp -d "$RUNNER_TEMP/ant-native-store-home.XXXXXX")"
+          chmod 700 "$native_home"
+          dbus-run-session -- env \
+            HOME="$native_home" \
+            C8_INSTALLED_NATIVE_IDENTITY_E2E=1 \
+            ANT_FARM_CLIENT_NATIVE_STORE_E2E=1 \
+            C8_INSTALLED_CLIENT="/opt/ant-farm-client/ant-farm-client" \
+            C8_INSTALLED_ROOT="/opt/ant-farm-client" \
+            C8_RELEASE_ARTIFACT="$artifact" \
+            C8_RELEASE_ARTIFACT_SHA256="$artifact_sha" \
+            C8_INSTALLED_VERSION="$version" \
+            bash -euo pipefail -c '
+              keyring_password="$(od -An -N32 -tx1 /dev/urandom | tr -d " \n")"
+              printf "%s" "$keyring_password" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+              unset keyring_password
+              go test ./backend -run "^(TestFarmClientInstalledArtifactNativeEnrollmentIdentity|TestFarmClientLinuxSecretServiceNativeOptIn)$" -count=1 -timeout=3m -v
+            '
           C8_INSTALLED_AUTOSTART_E2E=1 \
           C8_INSTALLED_CLIENT="/opt/ant-farm-client/ant-farm-client" \
           C8_INSTALLED_ROOT="/opt/ant-farm-client" \
