@@ -116,13 +116,14 @@ jobs:
           }
           trap cleanup_package EXIT
           C8_INSTALLED_ARTIFACT_E2E=1 \
+          C8_INSTALLED_RECONNECT_RECONCILE_E2E=1 \
           C8_INSTALLED_CLIENT="/opt/ant-farm-client/ant-farm-client" \
           C8_INSTALLED_ROOT="/opt/ant-farm-client" \
           C8_RELEASE_ARTIFACT="$artifact" \
           C8_RELEASE_ARTIFACT_SHA256="$artifact_sha" \
           C8_INSTALLED_VERSION="$version" \
           C8_REAL_CHROME_CORE="$chrome" \
-          go test ./backend -run '^TestFarmClientInstalledArtifactRealChrome$' -count=1 -v
+          go test ./backend -run '^TestFarmClientInstalledArtifact(RealChrome|ReconnectReconcile)$' -count=1 -v
           C8_INSTALLED_AUTOSTART_E2E=1 \
           C8_INSTALLED_CLIENT="/opt/ant-farm-client/ant-farm-client" \
           C8_INSTALLED_ROOT="/opt/ant-farm-client" \

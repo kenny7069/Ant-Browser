@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -171,6 +172,398 @@ func TestFarmClientInstalledArtifactRealChrome(t *testing.T) {
 	if err != nil || !bytes.Contains(listOutput, []byte(profileID)) {
 		t.Fatalf("installed profile persistence check failed: err=%v output=%s", err, listOutput)
 	}
+}
+
+type c8InstalledReconnectSessionEvidence struct {
+	runtime   FarmRuntime
+	telemetry FarmResourceTelemetry
+}
+
+// TestFarmClientInstalledArtifactReconnectReconcile proves that the same
+// installed executable preserves an owned browser runtime across an active
+// Control WSS loss. The fixture authenticates twice, deliberately closes the
+// first session, then requires the second session to publish an authoritative
+// handoff inventory and receive the matching reconcile completion ACK.
+func TestFarmClientInstalledArtifactReconnectReconcile(t *testing.T) {
+	if os.Getenv("C8_INSTALLED_RECONNECT_RECONCILE_E2E") != "1" {
+		t.Skip("set C8_INSTALLED_RECONNECT_RECONCILE_E2E=1 on a native installed-artifact host")
+	}
+	executable := requireC8AbsolutePath(t, "C8_INSTALLED_CLIENT")
+	installRoot := requireC8AbsolutePath(t, "C8_INSTALLED_ROOT")
+	artifact := requireC8AbsolutePath(t, "C8_RELEASE_ARTIFACT")
+	wantArtifactSHA := strings.ToLower(strings.TrimSpace(os.Getenv("C8_RELEASE_ARTIFACT_SHA256")))
+	wantVersion := strings.TrimSpace(os.Getenv("C8_INSTALLED_VERSION"))
+	if wantArtifactSHA == "" || wantVersion == "" || strings.Contains(wantVersion, "dev") {
+		t.Fatal("C8 release artifact SHA-256 and non-development version are required")
+	}
+	assertC8InstalledPath(t, executable, installRoot)
+	workingTree, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c8PathWithin(executable, workingTree) {
+		t.Fatalf("C8 installed executable must be outside the source working tree: %s", executable)
+	}
+	if got := c8FileSHA256(t, artifact); got != wantArtifactSHA {
+		t.Fatalf("release artifact SHA-256 = %s, want %s", got, wantArtifactSHA)
+	}
+	versionOutput, err := exec.Command(executable, "-version").Output()
+	if err != nil {
+		t.Fatalf("execute installed client version: %v", err)
+	}
+	var version FarmClientVersionInfo
+	if err := json.Unmarshal(bytes.TrimSpace(versionOutput), &version); err != nil {
+		t.Fatalf("decode installed version: %v", err)
+	}
+	if version.Version != wantVersion || version.GOOS != runtime.GOOS || version.GOARCH != runtime.GOARCH {
+		t.Fatalf("installed version = %+v, want version=%s target=%s/%s", version, wantVersion, runtime.GOOS, runtime.GOARCH)
+	}
+
+	root := t.TempDir()
+	coreRoot := strings.TrimSpace(os.Getenv("C8_REAL_CHROME_CORE"))
+	if coreRoot == "" {
+		t.Fatal("C8_REAL_CHROME_CORE must select a native Chrome installation")
+	}
+	const (
+		nodeUID            = "c8-installed-reconnect-node"
+		profileID          = "c8-installed-reconnect-profile"
+		providerInstanceID = "provider-c8-reconnect"
+		configHash         = "config-c8-reconnect"
+		controllerID       = "c8-reconnect-controller"
+	)
+	profile := BrowserProfile{
+		ProfileId: profileID, ProfileName: "C8 installed reconnect", CoreId: "chrome",
+		UserDataDir: filepath.Join(root, "profile-data"), CreatedAt: "2026-09-09T00:00:00Z",
+		IncarnationID: "c8-installed-reconnect-incarnation", RestoreLastSession: "never",
+		FingerprintArgs: []string{"--lang=zh-TW", "--timezone=Asia/Hong_Kong", "--disable-non-proxied-udp"},
+		LaunchArgs:      []string{"--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-background-networking"},
+	}
+	if err := os.MkdirAll(profile.UserDataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pairingIncarnation, err := farmClientProfileIncarnation(profileID, profile.IncarnationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	antConfigPath := filepath.Join(root, "ant.yaml")
+	antConfig := DefaultConfig()
+	antConfig.Database.SQLite.Path = "profiles.db"
+	antConfig.Browser.UserDataRoot = root
+	antConfig.Browser.StartReadyTimeoutMs = 60000
+	antConfig.Browser.StartStableWindowMs = 100
+	antConfig.Browser.DefaultStartURLs = []string{}
+	if err := antConfig.Save(antConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	seedFarmClientChromeDB(t, filepath.Join(root, "profiles.db"), profile, browser.Core{CoreId: "chrome", CoreName: "Chrome", CorePath: coreRoot, IsDefault: true})
+	key := newFarmClientTestPrivateKey(t)
+
+	firstEvidence := make(chan c8InstalledReconnectSessionEvidence, 1)
+	runtimePID := make(chan int, 1)
+	serverDone := make(chan error, 2)
+	shutdownFixture := make(chan struct{})
+	var session atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, upgradeErr := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(writer, request, nil)
+		if upgradeErr != nil {
+			serverDone <- upgradeErr
+			return
+		}
+		defer connection.Close()
+		sessionNumber := session.Add(1)
+		if sessionNumber > 2 {
+			serverDone <- fmt.Errorf("unexpected third Control WSS session")
+			return
+		}
+		var sessionErr error
+		switch sessionNumber {
+		case 1:
+			sessionErr = runC8InstalledReconnectFirstSession(connection, key.Public().(ed25519.PublicKey), nodeUID, controllerID, profileID, pairingIncarnation, providerInstanceID, configHash, firstEvidence)
+		case 2:
+			sessionErr = runC8InstalledReconnectSecondSession(connection, key.Public().(ed25519.PublicKey), nodeUID, controllerID, profileID, providerInstanceID, firstEvidence, runtimePID)
+		}
+		serverDone <- sessionErr
+		if sessionNumber == 2 {
+			// Keep the second authenticated session alive while the test stops the
+			// installed process; this prevents a third reconnect racing cleanup.
+			<-shutdownFixture
+		}
+	}))
+	defer server.Close()
+	defer close(shutdownFixture)
+
+	clientConfig := FarmClientConfig{
+		ApplicationRoot: root, StateRoot: filepath.Join(root, "state"), AntConfigPath: antConfigPath,
+		ControlURL:         "ws" + strings.TrimPrefix(server.URL, "http"),
+		Identity:           FarmClientIdentityConfig{NodeUID: nodeUID, PrivateKey: base64.StdEncoding.EncodeToString(key)},
+		ProviderInstanceID: providerInstanceID, FencingEpoch: 1,
+		CommandTimeoutMs: 75000, HeartbeatIntervalMs: 100,
+		ReconnectMinBackoffMs: 50, ReconnectMaxBackoffMs: 500,
+	}
+	configRaw, err := yaml.Marshal(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "client.yaml")
+	if err := os.WriteFile(configPath, configRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, executable, "-config", configPath)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatalf("start installed client: %v", err)
+	}
+	finished := make(chan error, 1)
+	go func() { finished <- command.Wait() }()
+	var clientStopped atomic.Bool
+	stopClient := func() {
+		if !clientStopped.CompareAndSwap(false, true) {
+			return
+		}
+		if command.Process == nil {
+			return
+		}
+		if runtime.GOOS == "windows" {
+			_ = command.Process.Kill()
+		} else {
+			_ = command.Process.Signal(os.Interrupt)
+		}
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			_ = command.Process.Kill()
+			<-finished
+		}
+	}
+	defer stopClient()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case sessionErr := <-serverDone:
+			if sessionErr != nil {
+				logRaw, _ := os.ReadFile(filepath.Join(clientConfig.StateRoot, "logs", "ant-farm-client.log"))
+				t.Fatalf("installed reconnect/reconcile session %d: %v; stderr=%s; log=%s", i+1, sessionErr, stderr.String(), logRaw)
+			}
+		case <-ctx.Done():
+			logRaw, _ := os.ReadFile(filepath.Join(clientConfig.StateRoot, "logs", "ant-farm-client.log"))
+			t.Fatalf("installed reconnect/reconcile timed out: %v; stderr=%s; log=%s", ctx.Err(), stderr.String(), logRaw)
+		}
+	}
+	stopClient()
+	select {
+	case pid := <-runtimePID:
+		deadline := time.Now().Add(10 * time.Second)
+		for pid > 0 && isProcessAlive(pid) && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if pid > 0 && isProcessAlive(pid) {
+			t.Fatalf("installed reconnect cleanup left Chrome pid %d running", pid)
+		}
+	case <-ctx.Done():
+		t.Fatalf("installed reconnect runtime identity was not reported: %v", ctx.Err())
+	}
+}
+
+func authenticateC8InstalledReconnectSession(connection *websocket.Conn, publicKey ed25519.PublicKey, nodeUID, controllerID string, controllerGeneration uint64) error {
+	var begin farmControlAuthBegin
+	if err := connection.ReadJSON(&begin); err != nil {
+		return fmt.Errorf("auth begin: %w", err)
+	}
+	if begin.Type != "auth_begin" || begin.NodeUID != nodeUID {
+		return fmt.Errorf("invalid auth begin: type=%q node=%q", begin.Type, begin.NodeUID)
+	}
+	deviceKey, err := base64.StdEncoding.DecodeString(begin.DevicePubKey)
+	if err != nil || !bytes.Equal(deviceKey, publicKey) {
+		return fmt.Errorf("unregistered device key")
+	}
+	challengeRaw := bytes.Repeat([]byte{0x63}, 32)
+	challenge := base64.StdEncoding.EncodeToString(challengeRaw)
+	if err := connection.WriteJSON(farmControlChallenge{Type: "auth_challenge", Protocol: farmControlProtocolVersion, NodeUID: nodeUID, Challenge: challenge}); err != nil {
+		return fmt.Errorf("auth challenge: %w", err)
+	}
+	var prove farmControlAuthProve
+	if err := connection.ReadJSON(&prove); err != nil {
+		return fmt.Errorf("auth prove: %w", err)
+	}
+	if prove.Type != "auth_prove" || prove.Protocol != farmControlProtocolVersion || prove.NodeUID != nodeUID || prove.Challenge != challenge || prove.DevicePubKey != begin.DevicePubKey {
+		return fmt.Errorf("invalid auth proof")
+	}
+	message, err := farmControlAuthMessage(nodeUID, challenge)
+	if err != nil {
+		return err
+	}
+	signature, err := base64.StdEncoding.DecodeString(prove.Signature)
+	if err != nil || !ed25519.Verify(publicKey, message, signature) {
+		return fmt.Errorf("invalid auth signature")
+	}
+	if err := connection.WriteJSON(farmControlAuthenticated{Type: "authenticated", NodeUID: nodeUID, ControllerID: controllerID, ControllerGeneration: controllerGeneration}); err != nil {
+		return fmt.Errorf("authenticated: %w", err)
+	}
+	return nil
+}
+
+func runC8InstalledReconnectFirstSession(connection *websocket.Conn, publicKey ed25519.PublicKey, nodeUID, controllerID, profileID, pairingIncarnation, providerInstanceID, configHash string, evidence chan<- c8InstalledReconnectSessionEvidence) error {
+	if err := authenticateC8InstalledReconnectSession(connection, publicKey, nodeUID, controllerID, 1); err != nil {
+		return err
+	}
+	if err := connection.WriteJSON(FarmRuntimeCommand{Type: "command", NodeUID: nodeUID, CorrelationID: "c8-reconnect-ensure", Command: "ensure_runtime", Payload: map[string]any{
+		"node_uid": nodeUID, "profile_id": profileID, "provider_instance_id": providerInstanceID, "fencing_epoch": 1,
+		"config_hash": configHash, "launch_mode": FarmRuntimeLaunchModeDirectNoProxy, "pairing_incarnation": pairingIncarnation,
+	}}); err != nil {
+		return fmt.Errorf("ensure command: %w", err)
+	}
+	raw, err := readFarmClientFixtureCommandResponse(connection, "c8-reconnect-ensure")
+	if err != nil {
+		return fmt.Errorf("ensure response: %w", err)
+	}
+	var response struct {
+		OK      bool            `json:"ok"`
+		Error   string          `json:"error"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return fmt.Errorf("decode ensure response: %w", err)
+	}
+	if !response.OK {
+		return fmt.Errorf("ensure failed: %s", response.Error)
+	}
+	var launched FarmRuntime
+	if err := json.Unmarshal(response.Payload, &launched); err != nil {
+		return fmt.Errorf("decode ensured runtime: %w", err)
+	}
+	if launched.NodeUID != nodeUID || launched.ProfileID != profileID || launched.RuntimeUID == "" || launched.PID <= 0 || launched.Generation == 0 || launched.ProfileIncarnation == "" {
+		return fmt.Errorf("ensure did not return an owned runtime: %+v", launched)
+	}
+	telemetry, err := readFarmClientFixtureHeartbeat(connection)
+	if err != nil {
+		return fmt.Errorf("first-session heartbeat: %w", err)
+	}
+	if telemetry.ConnectionGeneration == 0 || telemetry.SampleSequence == 0 || !c8TelemetryHasRuntime(telemetry, launched.RuntimeUID, launched.PID) {
+		return fmt.Errorf("first-session heartbeat omitted owned runtime: %+v", telemetry)
+	}
+	evidence <- c8InstalledReconnectSessionEvidence{runtime: launched, telemetry: telemetry}
+	// This is the deliberate transport loss. The process and Chrome remain
+	// alive; only the authenticated Control session is interrupted.
+	_ = connection.Close()
+	return nil
+}
+
+func runC8InstalledReconnectSecondSession(connection *websocket.Conn, publicKey ed25519.PublicKey, nodeUID, controllerID, profileID, providerInstanceID string, firstEvidence <-chan c8InstalledReconnectSessionEvidence, runtimePID chan<- int) error {
+	if err := authenticateC8InstalledReconnectSession(connection, publicKey, nodeUID, controllerID, 1); err != nil {
+		return err
+	}
+	previous := <-firstEvidence
+	secondHeartbeat, err := readFarmClientFixtureHeartbeat(connection)
+	if err != nil {
+		return fmt.Errorf("second-session heartbeat: %w", err)
+	}
+	if secondHeartbeat.ConnectionGeneration <= previous.telemetry.ConnectionGeneration || secondHeartbeat.SampleSequence <= previous.telemetry.SampleSequence {
+		return fmt.Errorf("reconnect did not advance authenticated heartbeat identity: first=%+v second=%+v", previous.telemetry, secondHeartbeat)
+	}
+	if !c8TelemetryHasRuntime(secondHeartbeat, previous.runtime.RuntimeUID, previous.runtime.PID) {
+		return fmt.Errorf("reconnect heartbeat lost owned runtime: %+v", secondHeartbeat)
+	}
+
+	const inventoryCorrelation = "c8-reconnect-inventory"
+	if err := connection.WriteJSON(FarmRuntimeCommand{Type: "command", NodeUID: nodeUID, CorrelationID: inventoryCorrelation, Command: "inventory_handoff", Payload: map[string]any{}}); err != nil {
+		return fmt.Errorf("inventory_handoff command: %w", err)
+	}
+	inventoryRaw, err := readFarmClientFixtureCommandResponse(connection, inventoryCorrelation)
+	if err != nil {
+		return fmt.Errorf("inventory_handoff response: %w", err)
+	}
+	var inventoryResponse struct {
+		OK      bool            `json:"ok"`
+		Error   string          `json:"error"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(inventoryRaw, &inventoryResponse); err != nil {
+		return fmt.Errorf("decode inventory_handoff response: %w", err)
+	}
+	if !inventoryResponse.OK {
+		return fmt.Errorf("inventory_handoff failed: %s", inventoryResponse.Error)
+	}
+	var snapshot FarmRuntimeInventorySnapshot
+	if err := json.Unmarshal(inventoryResponse.Payload, &snapshot); err != nil {
+		return fmt.Errorf("decode inventory_handoff snapshot: %w", err)
+	}
+	if snapshot.ConnectionGeneration != secondHeartbeat.ConnectionGeneration || len(snapshot.Inventory) != 1 || snapshot.InventoryDigest != farmRuntimeInventoryDigest(snapshot.Inventory) {
+		return fmt.Errorf("inventory_handoff was not authoritative: %+v", snapshot)
+	}
+	owned := snapshot.Inventory[0]
+	if owned.RuntimeUID != previous.runtime.RuntimeUID || owned.ProfileID != profileID || owned.PID != previous.runtime.PID || owned.NodeUID != nodeUID || owned.ProviderInstanceID != providerInstanceID {
+		return fmt.Errorf("reconnected inventory changed runtime ownership: first=%+v second=%+v", previous.runtime, owned)
+	}
+
+	const completionCorrelation = "c8-reconnect-complete"
+	if err := connection.WriteJSON(FarmRuntimeCommand{Type: "command", NodeUID: nodeUID, CorrelationID: completionCorrelation, Command: "handoff_reconcile_complete", Payload: FarmRuntimeHandoffCompletion{
+		Status: "completed", ControllerID: controllerID, ControllerGeneration: 1,
+		ConnectionGeneration: snapshot.ConnectionGeneration, InventoryDigest: snapshot.InventoryDigest, InventoryCount: len(snapshot.Inventory),
+	}}); err != nil {
+		return fmt.Errorf("handoff_reconcile_complete command: %w", err)
+	}
+	completionRaw, err := readFarmClientFixtureCommandResponse(connection, completionCorrelation)
+	if err != nil {
+		return fmt.Errorf("handoff_reconcile_complete response: %w", err)
+	}
+	var completionResponse struct {
+		OK      bool                         `json:"ok"`
+		Error   string                       `json:"error"`
+		Payload FarmRuntimeHandoffCompletion `json:"payload"`
+	}
+	if err := json.Unmarshal(completionRaw, &completionResponse); err != nil {
+		return fmt.Errorf("decode handoff_reconcile_complete response: %w", err)
+	}
+	if !completionResponse.OK || completionResponse.Payload.Status != "completed" || completionResponse.Payload.ConnectionGeneration != snapshot.ConnectionGeneration || completionResponse.Payload.InventoryDigest != snapshot.InventoryDigest || completionResponse.Payload.InventoryCount != len(snapshot.Inventory) {
+		return fmt.Errorf("handoff_reconcile_complete ACK was not exact: %+v", completionResponse)
+	}
+	postReconcileHeartbeat, err := readFarmClientFixtureHeartbeat(connection)
+	if err != nil {
+		return fmt.Errorf("post-reconcile heartbeat: %w", err)
+	}
+	if postReconcileHeartbeat.SampleSequence <= secondHeartbeat.SampleSequence || postReconcileHeartbeat.ConnectionGeneration != snapshot.ConnectionGeneration || !c8TelemetryHasRuntime(postReconcileHeartbeat, owned.RuntimeUID, owned.PID) {
+		return fmt.Errorf("heartbeat/owned runtime did not remain healthy after reconcile: %+v", postReconcileHeartbeat)
+	}
+	runtimePID <- owned.PID
+
+	stopCorrelation := "c8-reconnect-stop"
+	if err := connection.WriteJSON(FarmRuntimeCommand{Type: "command", NodeUID: nodeUID, CorrelationID: stopCorrelation, Command: "stop_runtime", Payload: FarmRuntimeStopRequest{
+		Provider: "farm", NodeUID: owned.NodeUID, ProfileID: owned.ProfileID, RuntimeUID: owned.RuntimeUID,
+		ProviderInstanceID: owned.ProviderInstanceID, FencingEpoch: owned.FencingEpoch, ConfigHash: owned.ConfigHash,
+		Generation: owned.Generation, PID: owned.PID, ProcessStartIdentity: owned.ProcessStartIdentity,
+		ProfileIncarnation: owned.ProfileIncarnation, ControllerID: owned.ControllerID, ControllerGeneration: owned.ControllerGeneration,
+		TelemetrySequence: postReconcileHeartbeat.SampleSequence, TelemetryObservedAt: postReconcileHeartbeat.ObservedAt,
+	}}); err != nil {
+		return fmt.Errorf("stop_runtime command: %w", err)
+	}
+	stopRaw, err := readFarmClientFixtureCommandResponse(connection, stopCorrelation)
+	if err != nil {
+		return fmt.Errorf("stop_runtime response: %w", err)
+	}
+	var stopResponse struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(stopRaw, &stopResponse); err != nil {
+		return fmt.Errorf("decode stop_runtime response: %w", err)
+	}
+	if !stopResponse.OK {
+		return fmt.Errorf("stop_runtime failed: %s", stopResponse.Error)
+	}
+	return nil
+}
+
+func c8TelemetryHasRuntime(telemetry FarmResourceTelemetry, runtimeUID string, pid int) bool {
+	for _, runtime := range telemetry.Runtimes {
+		if runtime.RuntimeUID == runtimeUID && runtime.PID == pid && runtime.State == FarmRuntimeStateIdle {
+			return true
+		}
+	}
+	return false
 }
 
 // TestFarmClientInstalledArtifactAutostartNative exercises the real per-user

@@ -80,13 +80,14 @@ jobs:
           if ($install.ExitCode -ne 0 -or -not (Test-Path $client)) { throw "NSIS install failed" }
           try {
             $env:C8_INSTALLED_ARTIFACT_E2E = "1"
+            $env:C8_INSTALLED_RECONNECT_RECONCILE_E2E = "1"
             $env:C8_INSTALLED_CLIENT = $client
             $env:C8_INSTALLED_ROOT = $installRoot
             $env:C8_RELEASE_ARTIFACT = $artifactPath
             $env:C8_RELEASE_ARTIFACT_SHA256 = $artifactSha
             $env:C8_INSTALLED_VERSION = $version
             $env:C8_REAL_CHROME_CORE = $chrome
-            go test ./backend -run '^TestFarmClientInstalledArtifactRealChrome$' -count=1 -v
+            go test ./backend -run '^TestFarmClientInstalledArtifact(RealChrome|ReconnectReconcile)$' -count=1 -v
             if ($LASTEXITCODE -ne 0) { throw "installed artifact E2E failed" }
             $env:C8_INSTALLED_AUTOSTART_E2E = "1"
             $env:C8_AUTOSTART_METHOD = "scheduled-task-at-logon"
