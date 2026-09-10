@@ -268,6 +268,7 @@ func waitFarmClientUpdateProbation(ctx context.Context, process *farmClientLaunc
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	var probationStarted time.Time
+	var lastHealthyObservation time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -286,11 +287,22 @@ func waitFarmClientUpdateProbation(ctx context.Context, process *farmClientLaunc
 			info, statErr := os.Stat(healthPath)
 			fresh := err == nil && statErr == nil && strings.TrimSpace(string(raw)) == nonce && time.Since(info.ModTime()) <= 3*time.Second
 			if !fresh {
-				if !probationStarted.IsZero() {
+				if probationStarted.IsZero() {
+					continue
+				}
+				// The marker is atomically published and its nonce never changes
+				// during one candidate. A different readable nonce is therefore a
+				// hard failure, while a transient Windows read/stat sharing error is
+				// allowed only inside the same three-second liveness window.
+				if err == nil && strings.TrimSpace(string(raw)) != nonce {
+					return ErrFarmClientUpdateApply
+				}
+				if !lastHealthyObservation.IsZero() && time.Since(lastHealthyObservation) > 3*time.Second {
 					return ErrFarmClientUpdateApply
 				}
 				continue
 			}
+			lastHealthyObservation = time.Now()
 			if probationStarted.IsZero() {
 				if !healthDeadline.Stop() {
 					select {

@@ -135,6 +135,40 @@ func TestFarmClientUpdateProbationRequiresContinuousHealth(t *testing.T) {
 	}
 }
 
+func TestFarmClientUpdateProbationToleratesTransientMarkerObservationGap(t *testing.T) {
+	process := startFarmClientProbationTestProcess(t)
+	stateRoot := t.TempDir()
+	healthPath := filepath.Join(stateRoot, "updates", "health")
+	config := FarmClientConfig{StateRoot: stateRoot}
+	nonce := strings.Repeat("b", 64)
+	if err := WriteFarmClientUpdateHealthMarker(config, healthPath, nonce); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- waitFarmClientUpdateProbation(context.Background(), process, healthPath, nonce, 400*time.Millisecond, 1200*time.Millisecond)
+	}()
+	// The first 250 ms poll observes health and starts probation. Removing the
+	// marker across multiple later polls deterministically exercises the
+	// transient observation path that Windows file sharing can trigger.
+	time.Sleep(350 * time.Millisecond)
+	if err := os.Remove(healthPath); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if err := WriteFarmClientUpdateHealthMarker(config, healthPath, nonce); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("transient marker observation gap failed probation: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("probation did not complete after transient marker observation gap")
+	}
+}
+
 func TestStopFarmClientAgentDoesNotConsumeCompletionTwice(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process fixture uses the POSIX shell")
