@@ -3,31 +3,17 @@ package backend
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"ant-chrome/backend/internal/logger"
 )
 
 func (a *App) BrowserInstanceStatus(profileId string) (*BrowserProfile, error) {
-	a.browserMgr.Mutex.Lock()
-	defer a.browserMgr.Mutex.Unlock()
-	profile, exists := a.browserMgr.Profiles[profileId]
-	if !exists {
-		return nil, fmt.Errorf("profile not found")
+	service, err := a.browserRuntimeService()
+	if err != nil {
+		return nil, err
 	}
-	a.ensureProfileLaunchCode(profile)
-	if !profile.Running {
-		userDataDir := a.browserMgr.ResolveUserDataDir(profile)
-		if detection, ok := detectBrowserRuntimeByUserDataDir(userDataDir); ok && detection.DebugReady {
-			a.markProfileRunningLocked(profileId, profile, nil, detection.PID, detection.DebugPort, true, "")
-			logger.New("Browser").Warn("状态查询发现同一用户数据目录浏览器已运行，已同步实例状态",
-				logger.F("profile_id", profileId),
-				logger.F("user_data_dir", userDataDir),
-				logger.F("pid", detection.PID),
-				logger.F("debug_port", detection.DebugPort),
-			)
-		}
-	}
-	return profile, nil
+	return service.Status(profileId)
 }
 
 func (a *App) BrowserInstanceOpenUrl(profileId string, targetUrl string) (bool, error) {
@@ -38,6 +24,13 @@ func (a *App) BrowserInstanceOpenUrl(profileId string, targetUrl string) (bool, 
 	}
 
 	log := logger.New("Browser")
+	service, serviceErr := a.browserRuntimeService()
+	serviceIdentity := browserRuntimeIdentity{}
+	serviceProcess := (*BrowserRuntimeProcess)(nil)
+	if service != nil {
+		serviceIdentity = service.identity(profileId)
+		serviceProcess = service.processFor(profileId)
+	}
 
 	a.browserMgr.Mutex.Lock()
 	profile, exists := a.browserMgr.Profiles[profileId]
@@ -62,12 +55,50 @@ func (a *App) BrowserInstanceOpenUrl(profileId string, targetUrl string) (bool, 
 			return false, fmt.Errorf("打开地址失败：实例当前未运行，请先启动实例后再试。")
 		}
 	}
-	if !isBrowserProfileLive(profile, trackedCmd) {
+	live := isBrowserProfileLive(profile, trackedCmd)
+	// ProcessState is written by exec.Cmd.Wait. The service exposes the
+	// owner's Done channel as the only completion fence; reading ProcessState
+	// here would race the sole reaper during a concurrent OpenUrl/status call.
+	if live && serviceProcess != nil && serviceProcess.owner != nil &&
+		serviceProcess.owner.Done() != nil && serviceIdentity.cmd == serviceProcess.cmd &&
+		serviceIdentity.profile == profile && (trackedCmd == nil || trackedCmd == serviceProcess.cmd) &&
+		browserRuntimeDone(serviceProcess.owner.Done()) {
+		// A reaped launcher can still leave a detached Chrome endpoint alive;
+		// retain that runtime when CDP answers, but treat an exited owner plus a
+		// dead endpoint as stale even on platforms where Signal(0) reports a
+		// zombie PID as present.
+		live = profile.DebugPort > 0 && canConnectDebugPort(profile.DebugPort, 250*time.Millisecond)
+	}
+	if !live {
 		staleDebugPort := profile.DebugPort
 		stalePID := profile.Pid
-		a.markProfileStoppedLocked(profileId, profile)
-		profile.LastError = "打开地址失败：检测到实例运行状态已失效，请先重新启动实例。"
 		a.browserMgr.Mutex.Unlock()
+
+		staleError := "打开地址失败：检测到实例运行状态已失效，请先重新启动实例。"
+		if serviceErr == nil {
+			// Carry the exact observation into the service gate. A fresh Start may
+			// win the gate after this Manager snapshot is released; the strict
+			// transition then becomes a no-op instead of stopping that replacement.
+			if _, transitioned, transitionErr := service.markStaleRuntimeStoppedIfCurrent(profileId, serviceIdentity, profile, staleError); transitionErr != nil {
+				return false, fmt.Errorf("打开地址失败：检测到实例运行状态已失效，清理运行态失败：%w", transitionErr)
+			} else if !transitioned {
+				return false, fmt.Errorf("%s", staleError)
+			}
+		} else {
+			// Keep the legacy fallback only for an App whose shared service could
+			// not be constructed. It still runs under Manager.Mutex and is never
+			// used by the normal service-backed path.
+			a.browserMgr.Mutex.Lock()
+			if current := a.browserMgr.Profiles[profileId]; current != nil {
+				a.markProfileStoppedLocked(profileId, current)
+			}
+			a.browserMgr.Mutex.Unlock()
+			a.browserMgr.Mutex.Lock()
+			if current := a.browserMgr.Profiles[profileId]; current != nil {
+				current.LastError = staleError
+			}
+			a.browserMgr.Mutex.Unlock()
+		}
 
 		log.Warn("检测到实例运行状态已失效，取消复用打开地址",
 			logger.F("profile_id", profileId),
@@ -75,7 +106,7 @@ func (a *App) BrowserInstanceOpenUrl(profileId string, targetUrl string) (bool, 
 			logger.F("pid", stalePID),
 		)
 		a.emitRuntimeEvent("browser:instance:stopped", profileId)
-		return false, fmt.Errorf("%s", profile.LastError)
+		return false, fmt.Errorf("%s", staleError)
 	}
 
 	snapshot := copyBrowserProfileSnapshot(profile)

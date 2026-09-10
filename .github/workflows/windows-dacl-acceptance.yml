@@ -1,0 +1,70 @@
+name: Windows DACL acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/browser-farm-p1-handoff-agent
+    paths:
+      - .github/workflows/windows-dacl-acceptance.yml
+      - backend/internal/proxy/secure_runtime_permissions_windows.go
+      - backend/internal/proxy/secure_runtime_windows_dacl_e2e_test.go
+      - backend/internal/proxy/secure_runtime_writer.go
+      - scripts/run_windows_dacl_acceptance.ps1
+
+permissions:
+  contents: read
+
+jobs:
+  secure-runtime-dacl:
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run two-account DACL acceptance
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          $Suffix = [guid]::NewGuid().ToString("N").Substring(0, 8)
+          $AlternateUsername = "bfp1dacl$Suffix"
+          $RandomBytes = New-Object byte[] 24
+          $Rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+          try {
+            $Rng.GetBytes($RandomBytes)
+          } finally {
+            $Rng.Dispose()
+          }
+          $AlternatePassword = [Convert]::ToBase64String($RandomBytes) + "!aA9"
+          Write-Output "::add-mask::$AlternatePassword"
+
+          $Computer = [ADSI]"WinNT://$env:COMPUTERNAME"
+          $Created = $false
+          try {
+            $AlternateUser = $Computer.Create("user", $AlternateUsername)
+            $AlternateUser.SetPassword($AlternatePassword)
+            $AlternateUser.SetInfo()
+            $AlternateUser.UserFlags = 512
+            $AlternateUser.SetInfo()
+            $Created = $true
+
+            $env:BF_P1_WINDOWS_DACL_ALT_PASSWORD = $AlternatePassword
+            .\scripts\run_windows_dacl_acceptance.ps1 -AlternateUsername $AlternateUsername
+          } finally {
+            Remove-Item Env:BF_P1_WINDOWS_DACL_ALT_PASSWORD -ErrorAction SilentlyContinue
+            [Array]::Clear($RandomBytes, 0, $RandomBytes.Length)
+            $AlternatePassword = $null
+            if ($Created) {
+              $Computer.Delete("user", $AlternateUsername)
+            }
+          }

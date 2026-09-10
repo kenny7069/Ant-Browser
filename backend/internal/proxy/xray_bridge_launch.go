@@ -49,7 +49,7 @@ func (m *XrayManager) ensureBridgeContext(ctx context.Context, proxyConfig strin
 	if IsChainSocks5Proxy(src) {
 		chainCfg, err := ParseChainSocks5Config(src)
 		if err != nil {
-			log.Error("链式节点解析失败", logger.F("error", err))
+			log.Error("链式节点解析失败", logger.F("error", safeProxyError(err)))
 			return "", "", err
 		}
 		outbounds = []interface{}{
@@ -67,7 +67,7 @@ func (m *XrayManager) ensureBridgeContext(ctx context.Context, proxyConfig strin
 	} else {
 		directOutbound, shouldBridgeDirectProxy, err := buildDirectProxyBridgeOutbound(src)
 		if err != nil {
-			log.Error("直连代理桥接配置解析失败", logger.F("error", err))
+			log.Error("直连代理桥接配置解析失败", logger.F("error", safeProxyError(err)))
 			return "", "", err
 		}
 		if shouldBridgeDirectProxy {
@@ -82,7 +82,7 @@ func (m *XrayManager) ensureBridgeContext(ctx context.Context, proxyConfig strin
 		} else {
 			standardProxy, outbound, err := ParseProxyNode(src)
 			if err != nil {
-				log.Error("节点解析失败", logger.F("error", err))
+				log.Error("节点解析失败", logger.F("error", safeProxyError(err)))
 				return "", "", err
 			}
 			if standardProxy != "" {
@@ -104,7 +104,7 @@ func (m *XrayManager) ensureBridgeContext(ctx context.Context, proxyConfig strin
 	key := computeNodeKey(src + "\x00" + dnsServers)
 
 	if socksURL, reused := m.tryReuseBridge(key, pin); reused {
-		log.Info("复用 xray 桥接进程", logger.F("engine", "xray"), logger.F("key", key), logger.F("socks_url", socksURL))
+		log.Info("复用 xray 桥接进程", logger.F("engine", "xray"), logger.F("key", key), logger.F("socks_url", safeProxyURI(socksURL)))
 		return socksURL, key, nil
 	}
 	unlockLaunch := m.lockLaunchForKey(key)
@@ -113,13 +113,13 @@ func (m *XrayManager) ensureBridgeContext(ctx context.Context, proxyConfig strin
 		return "", "", err
 	}
 	if socksURL, reused := m.tryReuseBridge(key, pin); reused {
-		log.Info("复用 xray 桥接进程", logger.F("engine", "xray"), logger.F("key", key), logger.F("socks_url", socksURL))
+		log.Info("复用 xray 桥接进程", logger.F("engine", "xray"), logger.F("key", key), logger.F("socks_url", safeProxyURI(socksURL)))
 		return socksURL, key, nil
 	}
 
 	binaryPath, err := m.resolveBinary()
 	if err != nil {
-		log.Error("xray 不可用", logger.F("error", err))
+		log.Error("xray 不可用", logger.F("error", safeProxyError(err)))
 		return "", "", err
 	}
 
@@ -208,56 +208,80 @@ func (m *XrayManager) launchBridgeAttemptContext(ctx context.Context, log *logge
 		var err error
 		port, err = nextAvailablePort()
 		if err != nil {
-			log.Error("端口分配失败", logger.F("error", err), logger.F("attempt", attempt))
+			log.Error("端口分配失败", logger.F("error", safeProxyError(err)), logger.F("attempt", attempt))
 			return "", nil, err
 		}
 	}
 	cfgPath, err := m.buildRuntimeConfigWithRoute(key, outbounds, routes, port, dnsServers)
 	if err != nil {
-		log.Error("xray 配置生成失败", logger.F("error", err))
+		log.Error("xray 配置生成失败", logger.F("error", safeProxyError(err)))
 		return "", nil, err
 	}
-	stderrPath := filepath.Join(filepath.Dir(cfgPath), "xray-stderr.log")
-	if err := m.testRuntimeConfigContext(ctx, binaryPath, cfgPath, stderrPath); err != nil {
-		log.Error("xray 配置预检失败", logger.F("error", err), logger.F("attempt", attempt), logger.F("config", cfgPath))
+	writer, err := m.getSecureRuntimeWriter()
+	if err != nil {
+		return "", nil, err
+	}
+	runtimeHandle, err := writer.handle(key)
+	if err != nil {
+		return "", nil, err
+	}
+	stderrFile, stderrPath, err := writer.openLog(key, "xray-stderr.log")
+	if err != nil {
+		return "", nil, err
+	}
+	if err := m.testRuntimeConfigContext(ctx, binaryPath, cfgPath, stderrFile, stderrPath); err != nil {
+		log.Error("xray 配置预检失败", logger.F("error", safeProxyError(err)), logger.F("attempt", attempt), logger.F("config", cfgPath))
+		return "", nil, err
+	}
+	stderrFile, stderrPath, err = writer.openLog(key, "xray-stderr.log")
+	if err != nil {
 		return "", nil, err
 	}
 	cmd := exec.Command(binaryPath, "run", "-c", cfgPath)
 	hideWindow(cmd)
 	cmd.Dir = filepath.Dir(cfgPath)
 
-	stderrFile, _ := os.Create(stderrPath)
-	if stderrFile != nil {
-		cmd.Stderr = stderrFile
+	cmd.Stderr = stderrFile
+	launchToken, err := runtimeHandle.markProcessLaunchPendingToken()
+	if err != nil {
+		_ = stderrFile.Close()
+		return "", nil, fmt.Errorf("register xray launch: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		if stderrFile != nil {
-			stderrFile.Close()
-		}
-		log.Error("xray 启动失败", logger.F("error", err), logger.F("attempt", attempt))
+		runtimeHandle.markProcessLaunchFailed(launchToken)
+		_ = stderrFile.Close()
+		log.Error("xray 启动失败", logger.F("error", safeProxyError(err)), logger.F("attempt", attempt))
 		return "", nil, &xrayLaunchError{err: err, retryable: false}
 	}
 	if err := ctx.Err(); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		if stderrFile != nil {
-			stderrFile.Close()
-		}
+		runtimeHandle.markProcessLaunchFailed(launchToken)
+		_ = stderrFile.Close()
 		return "", nil, &xrayLaunchError{err: err, retryable: false}
 	}
 
+	runtimeToken := runtimeHandle.markProcessStartedForLaunch(launchToken, cmd.Process.Pid)
+	if runtimeToken == 0 {
+		runtimeHandle.markProcessLaunchFailed(launchToken)
+		_ = cmd.Process.Kill()
+		_ = stderrFile.Close()
+		return "", nil, fmt.Errorf("register xray process identity")
+	}
 	bridge := &XrayBridge{
-		NodeKey:    key,
-		Port:       port,
-		Cmd:        cmd,
-		Pid:        cmd.Process.Pid,
-		Running:    true,
-		RefCount:   0,
-		LastUsedAt: time.Now(),
-		Outbounds:  cloneInterfaceSlice(outbounds),
-		Routes:     cloneInterfaceSlice(routes),
-		DNSServers: dnsServers,
+		NodeKey:      key,
+		Port:         port,
+		Cmd:          cmd,
+		Pid:          cmd.Process.Pid,
+		Running:      true,
+		RefCount:     0,
+		LastUsedAt:   time.Now(),
+		Outbounds:    cloneInterfaceSlice(outbounds),
+		Routes:       cloneInterfaceSlice(routes),
+		DNSServers:   dnsServers,
+		Runtime:      runtimeHandle,
+		RuntimeToken: runtimeToken,
 	}
 	bridge.startExitWatcher()
 	log.Info("xray 内核进程已启动", logger.F("engine", "xray"), logger.F("key", key), logger.F("pid", bridge.Pid), logger.F("port", bridge.Port), logger.F("attempt", attempt))
@@ -271,7 +295,7 @@ func (m *XrayManager) launchBridgeAttemptContext(ctx context.Context, log *logge
 	}
 
 	if socksURL, reused := m.registerBridge(key, bridge, pin); reused {
-		log.Info("复用已就绪 xray 桥接进程", logger.F("engine", "xray"), logger.F("key", key), logger.F("socks_url", socksURL))
+		log.Info("复用已就绪 xray 桥接进程", logger.F("engine", "xray"), logger.F("key", key), logger.F("socks_url", safeProxyURI(socksURL)))
 		bridge.Stopping = true
 		m.stopBridgeProcess(bridge)
 		return socksURL, nil, nil
@@ -384,11 +408,15 @@ func (m *XrayManager) waitBridgeReadyContext(ctx context.Context, log *logger.Lo
 		if retryable {
 			message = "xray 桥接未就绪，重试"
 		}
-		log.Error(message, logger.F("key", bridge.NodeKey), logger.F("error", err), logger.F("port", bridge.Port), logger.F("attempt", attempt), logger.F("retryable", retryable))
+		log.Error(message, logger.F("key", bridge.NodeKey), logger.F("error", safeProxyError(err)), logger.F("port", bridge.Port), logger.F("attempt", attempt), logger.F("retryable", retryable))
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return &xrayLaunchError{err: ctxErr, retryable: false}
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return &xrayLaunchError{err: ctx.Err(), retryable: false}
+		case <-time.After(200 * time.Millisecond):
+		}
 		return &xrayLaunchError{err: fmt.Errorf("%s", bridge.LastError), retryable: retryable}
 	}
 	if stderrFile != nil {
@@ -415,22 +443,18 @@ func (m *XrayManager) isRetryableBridgeReadyError(err error, cfgPath string, std
 		strings.Contains(tail, "bind ")
 }
 
-func (m *XrayManager) testRuntimeConfig(binaryPath string, cfgPath string, stderrPath string) error {
-	return m.testRuntimeConfigContext(context.Background(), binaryPath, cfgPath, stderrPath)
-}
-
-func (m *XrayManager) testRuntimeConfigContext(ctx context.Context, binaryPath string, cfgPath string, stderrPath string) error {
+func (m *XrayManager) testRuntimeConfigContext(ctx context.Context, binaryPath string, cfgPath string, stderrFile *os.File, stderrPath string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	cmd := exec.CommandContext(ctx, binaryPath, "run", "-test", "-c", cfgPath)
 	hideWindow(cmd)
 	cmd.Dir = filepath.Dir(cfgPath)
-	stderrFile, _ := os.Create(stderrPath)
-	if stderrFile != nil {
-		defer stderrFile.Close()
-		cmd.Stderr = stderrFile
+	if stderrFile == nil {
+		return &xrayLaunchError{err: fmt.Errorf("xray secure stderr file is unavailable"), retryable: false}
 	}
+	defer stderrFile.Close()
+	cmd.Stderr = stderrFile
 	output, err := cmd.Output()
 	if err == nil {
 		return nil
@@ -553,12 +577,12 @@ func readLogTail(path string, max int) string {
 
 func (m *XrayManager) logBridgeStartupError(log *logger.Logger, cfgPath string, stderrPath string) {
 	if stderrContent, readErr := os.ReadFile(stderrPath); readErr == nil && len(stderrContent) > 0 {
-		log.Error("xray stderr", logger.F("output", string(stderrContent)))
+		log.Error("xray stderr", logger.F("output", maskProxySensitiveText(string(stderrContent))))
 		return
 	}
 
 	errLogPath := filepath.Join(filepath.Dir(cfgPath), "xray-error.log")
 	if errContent, readErr := os.ReadFile(errLogPath); readErr == nil && len(errContent) > 0 {
-		log.Error("xray error.log", logger.F("output", string(errContent)))
+		log.Error("xray error.log", logger.F("output", maskProxySensitiveText(string(errContent))))
 	}
 }

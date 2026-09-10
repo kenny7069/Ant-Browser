@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/logger"
 	"ant-chrome/backend/internal/proxy"
 	"fmt"
@@ -30,13 +29,14 @@ func (a *App) resolveBrowserStartProxy(input browserStartInput, profile *Browser
 		var err error
 		resolvedProxyID, resolvedProxyConfig, err = resolveTemporaryBrowserStartProxy(input.TemporaryProxyID, input.TemporaryProxyConfig, proxies)
 		if err != nil {
-			startErr := fmt.Errorf("实例启动失败：%s", err.Error())
+			safeErr := proxy.MaskProxySensitiveText(err.Error())
+			startErr := fmt.Errorf("实例启动失败：%s", safeErr)
 			profile.LastError = startErr.Error()
 			log.Error("一次性代理配置无效",
 				logger.F("profile_id", profileID),
 				logger.F("temporary_proxy_id", input.TemporaryProxyID),
-				logger.F("error", err.Error()),
-				logger.F("reason", startErr.Error()),
+				logger.F("error", safeErr),
+				logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())),
 			)
 			return "", profileProxyBridgeRef{}, false, startErr
 		}
@@ -49,41 +49,43 @@ func (a *App) resolveBrowserStartProxy(input browserStartInput, profile *Browser
 			}
 		}
 	}
+	if resolvedProxyID == "" && strings.TrimSpace(resolvedProxyConfig) == "" {
+		resolvedProxyConfig = "direct://"
+	}
 
 	log.Info("代理配置检查",
 		logger.F("profile_id", profileID),
 		logger.F("proxy_id", profile.ProxyId),
-		logger.F("profile_proxy_config", profile.ProxyConfig),
+		logger.F("profile_proxy_config", proxy.MaskProxySensitiveText(profile.ProxyConfig)),
 		logger.F("temporary_proxy", usingTemporaryProxy),
 		logger.F("temporary_proxy_id", input.TemporaryProxyID),
-		logger.F("temporary_proxy_config", input.TemporaryProxyConfig),
-		logger.F("resolved_proxy_config", resolvedProxyConfig),
+		logger.F("temporary_proxy_config", proxy.MaskProxySensitiveText(input.TemporaryProxyConfig)),
+		logger.F("resolved_proxy_config", proxy.MaskProxySensitiveText(resolvedProxyConfig)),
 	)
-	if supported, errorMsg := proxy.ValidateProxyConfig(resolvedProxyConfig, proxies, resolvedProxyID); !supported {
-		startErr := fmt.Errorf("实例启动失败：%s", errorMsg)
+	connectorType := a.defaultProxyConnectorType()
+	if supported, errorMsg := proxy.ValidateProxyConfigForConnector(resolvedProxyConfig, proxies, resolvedProxyID, connectorType); !supported {
+		safeErrorMsg := proxy.MaskProxySensitiveText(errorMsg)
+		startErr := fmt.Errorf("实例启动失败：%s", safeErrorMsg)
 		profile.LastError = startErr.Error()
 		log.Error("代理配置无效",
 			logger.F("profile_id", profileID),
 			logger.F("proxy_id", resolvedProxyID),
-			logger.F("error", errorMsg),
-			logger.F("reason", startErr.Error()),
+			logger.F("error", safeErrorMsg),
+			logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())),
 		)
 		return "", profileProxyBridgeRef{}, false, startErr
 	}
 
-	connectorType := config.BrowserConnectorXray
-	if a.config != nil {
-		connectorType = config.NormalizeBrowserConnectorType(a.config.Browser.DefaultConnectorType)
-	}
 	resolution, err := proxy.ResolveProxyKernelForConnector(resolvedProxyConfig, proxies, resolvedProxyID, connectorType)
 	if err != nil {
-		startErr := fmt.Errorf("实例启动失败：%s", err.Error())
+		safeErr := proxy.MaskProxySensitiveText(err.Error())
+		startErr := fmt.Errorf("实例启动失败：%s", safeErr)
 		profile.LastError = startErr.Error()
 		log.Error("代理内核选择失败",
 			logger.F("profile_id", profileID),
 			logger.F("proxy_id", resolvedProxyID),
-			logger.F("error", err.Error()),
-			logger.F("reason", startErr.Error()),
+			logger.F("error", safeErr),
+			logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())),
 		)
 		return "", profileProxyBridgeRef{}, false, startErr
 	}
@@ -98,8 +100,9 @@ func (a *App) resolveBrowserStartProxy(input browserStartInput, profile *Browser
 		}
 		proxyURL, bridgeKey, bridgeErr := a.clashMgr.AcquireNodeBridge(resolvedProxyConfig, proxies, resolvedProxyID)
 		if bridgeErr != nil {
-			startErr := fmt.Errorf("实例启动失败：mihomo 代理桥接失败：%v", bridgeErr)
-			log.Error("代理桥接失败(mihomo)", logger.F("error", bridgeErr.Error()), logger.F("reason", startErr.Error()))
+			safeBridgeErr := proxy.MaskProxySensitiveText(bridgeErr.Error())
+			startErr := fmt.Errorf("实例启动失败：mihomo 代理桥接失败：%s", safeBridgeErr)
+			log.Error("代理桥接失败(mihomo)", logger.F("error", safeBridgeErr), logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())))
 			profile.LastError = startErr.Error()
 			return "", profileProxyBridgeRef{}, false, startErr
 		}
@@ -112,8 +115,9 @@ func (a *App) resolveBrowserStartProxy(input browserStartInput, profile *Browser
 		}
 		socksURL, bridgeKey, bridgeErr := a.singboxMgr.AcquireBridge(resolvedProxyConfig, proxies, resolvedProxyID)
 		if bridgeErr != nil {
-			startErr := fmt.Errorf("实例启动失败：sing-box 代理桥接失败：%v", bridgeErr)
-			log.Error("代理桥接失败(sing-box)", logger.F("error", bridgeErr.Error()), logger.F("reason", startErr.Error()))
+			safeBridgeErr := proxy.MaskProxySensitiveText(bridgeErr.Error())
+			startErr := fmt.Errorf("实例启动失败：sing-box 代理桥接失败：%s", safeBridgeErr)
+			log.Error("代理桥接失败(sing-box)", logger.F("error", safeBridgeErr), logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())))
 			profile.LastError = startErr.Error()
 			return "", profileProxyBridgeRef{}, false, startErr
 		}
@@ -126,8 +130,9 @@ func (a *App) resolveBrowserStartProxy(input browserStartInput, profile *Browser
 		}
 		socksURL, bridgeKey, bridgeErr := a.xrayMgr.AcquireBridge(resolvedProxyConfig, proxies, resolvedProxyID)
 		if bridgeErr != nil {
-			startErr := fmt.Errorf("实例启动失败：Xray 代理桥接失败：%v", bridgeErr)
-			log.Error("代理桥接失败(xray)", logger.F("error", bridgeErr.Error()), logger.F("reason", startErr.Error()))
+			safeBridgeErr := proxy.MaskProxySensitiveText(bridgeErr.Error())
+			startErr := fmt.Errorf("实例启动失败：Xray 代理桥接失败：%s", safeBridgeErr)
+			log.Error("代理桥接失败(xray)", logger.F("error", safeBridgeErr), logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())))
 			profile.LastError = startErr.Error()
 			return "", profileProxyBridgeRef{}, false, startErr
 		}

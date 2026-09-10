@@ -2,6 +2,7 @@ package backend
 
 import (
 	"ant-chrome/backend/internal/logger"
+	"ant-chrome/backend/internal/proxy"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -12,30 +13,31 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 	log := logger.New("Browser")
 	profile := plan.profile
 	a.clearDeferredStartTargets(input.ProfileID)
-	a.markProfileLastLaunchArgsLocked(profile, plan.args)
+	a.markProfileLastLaunchArgsLocked(profile, maskBrowserLaunchArgs(plan.args))
 
 	cmd := exec.Command(plan.chromeBinaryPath, plan.args...)
 	cmd.Dir = filepath.Dir(plan.chromeBinaryPath)
 
 	monitor, err := newBrowserProcessMonitor(cmd)
 	if err != nil {
-		startErr := fmt.Errorf("实例启动失败：无法建立浏览器错误输出捕获。可执行文件：%s。原因：%v。", plan.chromeBinaryPath, err)
+		safeErr := proxy.MaskProxySensitiveText(err.Error())
+		startErr := fmt.Errorf("实例启动失败：无法建立浏览器错误输出捕获。可执行文件：%s。原因：%s。", plan.chromeBinaryPath, safeErr)
 		log.Error("浏览器错误输出捕获初始化失败",
 			logger.F("profile_id", input.ProfileID),
 			logger.F("chrome", plan.chromeBinaryPath),
-			logger.F("error", err.Error()),
-			logger.F("reason", startErr.Error()),
+			logger.F("error", safeErr),
+			logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())),
 		)
 		profile.LastError = startErr.Error()
 		return profile, startErr
 	}
 	if err := cmd.Start(); err != nil {
-		startErr := fmt.Errorf("%s", describeChromeProcessStartError(plan.chromeBinaryPath, err))
+		startErr := fmt.Errorf("%s", proxy.MaskProxySensitiveText(describeChromeProcessStartError(plan.chromeBinaryPath, err)))
 		log.Error("浏览器进程启动失败",
 			logger.F("profile_id", input.ProfileID),
 			logger.F("chrome", plan.chromeBinaryPath),
-			logger.F("error", err.Error()),
-			logger.F("reason", startErr.Error()),
+			logger.F("error", proxy.MaskProxySensitiveText(err.Error())),
+			logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())),
 		)
 		profile.LastError = startErr.Error()
 		return profile, startErr
@@ -43,13 +45,13 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 	memoryLimitCleanup, err := applyBrowserProcessMemoryLimit(cmd, profile.MemoryLimitMB)
 	if err != nil {
 		_ = a.stopProcessCmd(cmd)
-		startErr := fmt.Errorf("实例启动失败：无法应用实例内存限制 %d MB。原因：%v。", profile.MemoryLimitMB, err)
+		startErr := fmt.Errorf("实例启动失败：无法应用实例内存限制 %d MB。原因：%s。", profile.MemoryLimitMB, proxy.MaskProxySensitiveText(err.Error()))
 		log.Error("浏览器进程内存限制应用失败",
 			logger.F("profile_id", input.ProfileID),
 			logger.F("chrome", plan.chromeBinaryPath),
 			logger.F("memory_limit_mb", profile.MemoryLimitMB),
-			logger.F("error", err.Error()),
-			logger.F("reason", startErr.Error()),
+			logger.F("error", proxy.MaskProxySensitiveText(err.Error())),
+			logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())),
 		)
 		profile.LastError = startErr.Error()
 		return profile, startErr
@@ -87,7 +89,7 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 						logger.F("profile_id", input.ProfileID),
 						logger.F("debug_port", stableDebugPort),
 						logger.F("target_count", len(plan.deferredStartTargets)),
-						logger.F("error", err.Error()),
+						logger.F("error", proxy.MaskProxySensitiveText(err.Error())),
 						logger.F("warning", warning),
 					)
 				}
@@ -97,11 +99,11 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 				logger.F("profile_id", input.ProfileID),
 				logger.F("debug_port", stableDebugPort),
 				logger.F("pid", profile.Pid),
-				logger.F("proxy", plan.effectiveProxy),
+				logger.F("proxy", proxy.MaskProxySensitiveText(plan.effectiveProxy)),
 				logger.F("memory_limit_mb", profile.MemoryLimitMB),
 				logger.F("attempt", attempt),
 				logger.F("max_attempts", plan.maxStartAttempts),
-				logger.F("args", strings.Join(plan.args, " ")),
+				logger.F("args", strings.Join(maskBrowserLaunchArgs(plan.args), " ")),
 			)
 			a.emitBrowserInstanceStarted(profile, false)
 
@@ -126,8 +128,8 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 			logger.F("debug_port", plan.assignedDebugPort),
 			logger.F("attempt", attempt),
 			logger.F("max_attempts", plan.maxStartAttempts),
-			logger.F("error", readyErr.Error()),
-			logger.F("reason", startErr.Error()),
+			logger.F("error", proxy.MaskProxySensitiveText(readyErr.Error())),
+			logger.F("reason", proxy.MaskProxySensitiveText(startErr.Error())),
 		)
 
 		if attempt < plan.maxStartAttempts && shouldRetryBrowserReadyFailure(readyErr) {
@@ -196,4 +198,15 @@ func (a *App) startBrowserProfileWithPlan(input browserStartInput, plan *browser
 	startErr := fmt.Errorf("实例启动失败：浏览器在等待窗口内仍未就绪")
 	profile.LastError = startErr.Error()
 	return profile, startErr
+}
+
+func maskBrowserLaunchArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	masked := make([]string, len(args))
+	for i, arg := range args {
+		masked[i] = proxy.MaskProxySensitiveText(arg)
+	}
+	return masked
 }

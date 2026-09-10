@@ -12,6 +12,9 @@ func TestBackupImportFileTreesPreservesAppDataWhenUserDataOverlaps(t *testing.T)
 	root := t.TempDir()
 	appRoot := filepath.Join(root, "app")
 	payloadRoot := filepath.Join(root, "payload")
+	if err := os.MkdirAll(appRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Join(payloadRoot, "app", "data"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +58,9 @@ func TestBackupImportExternalCoresUsesManifestCoreIDs(t *testing.T) {
 	root := t.TempDir()
 	appRoot := filepath.Join(root, "app")
 	payloadRoot := filepath.Join(root, "payload")
+	if err := os.MkdirAll(appRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, folder := range []string{"external-01", "external-02"} {
 		if err := os.MkdirAll(filepath.Join(payloadRoot, "browser", "cores", "external", folder), 0o755); err != nil {
 			t.Fatal(err)
@@ -104,6 +110,9 @@ func TestBackupImportExternalCoresUsesMappedTargetCoreIDs(t *testing.T) {
 	root := t.TempDir()
 	appRoot := filepath.Join(root, "app")
 	payloadRoot := filepath.Join(root, "payload")
+	if err := os.MkdirAll(appRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, folder := range []string{"external-01", "external-02"} {
 		if err := os.MkdirAll(filepath.Join(payloadRoot, "browser", "cores", "external", folder), 0o755); err != nil {
 			t.Fatal(err)

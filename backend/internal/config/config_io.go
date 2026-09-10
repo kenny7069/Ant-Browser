@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -21,6 +22,23 @@ func Load(configPath string) (*Config, error) {
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+	var raw struct {
+		Browser map[string]interface{} `yaml:"browser"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("解析配置字段失败: %w", err)
+	}
+	if rawConnector, present := raw.Browser["default_connector_type"]; present {
+		value, ok := rawConnector.(string)
+		if !ok || strings.TrimSpace(value) == "" {
+			return nil, fmt.Errorf("配置字段 browser.default_connector_type 不可为空")
+		}
+		migrated, migrateErr := MigrateLegacyBrowserConnectorType(value)
+		if migrateErr != nil {
+			return nil, fmt.Errorf("配置字段 browser.default_connector_type 无效: %w", migrateErr)
+		}
+		config.Browser.DefaultConnectorType = migrated
 	}
 
 	normalizeConfig(&config)

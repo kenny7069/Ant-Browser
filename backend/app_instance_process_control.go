@@ -9,12 +9,22 @@ import (
 )
 
 func (a *App) stopBrowserProcess(cmd *exec.Cmd) error {
-	return a.stopProcessCmd(cmd)
+	return stopBrowserProcessCommand(cmd)
 }
 
 func (a *App) stopProcessCmd(cmd *exec.Cmd) error {
+	return stopBrowserProcessCommand(cmd)
+}
+
+// stopBrowserProcessCommand is shared by the Wails facade and the local
+// runtime process factory. It never reaps a command; the process owner created
+// by browserProcessMonitor is the sole Cmd.Wait caller.
+func stopBrowserProcessCommand(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
+	}
+	if handled, err := stopBrowserProcessGroup(cmd); handled {
+		return err
 	}
 
 	if stdruntime.GOOS == "windows" {
@@ -26,12 +36,17 @@ func (a *App) stopProcessCmd(cmd *exec.Cmd) error {
 				if waitProcessExitWindows(pid, 3*time.Second) {
 					return nil
 				}
-				forceKillCmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid), "/T")
-				hideWindow(forceKillCmd)
-				if forceErr := forceKillCmd.Run(); forceErr == nil {
-					_ = waitProcessExitWindows(pid, 2*time.Second)
+			}
+			// Chrome commonly rejects taskkill's non-forced termination. Always
+			// escalate to a forced tree kill instead of falling back immediately
+			// to Process.Kill, which terminates only the root PID on Windows.
+			forceKillCmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid), "/T")
+			hideWindow(forceKillCmd)
+			if forceErr := forceKillCmd.Run(); forceErr == nil {
+				if waitProcessExitWindows(pid, 2*time.Second) {
 					return nil
 				}
+				return fmt.Errorf("browser process tree %d remained alive after forced termination", pid)
 			}
 		}
 	}

@@ -10,9 +10,10 @@ import (
 var defaultBrowserStartURLs = []string{}
 
 const (
-	// BrowserConnectorXray 表示 Xray + sing-box 组合连接栈。
+	// BrowserConnectorXray 是历史 default_connector_type 的默认值。
+	// 新代理运行入口不再依赖全局连接栈，而是按单个代理使用明确的 connector policy。
 	BrowserConnectorXray = "xray"
-	// BrowserConnectorMihomo 表示独立 Mihomo 连接栈。
+	// BrowserConnectorMihomo 是独立的 Mihomo connector policy。
 	BrowserConnectorMihomo = "mihomo"
 )
 
@@ -21,15 +22,43 @@ const (
 	BrowserConnectorMihomoStack = BrowserConnectorMihomo
 )
 
-// NormalizeBrowserConnectorType 规范化连接栈配置。
+// NormalizeBrowserConnectorType 只做 canonical spelling 的 trim/lowercase，
+// 不接受 legacy alias，也不把空值或未知值静默转换成 xray。配置文件加载
+// 若需兼容旧 alias，必须只经过 MigrateLegacyBrowserConnectorType。
 func NormalizeBrowserConnectorType(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case BrowserConnectorMihomo, "clash", "clash-meta":
-		return BrowserConnectorMihomo
-	case BrowserConnectorXray, "sing-box", "singbox", "sing_box", "":
-		return BrowserConnectorXray
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+// ValidateBrowserConnectorType accepts only the exact canonical values used by
+// new settings/API input. Legacy aliases belong exclusively to config-file
+// migration and must never reach this boundary.
+func ValidateBrowserConnectorType(value string) (string, error) {
+	switch value {
+	case BrowserConnectorXray, BrowserConnectorMihomo:
+		return value, nil
 	default:
-		return BrowserConnectorXray
+		if strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("connector type is required")
+		}
+		return "", fmt.Errorf("unknown connector type: %s", strings.TrimSpace(value))
+	}
+}
+
+// MigrateLegacyBrowserConnectorType is the single config-load compatibility
+// boundary. It converts historical aliases to canonical values once in memory;
+// operation boundaries and new settings input never call it.
+func MigrateLegacyBrowserConnectorType(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case BrowserConnectorXray:
+		return BrowserConnectorXray, nil
+	case BrowserConnectorMihomo, "clash", "clash-meta":
+		return BrowserConnectorMihomo, nil
+	case "sing-box", "singbox", "sing_box":
+		return BrowserConnectorXray, nil
+	case "":
+		return "", fmt.Errorf("default_connector_type cannot be empty")
+	default:
+		return "", fmt.Errorf("unknown legacy connector type: %s", strings.TrimSpace(value))
 	}
 }
 
@@ -136,7 +165,11 @@ func normalizeConfig(config *Config) {
 	if config.Browser.StartStableWindowMs <= 0 {
 		config.Browser.StartStableWindowMs = defaultConfig.Browser.StartStableWindowMs
 	}
-	config.Browser.DefaultConnectorType = NormalizeBrowserConnectorType(config.Browser.DefaultConnectorType)
+	if strings.TrimSpace(config.Browser.DefaultConnectorType) == "" {
+		config.Browser.DefaultConnectorType = defaultConfig.Browser.DefaultConnectorType
+	} else {
+		config.Browser.DefaultConnectorType = NormalizeBrowserConnectorType(config.Browser.DefaultConnectorType)
+	}
 	if config.Browser.DefaultBookmarks == nil {
 		config.Browser.DefaultBookmarks = []BrowserBookmark{}
 	}

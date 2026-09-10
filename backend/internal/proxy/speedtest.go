@@ -39,7 +39,8 @@ var DefaultSpeedTestConfig = SpeedTestConfig{
 
 // ─── 对外入口 ───
 
-// SpeedTest 按单个代理的内核决策执行轻量 HTTP 延迟测试。
+// SpeedTest is retained for source compatibility but cannot safely infer a
+// connector. Callers must use SpeedTestWithConnector.
 func SpeedTest(
 	proxyId string,
 	proxies []config.BrowserProxy,
@@ -47,11 +48,10 @@ func SpeedTest(
 	singboxMgr *SingBoxManager,
 	cfg *SpeedTestConfig,
 ) TestResult {
-	return SpeedTestWithConnector(proxyId, proxies, xrayMgr, singboxMgr, nil, config.BrowserConnectorXray, cfg)
+	return connectorRequiredTestResult(proxyId)
 }
 
-// SpeedTestWithConnector 保留 connectorType 参数用于旧调用兼容。
-// 实际测速内核由 ResolveProxyKernel 按单个代理决定。
+// SpeedTestWithConnector requires the operation's explicit connector policy.
 func SpeedTestWithConnector(
 	proxyId string,
 	proxies []config.BrowserProxy,
@@ -61,7 +61,11 @@ func SpeedTestWithConnector(
 	connectorType string,
 	cfg *SpeedTestConfig,
 ) TestResult {
-	connectorType = config.NormalizeBrowserConnectorType(connectorType)
+	canonicalConnector, err := RequireConnectorType(connectorType)
+	if err != nil {
+		return TestResult{ProxyId: proxyId, Ok: false, Error: err.Error()}
+	}
+	connectorType = canonicalConnector
 	return lightHTTPDelayTestWithConnector(proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, cfg)
 }
 
@@ -105,11 +109,12 @@ func lightHTTPDelayTestWithConnector(
 
 	client, err := buildSpeedTestHTTPClient(src, proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, cfg)
 	if err != nil {
+		safeErr := safeProxyError(err)
 		log.Warn("代理测速 HTTP 客户端创建失败",
 			logger.F("proxy_id", proxyId),
-			logger.F("error", err.Error()),
+			logger.F("error", safeErr),
 		)
-		return TestResult{ProxyId: proxyId, Ok: false, Engine: engine, Error: err.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: engine, Error: safeErr}
 	}
 
 	var lastErr error
@@ -124,7 +129,7 @@ func lightHTTPDelayTestWithConnector(
 				logger.F("engine", engine),
 				logger.F("url", testURL),
 				logger.F("latency_ms", latency),
-				logger.F("error", err.Error()),
+				logger.F("error", safeProxyError(err)),
 			)
 			continue
 		}
@@ -149,9 +154,9 @@ func lightHTTPDelayTestWithConnector(
 	}
 
 	if lastErr != nil {
-		errorMessage := lastErr.Error()
+		errorMessage := safeProxyError(lastErr)
 		if runtimeError := speedTestRuntimeError(engine, src, proxies, proxyId, xrayMgr); runtimeError != "" {
-			errorMessage = runtimeError
+			errorMessage = maskProxySensitiveText(runtimeError)
 		}
 		log.Warn("代理测速失败",
 			logger.F("proxy_id", proxyId),
@@ -236,7 +241,7 @@ func speedTestProbeEngine(src string, proxies []config.BrowserProxy, proxyId str
 		if resolution.Kernel != "" {
 			return resolution.Kernel
 		}
-		return config.NormalizeBrowserConnectorType(connectorType)
+		return connectorType
 	}
 	if resolution.Kernel == ProxyKernelNative {
 		return "native"
@@ -278,7 +283,7 @@ func latestXrayErrorSummary(path string) string {
 		if len([]rune(line)) > 240 {
 			line = string([]rune(line)[:240]) + "..."
 		}
-		return "xray 转发失败: " + line
+		return maskProxySensitiveText("xray 转发失败: " + line)
 	}
 	return ""
 }
@@ -333,7 +338,7 @@ func mihomoURLTest(proxyId string, proxyInstance C.Proxy, testURL string, cfg *S
 
 	expectedStatus, err := speedTestExpectedStatus(cfg)
 	if err != nil {
-		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: err.Error()}
+		return TestResult{ProxyId: proxyId, Ok: false, Engine: "mihomo", Error: safeProxyError(err)}
 	}
 
 	adapter.UnifiedDelay.Store(true)
@@ -347,7 +352,7 @@ func mihomoURLTest(proxyId string, proxyInstance C.Proxy, testURL string, cfg *S
 	}
 	if err != nil || delay == 0 {
 		if err != nil {
-			return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Engine: "mihomo", Error: err.Error()}
+			return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Engine: "mihomo", Error: safeProxyError(err)}
 		}
 		return TestResult{ProxyId: proxyId, Ok: false, LatencyMs: latency, Engine: "mihomo", Error: "mihomo 延迟测试无结果"}
 	}

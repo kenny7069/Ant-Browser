@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -64,7 +65,7 @@ func buildProxyHTTPClientContext(
 	if err != nil {
 		log.Warn("代理内核解析失败",
 			logger.F("proxy_id", proxyId),
-			logger.F("error", err.Error()),
+			logger.F("error", safeProxyError(err)),
 		)
 		return nil, err
 	}
@@ -77,35 +78,8 @@ func buildProxyHTTPClientContext(
 		logger.F("reason", resolution.Reason),
 	)
 	l := strings.ToLower(strings.TrimSpace(src))
-	if resolution.Kernel == ProxyKernelNative || l == "" || l == "direct://" {
-		if strings.HasPrefix(l, "socks5://") {
-			u, err := url.Parse(src)
-			if err != nil {
-				return nil, fmt.Errorf("SOCKS5 地址解析失败: %w", err)
-			}
-			var auth *xproxy.Auth
-			if u.User != nil {
-				pass, _ := u.User.Password()
-				auth = &xproxy.Auth{User: u.User.Username(), Password: pass}
-			}
-			dialer, err := xproxy.SOCKS5("tcp", u.Host, auth, xproxy.Direct)
-			if err != nil {
-				return nil, fmt.Errorf("SOCKS5 dialer 创建失败: %w", err)
-			}
-			contextDialer, ok := dialer.(xproxy.ContextDialer)
-			if !ok {
-				return nil, fmt.Errorf("SOCKS5 dialer 不支持 ContextDialer")
-			}
-			return &http.Client{Transport: &http.Transport{DialContext: contextDialer.DialContext}, Timeout: timeout}, nil
-		}
-		if strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://") {
-			proxyURL, err := url.Parse(src)
-			if err != nil {
-				return nil, fmt.Errorf("代理地址解析失败: %w", err)
-			}
-			return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}, Timeout: timeout}, nil
-		}
-		return &http.Client{Timeout: timeout}, nil
+	if l == "direct://" {
+		return BuildDirectHTTPClient(timeout), nil
 	}
 
 	switch resolution.Kernel {
@@ -116,10 +90,10 @@ func buildProxyHTTPClientContext(
 		}
 		proxyAddr, err := clashMgr.EnsureNodeBridgeContext(ctx, src, proxies, proxyId)
 		if err != nil {
-			log.Warn("Mihomo 桥接启动失败", logger.F("proxy_id", proxyId), logger.F("error", err.Error()))
+			log.Warn("Mihomo 桥接启动失败", logger.F("proxy_id", proxyId), logger.F("error", safeProxyError(err)))
 			return nil, fmt.Errorf("Mihomo 桥接启动失败: %w", err)
 		}
-		log.Info("Mihomo 桥接已就绪", logger.F("proxy_id", proxyId), logger.F("proxy_addr", proxyAddr))
+		log.Info("Mihomo 桥接已就绪", logger.F("proxy_id", proxyId), logger.F("proxy_addr", safeProxyURI(proxyAddr)))
 		return buildHTTPProxyClient(proxyAddr, timeout)
 	case ProxyKernelSingBox:
 		if singboxMgr == nil {
@@ -128,10 +102,10 @@ func buildProxyHTTPClientContext(
 		}
 		socks5Addr, err := singboxMgr.EnsureBridgeContext(ctx, src, proxies, proxyId)
 		if err != nil {
-			log.Warn("sing-box 桥接启动失败", logger.F("proxy_id", proxyId), logger.F("error", err.Error()))
+			log.Warn("sing-box 桥接启动失败", logger.F("proxy_id", proxyId), logger.F("error", safeProxyError(err)))
 			return nil, fmt.Errorf("sing-box 桥接启动失败: %w", err)
 		}
-		log.Info("sing-box 桥接已就绪", logger.F("proxy_id", proxyId), logger.F("socks5_addr", socks5Addr))
+		log.Info("sing-box 桥接已就绪", logger.F("proxy_id", proxyId), logger.F("socks5_addr", safeProxyURI(socks5Addr)))
 		return buildSocks5HTTPClient(strings.TrimPrefix(socks5Addr, "socks5://"), timeout)
 	case ProxyKernelXray:
 		if xrayMgr == nil {
@@ -140,13 +114,23 @@ func buildProxyHTTPClientContext(
 		}
 		socks5Addr, err := xrayMgr.EnsureBridgeContext(ctx, src, proxies, proxyId)
 		if err != nil {
-			log.Warn("xray 桥接启动失败", logger.F("proxy_id", proxyId), logger.F("error", err.Error()))
+			log.Warn("xray 桥接启动失败", logger.F("proxy_id", proxyId), logger.F("error", safeProxyError(err)))
 			return nil, fmt.Errorf("xray 桥接启动失败: %w", err)
 		}
-		log.Info("xray 桥接已就绪", logger.F("proxy_id", proxyId), logger.F("socks5_addr", socks5Addr))
+		log.Info("xray 桥接已就绪", logger.F("proxy_id", proxyId), logger.F("socks5_addr", safeProxyURI(socks5Addr)))
 		return buildSocks5HTTPClient(strings.TrimPrefix(socks5Addr, "socks5://"), timeout)
 	default:
 		return nil, fmt.Errorf("无法为协议 %s 选择代理内核", resolution.Protocol)
+	}
+}
+
+// BuildDirectHTTPClient is the only non-stack HTTP client exception. It does
+// not consult HTTP(S)_PROXY or any system proxy configuration.
+func BuildDirectHTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return &http.Client{
+		Transport: &http.Transport{DialContext: dialer.DialContext},
+		Timeout:   timeout,
 	}
 }
 

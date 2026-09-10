@@ -135,7 +135,7 @@ plugin-opts:
 	if RequiresBridge(src, nil, "") {
 		t.Fatalf("SS plugin node must not require Xray bridge")
 	}
-	ok, msg := ValidateProxyConfig(src, nil, "")
+	ok, msg := ValidateProxyConfigForConnector(src, nil, "", config.BrowserConnectorMihomo)
 	if !ok {
 		t.Fatalf("ValidateProxyConfig rejected SS plugin node: %s", msg)
 	}
@@ -164,7 +164,7 @@ public-key: public
 	if RequiresBridge(src, nil, "") {
 		t.Fatalf("WireGuard node must not require Xray bridge")
 	}
-	ok, msg := ValidateProxyConfig(src, nil, "")
+	ok, msg := ValidateProxyConfigForConnector(src, nil, "", config.BrowserConnectorMihomo)
 	if !ok {
 		t.Fatalf("ValidateProxyConfig rejected WireGuard node: %s", msg)
 	}

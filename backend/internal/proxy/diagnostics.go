@@ -68,13 +68,18 @@ func BuildProxyDiagnostic(proxyConfig string, proxies []config.BrowserProxy, pro
 	if found {
 		result.ProxyName = item.ProxyName
 	}
+	connectorType, connectorErr := RequireConnectorType(options.ConnectorType)
+	if connectorErr != nil {
+		result.Errors = append(result.Errors, safeProxyError(connectorErr))
+		return result
+	}
+	options.ConnectorType = connectorType
 	if proxyId != "" && !found && src == "" {
 		result.Errors = append(result.Errors, fmt.Sprintf("代理池节点已不存在: %s", proxyId))
 		return result
 	}
 	if src == "" {
-		result.Engine = "empty"
-		result.Ok = true
+		result.Errors = append(result.Errors, "代理配置为空")
 		return result
 	}
 	if strings.EqualFold(src, "direct://") {
@@ -85,10 +90,9 @@ func BuildProxyDiagnostic(proxyConfig string, proxies []config.BrowserProxy, pro
 
 	src = normalizeNodeScheme(src)
 	result.RawConfigMasked = maskProxyConfig(src)
-	connectorType := config.NormalizeBrowserConnectorType(options.ConnectorType)
-	resolution, err := ResolveProxyKernelForConnector(src, proxies, proxyId, connectorType)
+	resolution, err := ResolveProxyKernelForConnector(src, proxies, proxyId, options.ConnectorType)
 	if err != nil {
-		result.Errors = append(result.Errors, err.Error())
+		result.Errors = append(result.Errors, safeProxyError(err))
 		return result
 	}
 	switch resolution.Kernel {
@@ -115,7 +119,7 @@ func buildMihomoDiagnostic(src string, manager *ClashManager, result *ProxyBuild
 	result.Engine = "mihomo"
 	node, err := buildMihomoNode(src)
 	if err != nil {
-		result.Errors = append(result.Errors, err.Error())
+		result.Errors = append(result.Errors, safeProxyError(err))
 		return
 	}
 	result.Ok = true
@@ -132,7 +136,7 @@ func buildSingBoxDiagnostic(src string, manager *SingBoxManager, result *ProxyBu
 	result.Engine = "sing-box"
 	outbound, err := BuildSingBoxOutbound(src)
 	if err != nil {
-		result.Errors = append(result.Errors, err.Error())
+		result.Errors = append(result.Errors, safeProxyError(err))
 		return
 	}
 	result.Ok = true
@@ -151,7 +155,7 @@ func buildXrayDiagnostic(src string, proxies []config.BrowserProxy, proxyId stri
 	if IsChainSocks5Proxy(src) {
 		chainCfg, err := ParseChainSocks5Config(src)
 		if err != nil {
-			result.Errors = append(result.Errors, err.Error())
+			result.Errors = append(result.Errors, safeProxyError(err))
 			return
 		}
 		result.Outbounds = []interface{}{
@@ -160,7 +164,7 @@ func buildXrayDiagnostic(src string, proxies []config.BrowserProxy, proxyId stri
 		}
 		result.Routes = []interface{}{map[string]interface{}{"type": "field", "inboundTag": []string{"socks-in"}, "outboundTag": "second-hop"}}
 	} else if outbound, shouldBridge, err := buildDirectProxyBridgeOutbound(src); err != nil {
-		result.Errors = append(result.Errors, err.Error())
+		result.Errors = append(result.Errors, safeProxyError(err))
 		return
 	} else if shouldBridge {
 		result.Outbounds = []interface{}{sanitizeDiagnosticMap(outbound)}
@@ -168,7 +172,7 @@ func buildXrayDiagnostic(src string, proxies []config.BrowserProxy, proxyId stri
 	} else {
 		standardProxy, outbound, err := ParseProxyNode(src)
 		if err != nil {
-			result.Errors = append(result.Errors, err.Error())
+			result.Errors = append(result.Errors, safeProxyError(err))
 			return
 		}
 		if standardProxy != "" {
@@ -222,13 +226,13 @@ func buildRuntimeDiagnostic(workDir string, configName string, stderrName string
 		runtime.ErrorPath = filepath.Join(workDir, errorName)
 	}
 	if tail := readLogTail(runtime.StderrPath, 2000); tail != "" {
-		runtime.RecentLogs["stderr"] = tail
+		runtime.RecentLogs["stderr"] = maskProxySensitiveText(tail)
 	}
 	if tail := readLogTail(runtime.LogPath, 2000); tail != "" {
-		runtime.RecentLogs["log"] = tail
+		runtime.RecentLogs["log"] = maskProxySensitiveText(tail)
 	}
 	if tail := readLogTail(runtime.ErrorPath, 2000); tail != "" {
-		runtime.RecentLogs["error"] = tail
+		runtime.RecentLogs["error"] = maskProxySensitiveText(tail)
 	}
 	return runtime
 }
@@ -242,7 +246,7 @@ func fillXrayBridgeState(manager *XrayManager, key string, runtime *ProxyRuntime
 	}
 	runtime.BridgeAlive = bridge.Running && !bridge.Stopping
 	runtime.BridgePort = bridge.Port
-	runtime.LastError = bridge.LastError
+	runtime.LastError = maskProxySensitiveText(bridge.LastError)
 }
 
 func fillSingBoxBridgeState(manager *SingBoxManager, key string, runtime *ProxyRuntimeDiagnostic) {
@@ -254,7 +258,7 @@ func fillSingBoxBridgeState(manager *SingBoxManager, key string, runtime *ProxyR
 	}
 	runtime.BridgeAlive = bridge.Running && !bridge.Stopping
 	runtime.BridgePort = bridge.Port
-	runtime.LastError = bridge.LastError
+	runtime.LastError = maskProxySensitiveText(bridge.LastError)
 }
 
 func fillMihomoBridgeState(manager *ClashManager, key string, runtime *ProxyRuntimeDiagnostic) {
@@ -267,7 +271,7 @@ func fillMihomoBridgeState(manager *ClashManager, key string, runtime *ProxyRunt
 	runtime.BridgeAlive = bridge.Running
 	runtime.BridgePort = bridge.Port
 	if bridge.ExitErr != nil {
-		runtime.LastError = bridge.ExitErr.Error()
+		runtime.LastError = safeProxyError(bridge.ExitErr)
 	}
 }
 
@@ -336,7 +340,7 @@ func maskProxyConfig(src string) string {
 	}
 	parsed, err := url.Parse(src)
 	if err != nil || parsed.Scheme == "" {
-		return src
+		return maskProxySensitiveText(src)
 	}
 	if parsed.User != nil {
 		username := parsed.User.Username()
@@ -352,5 +356,5 @@ func maskProxyConfig(src string) string {
 		}
 	}
 	parsed.RawQuery = query.Encode()
-	return strings.ReplaceAll(parsed.String(), "%2A%2A%2A", "***")
+	return maskProxySensitiveText(strings.ReplaceAll(parsed.String(), "%2A%2A%2A", "***"))
 }

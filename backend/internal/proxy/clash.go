@@ -12,12 +12,15 @@ import (
 
 // ClashManager Clash 进程管理器
 type ClashManager struct {
-	Config      *config.Config
-	AppRoot     string // 应用根目录，所有相对路径基于此解析
-	Processes   map[string]*exec.Cmd
-	NodeBridges map[string]*MihomoNodeBridge
-	mu          sync.Mutex
-	launchLocks map[string]*bridgeLaunchLock
+	Config                  *config.Config
+	AppRoot                 string // 应用根目录，所有相对路径基于此解析
+	Processes               map[string]*exec.Cmd
+	NodeBridges             map[string]*MihomoNodeBridge
+	mu                      sync.Mutex
+	launchLocks             map[string]*bridgeLaunchLock
+	runtimeConfigWriter     *secureRuntimeWriter
+	runtimeConfigWriterOnce sync.Once
+	runtimeConfigWriterErr  error
 }
 
 // NewClashManager 创建 Clash 管理器
@@ -29,6 +32,16 @@ func NewClashManager(cfg *config.Config, appRoot string) *ClashManager {
 		NodeBridges: make(map[string]*MihomoNodeBridge),
 		launchLocks: make(map[string]*bridgeLaunchLock),
 	}
+}
+
+func (m *ClashManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) {
+	if m == nil {
+		return nil, fmt.Errorf("mihomo 管理器未初始化")
+	}
+	m.runtimeConfigWriterOnce.Do(func() {
+		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriterForApp("mihomo", m.AppRoot)
+	})
+	return m.runtimeConfigWriter, m.runtimeConfigWriterErr
 }
 
 // ClashProfile Clash 配置接口

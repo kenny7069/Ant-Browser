@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"ant-chrome/backend/internal/apppath"
 	"ant-chrome/backend/internal/fsutil"
 	"encoding/json"
 	"fmt"
@@ -80,8 +79,12 @@ func (m *SingBoxManager) resolveBinary() (string, error) {
 }
 
 func (m *SingBoxManager) buildConfig(key string, outbound map[string]interface{}, port int) (string, error) {
-	baseDir := m.resolveWorkdir(key)
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
+	writer, err := m.getSecureRuntimeWriter()
+	if err != nil {
+		return "", err
+	}
+	baseDir, err := writer.runtimeDir(key)
+	if err != nil {
 		return "", err
 	}
 
@@ -128,7 +131,10 @@ func (m *SingBoxManager) buildConfig(key string, outbound map[string]interface{}
 	}
 
 	cfgPath := filepath.Join(baseDir, "singbox-config.json")
-	if err := os.WriteFile(cfgPath, data, 0644); err != nil {
+	if _, err := writer.writeAtomic(key, filepath.Base(cfgPath), data); err != nil {
+		return "", err
+	}
+	if _, err := writer.ensureLog(key, "singbox.log"); err != nil {
 		return "", err
 	}
 	return cfgPath, nil
@@ -154,12 +160,9 @@ func defaultSingBoxDNSConfig() map[string]interface{} {
 }
 
 func (m *SingBoxManager) resolveWorkdir(key string) string {
-	root := strings.TrimSpace(m.Config.Browser.UserDataRoot)
-	if root == "" {
-		root = "data"
+	writer, err := m.getSecureRuntimeWriter()
+	if err != nil {
+		return ""
 	}
-	if !filepath.IsAbs(root) {
-		root = apppath.Resolve(m.AppRoot, root)
-	}
-	return filepath.Join(root, "_singbox", key)
+	return writer.runtimeDirIfExists(key)
 }

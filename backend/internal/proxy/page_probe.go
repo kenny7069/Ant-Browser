@@ -44,6 +44,7 @@ func ProbeBrowserPageConnectivity(
 	xrayMgr *XrayManager,
 	singboxMgr *SingBoxManager,
 	clashMgr *ClashManager,
+	connectorType string,
 	cfg *BrowserPageProbeConfig,
 ) BrowserPageProbeResult {
 	return ProbeBrowserPageConnectivityWithConnector(proxyId, proxies, xrayMgr, singboxMgr, clashMgr, config.BrowserConnectorXray, cfg)
@@ -61,7 +62,7 @@ func ProbeBrowserPageConnectivityWithConnector(
 	normalized := normalizeBrowserPageProbeConfig(cfg)
 	client, err := buildProxyHTTPClient("", proxyId, proxies, xrayMgr, singboxMgr, clashMgr, connectorType, normalized.Timeout)
 	if err != nil {
-		return BrowserPageProbeResult{ProxyId: proxyId, Ok: false, Error: err.Error(), Concurrency: normalized.Concurrency}
+		return BrowserPageProbeResult{ProxyId: proxyId, Ok: false, Error: safeProxyError(err), Concurrency: normalized.Concurrency}
 	}
 	return runBrowserPageProbe(proxyId, client, normalized)
 }

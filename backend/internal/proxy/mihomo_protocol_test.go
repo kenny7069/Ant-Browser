@@ -30,7 +30,7 @@ func TestMieruClashNodeIsMihomoOnlyProtocol(t *testing.T) {
 	if RequiresBridge(mieruClashNode, nil, "") {
 		t.Fatalf("mieru must not require xray bridge")
 	}
-	ok, msg := ValidateProxyConfig(mieruClashNode, nil, "")
+	ok, msg := ValidateProxyConfigForConnector(mieruClashNode, nil, "", config.BrowserConnectorMihomo)
 	if !ok {
 		t.Fatalf("ValidateProxyConfig rejected mieru node: %s", msg)
 	}
@@ -86,10 +86,10 @@ func TestMieruSpeedTestRequiresMihomoConnector(t *testing.T) {
 		t.Fatalf("speed test should fail without mihomo connector, got success: %+v", result)
 	}
 	if result.Engine != config.BrowserConnectorMihomo {
-		t.Fatalf("engine = %q, want mihomo; result=%+v", result.Engine, result)
+		t.Fatalf("engine = %q, want mihomo connector boundary; result=%+v", result.Engine, result)
 	}
-	if !strings.Contains(result.Error, "Mihomo") {
-		t.Fatalf("error = %q, want Mihomo guidance", result.Error)
+	if !strings.Contains(result.Error, "Mihomo 管理器未初始化") {
+		t.Fatalf("error = %q, want missing mihomo manager", result.Error)
 	}
 }
 
