@@ -16,14 +16,17 @@ const (
 
 // XrayManager Xray 桥接管理器
 type XrayManager struct {
-	Config       *config.Config
-	AppRoot      string // 应用根目录，所有相对路径基于此解析
-	Bridges      map[string]*XrayBridge
-	OnBridgeDied func(key string, err error) // 桥接进程意外退出回调
-	mu           sync.Mutex
-	launchLocks  map[string]*bridgeLaunchLock
-	stopCh       chan struct{}
-	stopOnce     sync.Once
+	Config                  *config.Config
+	AppRoot                 string // 应用根目录，所有相对路径基于此解析
+	Bridges                 map[string]*XrayBridge
+	OnBridgeDied            func(key string, err error) // 桥接进程意外退出回调
+	mu                      sync.Mutex
+	launchLocks             map[string]*bridgeLaunchLock
+	stopCh                  chan struct{}
+	stopOnce                sync.Once
+	runtimeConfigWriter     *secureRuntimeWriter
+	runtimeConfigWriterOnce sync.Once
+	runtimeConfigWriterErr  error
 }
 
 // NewXrayManager 创建 Xray 管理器
@@ -39,17 +42,31 @@ func NewXrayManager(cfg *config.Config, appRoot string) *XrayManager {
 	return manager
 }
 
-// ValidateProxyConfig 验证代理配置是否支持
-// 返回: supported bool, errorMsg string
+func (m *XrayManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) {
+	if m == nil {
+		return nil, fmt.Errorf("xray 管理器未初始化")
+	}
+	m.runtimeConfigWriterOnce.Do(func() {
+		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriterForApp("xray", m.AppRoot)
+	})
+	return m.runtimeConfigWriter, m.runtimeConfigWriterErr
+}
+
+// ValidateProxyConfig is retained for source compatibility and deliberately
+// fails closed because validation without an operation connector is unsafe.
 func ValidateProxyConfig(proxyConfig string, proxies []config.BrowserProxy, proxyId string) (bool, string) {
+	return false, ErrConnectorTypeRequired.Error()
+}
+
+// ValidateProxyConfigForConnector validates a proxy against the same explicit
+// connector policy used by launch, warmup, and HTTP operations.
+func ValidateProxyConfigForConnector(proxyConfig string, proxies []config.BrowserProxy, proxyId string, connectorType string) (bool, string) {
 	src := strings.TrimSpace(proxyConfig)
-	preferredKernel := ""
 	if proxyId != "" {
 		found := false
 		for _, item := range proxies {
 			if strings.EqualFold(item.ProxyId, proxyId) {
 				src = strings.TrimSpace(item.ProxyConfig)
-				preferredKernel = strings.TrimSpace(item.PreferredKernel)
 				found = true
 				break
 			}
@@ -60,13 +77,13 @@ func ValidateProxyConfig(proxyConfig string, proxies []config.BrowserProxy, prox
 			}
 		}
 	}
-	if resolution, err := ResolveProxyKernel(src, proxies, "", preferredKernel); err != nil {
-		return false, fmt.Sprintf("代理配置解析失败: %v", err)
+	if resolution, err := ResolveProxyKernelForConnector(src, proxies, proxyId, connectorType); err != nil {
+		return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 	} else if len(resolution.SupportedKernels) == 0 {
 		return false, "代理配置无效"
 	}
 	if src == "" {
-		return true, ""
+		return false, "代理配置为空"
 	}
 	if strings.EqualFold(src, "direct://") {
 		return true, ""
@@ -77,26 +94,26 @@ func ValidateProxyConfig(proxyConfig string, proxies []config.BrowserProxy, prox
 	}
 	if IsChainSocks5Proxy(src) {
 		if _, err := ParseChainSocks5Config(src); err != nil {
-			return false, fmt.Sprintf("链式代理配置解析失败: %v", err)
+			return false, maskProxySensitiveText(fmt.Sprintf("链式代理配置解析失败: %v", err))
 		}
 		return true, ""
 	}
 	if IsSingBoxProtocol(src) {
 		if _, err := BuildSingBoxOutbound(src); err != nil {
-			return false, fmt.Sprintf("代理配置解析失败: %v", err)
+			return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 		}
 		return true, ""
 	}
 	if IsMihomoOnlyProtocol(src) {
 		if err := validateMihomoOnlyProtocol(src); err != nil {
-			return false, fmt.Sprintf("代理配置解析失败: %v", err)
+			return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 		}
 		return true, ""
 	}
 
 	standardProxy, outbound, err := ParseProxyNode(src)
 	if err != nil {
-		return false, fmt.Sprintf("代理配置解析失败: %v", err)
+		return false, maskProxySensitiveText(fmt.Sprintf("代理配置解析失败: %v", err))
 	}
 	if strings.TrimSpace(standardProxy) == "" && outbound == nil {
 		return false, "代理配置无效"

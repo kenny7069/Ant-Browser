@@ -1,0 +1,22 @@
+# Copy to %LOCALAPPDATA%\AntFarmClient\client.yaml, replace every REPLACE
+# value, then run `ant-farm-client.exe -config <absolute-path> -enroll`.
+application_root: 'C:\REPLACE\WITH\ANT\APPLICATION\ROOT'
+state_root: 'C:\Users\REPLACE\AppData\Local\AntFarmClient'
+ant_config_path: 'C:\REPLACE\WITH\ANT\config.yaml'
+control_url: wss://REPLACE.example/control/ws
+enrollment_url: https://REPLACE.example/api/farm/enroll
+pairing_url: https://REPLACE.example/api/farm/pair
+update_manifest_url: https://REPLACE.example/farm-client/stable.json
+update_public_key: REPLACE-BASE64-ED25519-PUBLIC-KEY
+update_channel: stable
+update_check_interval_ms: 900000
+update_health_timeout_ms: 90000
+update_probation_ms: 60000
+node_name: REPLACE-NODE-NAME
+identity:
+  node_uid: REPLACE-NODE-UID
+  private_key_ref: antfarm:v1:REPLACE-KEY-REFERENCE
+shutdown_timeout_ms: 30000
+heartbeat_interval_ms: 5000
+reconnect_min_backoff_ms: 1000
+reconnect_max_backoff_ms: 30000

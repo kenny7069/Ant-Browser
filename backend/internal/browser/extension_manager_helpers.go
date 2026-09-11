@@ -36,7 +36,7 @@ func extractExtensionIDFromURL(rawURL string) string {
 
 func downloadChromeExtensionCRX(ctx context.Context, extensionID string, client *http.Client) ([]byte, error) {
 	if client == nil {
-		client = &http.Client{Timeout: extensionDownloadTimeout}
+		return nil, fmt.Errorf("extension download requires an explicit HTTP client")
 	}
 	downloadURL := BuildChromeExtensionDownloadURL(extensionID)
 	var lastErr error
@@ -59,6 +59,9 @@ func downloadChromeExtensionCRX(ctx context.Context, extensionID string, client 
 }
 
 func downloadChromeExtensionCRXOnce(ctx context.Context, client *http.Client, downloadURL string) ([]byte, error) {
+	if client == nil {
+		return nil, fmt.Errorf("extension download requires an explicit HTTP client")
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return nil, err

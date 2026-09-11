@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"ant-chrome/backend/internal/config"
+	"fmt"
 	"os/exec"
 	"sync"
 	"time"
@@ -28,20 +29,25 @@ type SingBoxBridge struct {
 	RestartCount int
 	ExitDone     chan struct{}
 	ExitErr      error
+	Runtime      *secureRuntimeHandle
+	RuntimeToken uint64
 	exitMu       sync.Mutex
 	waitOnce     sync.Once
 }
 
 // SingBoxManager sing-box 桥接管理器
 type SingBoxManager struct {
-	Config       *config.Config
-	AppRoot      string // 应用根目录，所有相对路径基于此解析
-	Bridges      map[string]*SingBoxBridge
-	OnBridgeDied func(key string, err error)
-	mu           sync.Mutex
-	launchLocks  map[string]*bridgeLaunchLock
-	stopCh       chan struct{}
-	stopOnce     sync.Once
+	Config                  *config.Config
+	AppRoot                 string // 应用根目录，所有相对路径基于此解析
+	Bridges                 map[string]*SingBoxBridge
+	OnBridgeDied            func(key string, err error)
+	mu                      sync.Mutex
+	launchLocks             map[string]*bridgeLaunchLock
+	stopCh                  chan struct{}
+	stopOnce                sync.Once
+	runtimeConfigWriter     *secureRuntimeWriter
+	runtimeConfigWriterOnce sync.Once
+	runtimeConfigWriterErr  error
 }
 
 // NewSingBoxManager 创建 sing-box 管理器
@@ -55,4 +61,14 @@ func NewSingBoxManager(cfg *config.Config, appRoot string) *SingBoxManager {
 	}
 	go manager.cleanupLoop()
 	return manager
+}
+
+func (m *SingBoxManager) getSecureRuntimeWriter() (*secureRuntimeWriter, error) {
+	if m == nil {
+		return nil, fmt.Errorf("sing-box 管理器未初始化")
+	}
+	m.runtimeConfigWriterOnce.Do(func() {
+		m.runtimeConfigWriter, m.runtimeConfigWriterErr = newSecureRuntimeWriterForApp("singbox", m.AppRoot)
+	})
+	return m.runtimeConfigWriter, m.runtimeConfigWriterErr
 }

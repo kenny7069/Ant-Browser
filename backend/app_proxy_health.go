@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/proxy"
 	"encoding/json"
 	"fmt"
@@ -81,14 +80,31 @@ func (a *App) BrowserProxyBatchTestSpeed(proxyIds []string, concurrency int) []P
 }
 
 func (a *App) testProxySpeedWithConnector(proxyId string, proxies []BrowserProxy, connectorType string) proxy.TestResult {
-	return proxy.SpeedTestWithConnector(proxyId, proxies, a.xrayMgr, a.singboxMgr, a.clashMgr, config.NormalizeBrowserConnectorType(connectorType), a.proxySpeedTestConfig())
+	return proxy.SpeedTestWithConnector(proxyId, proxies, a.xrayMgr, a.singboxMgr, a.clashMgr, connectorType, a.proxySpeedTestConfig())
 }
 
 func (a *App) defaultProxyConnectorType() string {
 	if a == nil || a.config == nil {
-		return config.BrowserConnectorXray
+		return ""
 	}
-	return config.NormalizeBrowserConnectorType(a.config.Browser.DefaultConnectorType)
+	connectorType, err := proxy.RequireConnectorType(a.config.Browser.DefaultConnectorType)
+	if err != nil {
+		return ""
+	}
+	return connectorType
+}
+
+// resolveOperationConnector permits only the configured browser default at a
+// compatibility boundary; operation implementations always receive a
+// canonical, explicit connector value.
+func (a *App) resolveOperationConnector(value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		if connectorType := a.defaultProxyConnectorType(); connectorType != "" {
+			return connectorType, nil
+		}
+		return "", fmt.Errorf("connector type is required")
+	}
+	return proxy.RequireConnectorType(value)
 }
 
 // BrowserProxyCheckIPHealth 检测单个代理的出口 IP 健康信息

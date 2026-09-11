@@ -15,11 +15,12 @@ import (
 )
 
 type ProxyCoreDownloadRequest struct {
-	Core        string `json:"core"`
-	GOOS        string `json:"goos"`
-	GOARCH      string `json:"goarch"`
-	ProxyConfig string `json:"proxyConfig"`
-	Version     string `json:"version"`
+	Core          string `json:"core"`
+	GOOS          string `json:"goos"`
+	GOARCH        string `json:"goarch"`
+	ProxyConfig   string `json:"proxyConfig"`
+	ConnectorType string `json:"connectorType"`
+	Version       string `json:"version"`
 }
 
 type ProxyCoreDownloadProgress struct {
@@ -76,10 +77,14 @@ func (a *App) BrowserProxyCoreDownload(input ProxyCoreDownloadRequest) error {
 		return err
 	}
 	version := normalizeProxyCoreVersion(input.Version, spec.Version)
+	connectorType, err := a.resolveOperationConnector(input.ConnectorType)
+	if err != nil {
+		return err
+	}
 	a.maintenanceMu.Lock()
 	defer a.maintenanceMu.Unlock()
 	return a.startBackgroundTask(func(ctx context.Context) {
-		a.downloadProxyCore(ctx, spec, target, input.ProxyConfig, version)
+		a.downloadProxyCore(ctx, spec, target, input.ProxyConfig, version, connectorType)
 	})
 }
 
@@ -108,7 +113,12 @@ func (a *App) BrowserProxyCoreDownloadInfo(input ProxyCoreDownloadRequest) Proxy
 	info := proxyCoreDownloadInfoBase(a, spec, target)
 	info.Version = version
 	info.ReleaseURL = proxyCoreReleaseURL(spec.Repo, version)
-	client, _, err := a.unifiedProxyCoreHTTPClient(30*time.Second, input.ProxyConfig)
+	connectorType, err := a.resolveOperationConnector(input.ConnectorType)
+	if err != nil {
+		info.Message = manualProxyCoreDownloadMessage(spec, target, "下载代理连接栈错误: "+err.Error())
+		return info
+	}
+	client, _, err := a.proxyCoreHTTPClient(30*time.Second, input.ProxyConfig, connectorType)
 	if err != nil {
 		info.Message = manualProxyCoreDownloadMessage(spec, target, "下载代理配置错误: "+err.Error())
 		return info
@@ -202,12 +212,12 @@ func normalizeProxyCoreSpec(core string) (proxyCoreSpec, error) {
 	}
 }
 
-func (a *App) downloadProxyCore(ctx context.Context, spec proxyCoreSpec, target proxyCoreTarget, proxyConfig string, version string) {
+func (a *App) downloadProxyCore(ctx context.Context, spec proxyCoreSpec, target proxyCoreTarget, proxyConfig string, version string, connectorType string) {
 	log := logger.New("ProxyCore")
 	send := func(phase string, progress int, message string) {
 		a.emitRuntimeEvent("proxy-core:download:progress", ProxyCoreDownloadProgress{Core: spec.Core, GOOS: target.GOOS, GOARCH: target.GOARCH, Phase: phase, Progress: progress, Message: message})
 	}
-	client, proxyLabel, err := a.unifiedProxyCoreHTTPClient(90*time.Second, proxyConfig)
+	client, proxyLabel, err := a.proxyCoreHTTPClient(90*time.Second, proxyConfig, connectorType)
 	if err != nil {
 		send("error", 0, "下载代理配置错误: "+err.Error())
 		return

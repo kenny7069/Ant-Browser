@@ -84,6 +84,7 @@ func (m *Manager) copyProfile(profileId string, newName string, fingerprintResol
 
 	profile := &Profile{
 		ProfileId:          newId,
+		IncarnationID:      uuid.NewString(),
 		ProfileName:        profileName,
 		UserDataDir:        newId,
 		CoreId:             normalizeProfileCoreID(src.CoreId),

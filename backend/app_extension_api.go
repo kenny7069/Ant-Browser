@@ -2,7 +2,6 @@ package backend
 
 import (
 	"ant-chrome/backend/internal/browser"
-	"ant-chrome/backend/internal/config"
 	"ant-chrome/backend/internal/logger"
 	"ant-chrome/backend/internal/proxy"
 	"fmt"
@@ -206,15 +205,16 @@ func (a *App) extensionDownloadHTTPClient(useProxy bool, proxyConfig string) (*h
 	}
 	if proxyConfig == "" || strings.EqualFold(proxyConfig, "direct://") {
 		log.Info("Chrome 插件下载使用直连")
-		client, _, err := proxyCoreHTTPClient(browser.ExtensionDownloadTimeout(), "")
+		connectorType, connectorErr := a.resolveOperationConnector("")
+		if connectorErr != nil {
+			return nil, connectorErr
+		}
+		client, _, err := a.proxyCoreHTTPClient(browser.ExtensionDownloadTimeout(), "direct://", connectorType)
 		return client, err
 	}
 	proxies := a.getLatestProxies()
-	connectorType := config.BrowserConnectorXray
-	if a != nil && a.config != nil {
-		connectorType = a.config.Browser.DefaultConnectorType
-	}
-	log.Info("Chrome 插件下载使用代理", logger.F("connector", connectorType), logger.F("proxy_prefix", proxyConfigLogPrefix(proxyConfig)))
+	connectorType := a.defaultProxyConnectorType()
+	log.Info("Chrome 插件下载使用代理", logger.F("connector", connectorType), logger.F("proxy_prefix", proxyConfigLogPrefix(proxy.MaskProxySensitiveText(proxyConfig))))
 	return proxy.BuildProxyHTTPClient(proxyConfig, "", proxies, a.xrayMgr, a.singboxMgr, a.clashMgr, connectorType, browser.ExtensionDownloadTimeout())
 }
 

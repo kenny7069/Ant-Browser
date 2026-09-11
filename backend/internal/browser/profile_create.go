@@ -38,6 +38,7 @@ func (m *Manager) Create(input ProfileInput) (*Profile, error) {
 	}
 	profile := &Profile{
 		ProfileId:          profileId,
+		IncarnationID:      uuid.NewString(),
 		ProfileName:        input.ProfileName,
 		UserDataDir:        userDataDir,
 		CoreId:             coreId,

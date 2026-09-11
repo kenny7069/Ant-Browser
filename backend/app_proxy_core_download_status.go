@@ -56,9 +56,6 @@ func proxyCoreIsActive(a *App, spec proxyCoreSpec) bool {
 		return false
 	}
 	current := strings.ToLower(strings.TrimSpace(a.config.Browser.DefaultConnectorType))
-	if current == "" {
-		current = "xray"
-	}
 	switch spec.Core {
 	case "xray":
 		return current == "xray"

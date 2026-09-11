@@ -1,0 +1,149 @@
+name: Publish Farm Client Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version
+        required: false
+        default: "1.5.0"
+        type: string
+  push:
+    branches: ["farm-client-dev"]
+    tags: ["farm-client-v*"]
+
+permissions:
+  contents: write
+
+env:
+  FARM_CLIENT_CI_VERSION: "1.5.1"
+
+concurrency:
+  group: publish-farm-client-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+      - name: Test Farm Client backend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # The repository's legacy browser-fixture suite still contains
+          # POSIX-only executable assumptions. Keep this native job focused on
+          # the standalone Client surface; the installed-artifact steps below
+          # exercise the real Windows browser and Scheduled Task backends.
+          go test ./backend -run '^(TestFarmClient(Update|Config|Identity|Autostart|Diagnostics|Packaging|Package|Release)|TestEnrollFarmClient|TestDefaultProcessTreeRSSUsesRealChildAndFailsClosedAfterExit|TestFarmClientWindowsPinnedHandleBlocksReplacement|TestStopBrowserProcessCommandTerminatesWindowsTree)' -count=1
+          if ($LASTEXITCODE -ne 0) { throw "Farm Client backend tests failed" }
+          go test ./backend/cmd/ant-farm-client ./backend/internal/automation -count=1
+          if ($LASTEXITCODE -ne 0) { throw "Farm Client command tests failed" }
+      - name: Build dedicated artifacts
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } elseif ($env:GITHUB_REF -like "refs/tags/farm-client-v*") { "${{ github.ref_name }}" -replace '^farm-client-v','' } else { $env:FARM_CLIENT_CI_VERSION }
+          ./publish/farm-client/windows/publish-windows.ps1 -Arch amd64 -Version $version
+      - name: Validate layouts and destructive-cleanup policy
+        shell: pwsh
+        run: |
+          $zip = Get-Item publish/farm-client/windows/dist/AntFarmClient-*-windows-x64.zip
+          $setup = Get-Item publish/farm-client/windows/dist/AntFarmClient-Setup-*-x64.exe
+          $update = Get-Item publish/farm-client/windows/dist/AntFarmClient-*-windows-amd64.update.exe
+          if (-not $zip -or -not $setup -or -not $update) { throw "Farm Client artifacts missing" }
+          $versionOutput = & $update.FullName -version
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch '"version"') { throw "Update binary failed" }
+          $text = Get-Content publish/farm-client/windows/installer.nsi -Raw
+          if ($text -match '(?i)taskkill\.exe|/IM\s+xray|/IM\s+sing-box|killall|pkill') { throw "global process-name cleanup is prohibited" }
+      - name: Exercise installed NSIS artifact with real Chrome
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } elseif ($env:GITHUB_REF -like "refs/tags/farm-client-v*") { "${{ github.ref_name }}" -replace '^farm-client-v','' } else { $env:FARM_CLIENT_CI_VERSION }
+          $artifact = Get-Item "publish/farm-client/windows/dist/AntFarmClient-Setup-$version-x64.exe"
+          $artifactPath = $artifact.FullName
+          $artifactSha = (Get-FileHash -Algorithm SHA256 $artifact.FullName).Hash.ToLowerInvariant()
+          $installRoot = Join-Path $env:ProgramFiles "Ant Farm Client"
+          $client = Join-Path $installRoot "ant-farm-client.exe"
+          $chrome = Join-Path $env:ProgramFiles "Google/Chrome/Application/chrome.exe"
+          if (-not (Test-Path $chrome)) { throw "native Google Chrome is required" }
+          $install = Start-Process -FilePath $artifact.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($install.ExitCode -ne 0 -or -not (Test-Path $client)) { throw "NSIS install failed" }
+          try {
+            $env:C8_INSTALLED_ARTIFACT_E2E = "1"
+            $env:C8_INSTALLED_RECONNECT_RECONCILE_E2E = "1"
+            $env:C8_INSTALLED_CLIENT = $client
+            $env:C8_INSTALLED_ROOT = $installRoot
+            $env:C8_RELEASE_ARTIFACT = $artifactPath
+            $env:C8_RELEASE_ARTIFACT_SHA256 = $artifactSha
+            $env:C8_INSTALLED_VERSION = $version
+            $env:C8_REAL_CHROME_CORE = $chrome
+            go test ./backend -run '^TestFarmClientInstalledArtifact(RealChrome|ReconnectReconcile)$' -count=1 -v
+            if ($LASTEXITCODE -ne 0) { throw "installed artifact E2E failed" }
+            $env:C8_INSTALLED_AUTOSTART_E2E = "1"
+            $env:C8_AUTOSTART_METHOD = "scheduled-task-at-logon"
+            go test ./backend -run '^TestFarmClientInstalledArtifactAutostartNative$' -count=1 -v
+            if ($LASTEXITCODE -ne 0) { throw "native autostart E2E failed" }
+            $baseVersion = ($version -split '-')[0]
+            $parts = $baseVersion.Split('.')
+            $invalidParts = @($parts | Where-Object { $_ -notmatch '^\d+$' })
+            if ($parts.Count -ne 3 -or $invalidParts.Count -gt 0) { throw "C8 update requires a numeric semantic package version" }
+            $versionB = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"
+            $releaseA = Join-Path $env:RUNNER_TEMP "AntFarmClient-$version-windows-amd64.update.exe"
+            Copy-Item -LiteralPath (Get-Item "publish/farm-client/windows/dist/AntFarmClient-$version-windows-amd64.update.exe").FullName -Destination $releaseA -Force
+            $releaseB = Join-Path $env:RUNNER_TEMP "AntFarmClient-$versionB-windows-amd64.update.exe"
+            $env:GOOS = "windows"; $env:GOARCH = "amd64"; $env:CGO_ENABLED = "0"
+            go build -trimpath -ldflags "-s -w -X ant-chrome/backend.FarmClientVersion=$versionB" -o $releaseB ./backend/cmd/ant-farm-client
+            if ($LASTEXITCODE -ne 0) { throw "release B build failed" }
+            $env:C8_INSTALLED_UPDATE_E2E = "1"
+            $env:C8_UPDATE_INSTALLED_CLIENT = $client
+            $env:C8_UPDATE_INSTALLED_ROOT = $installRoot
+            $env:C8_UPDATE_RELEASE_A = $releaseA
+            $env:C8_UPDATE_RELEASE_B = $releaseB
+            $env:C8_UPDATE_RELEASE_A_SHA256 = (Get-FileHash -Algorithm SHA256 $releaseA).Hash.ToLowerInvariant()
+            $env:C8_UPDATE_RELEASE_B_SHA256 = (Get-FileHash -Algorithm SHA256 $releaseB).Hash.ToLowerInvariant()
+            $env:C8_UPDATE_VERSION_A = $version
+            $env:C8_UPDATE_VERSION_B = $versionB
+            go test ./backend -run '^TestFarmClientInstalledArtifactSignedUpdateRollback$' -count=1 -timeout=10m -v
+            if ($LASTEXITCODE -ne 0) { throw "installed signed update/rollback E2E failed" }
+          } finally {
+            $uninstaller = Join-Path $installRoot "Uninstall.exe"
+            if (Test-Path $uninstaller) {
+              $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
+              if ($uninstall.ExitCode -ne 0) { throw "NSIS uninstall failed" }
+            }
+          }
+          if (Test-Path $client) { throw "installed executable remained after uninstall" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ant-farm-client-windows-amd64
+          path: |
+            publish/farm-client/windows/dist/AntFarmClient-Setup-*-x64.exe
+            publish/farm-client/windows/dist/AntFarmClient-*-windows-x64.zip
+            publish/farm-client/windows/dist/AntFarmClient-*-windows-amd64.update.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/farm-client-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || gh release create "$TAG_NAME" --generate-notes
+          gh release upload "$TAG_NAME" release-artifacts/* --clobber

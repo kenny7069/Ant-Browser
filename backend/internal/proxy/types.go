@@ -8,23 +8,25 @@ import (
 
 // XrayBridge Xray 桥接进程
 type XrayBridge struct {
-	NodeKey    string
-	Port       int
-	Cmd        *exec.Cmd
-	Pid        int
-	Running    bool
-	LastError  string
-	RefCount   int
-	LastUsedAt time.Time
-	Stopping   bool
-	Restarting bool
-	Outbounds  []interface{}
-	Routes     []interface{}
-	DNSServers string
-	ExitDone   chan struct{}
-	ExitErr    error
-	exitMu     sync.Mutex
-	waitOnce   sync.Once
+	NodeKey      string
+	Port         int
+	Cmd          *exec.Cmd
+	Pid          int
+	Running      bool
+	LastError    string
+	RefCount     int
+	LastUsedAt   time.Time
+	Stopping     bool
+	Restarting   bool
+	Outbounds    []interface{}
+	Routes       []interface{}
+	DNSServers   string
+	ExitDone     chan struct{}
+	ExitErr      error
+	Runtime      *secureRuntimeHandle
+	RuntimeToken uint64
+	exitMu       sync.Mutex
+	waitOnce     sync.Once
 }
 
 // ProxyResult 代理解析结果

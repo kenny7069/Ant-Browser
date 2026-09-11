@@ -120,7 +120,11 @@ type LaunchServer struct {
 	activePort  int
 	activeID    string
 	activeName  string
-	apiAuth     APIAuthConfig
+	// activeGeneration is populated by the shared browser runtime service. A
+	// zero value means the binding was set by a legacy/non-service caller and
+	// therefore cannot satisfy a generation-fenced clear request.
+	activeGeneration uint64
+	apiAuth          APIAuthConfig
 }
 
 // NewLaunchServer 创建 LaunchServer
@@ -262,10 +266,32 @@ func (s *LaunchServer) SetActiveProfile(profile *browser.Profile) {
 		return
 	}
 
+	s.setActiveProfile(profile, 0)
+}
+
+// SetActiveProfileForGeneration updates the shared CDP binding together with
+// the service runtime generation that owns it. It closes the race where an
+// old monitor's delayed clear callback could erase a newer runtime's binding.
+func (s *LaunchServer) SetActiveProfileForGeneration(profile *browser.Profile, generation uint64) {
+	if profile == nil || profile.DebugPort <= 0 || !profile.DebugReady || generation == 0 {
+		return
+	}
+	s.setActiveProfile(profile, generation)
+}
+
+func (s *LaunchServer) setActiveProfile(profile *browser.Profile, generation uint64) {
 	s.activeMu.Lock()
+	if generation == 0 && s.activeID == profile.ProfileId && s.activePort == profile.DebugPort {
+		// Legacy callers (including LaunchServer HTTP handlers) may repeat the
+		// same active binding after the service has published a generation. Keep
+		// that ownership tag so a later fenced clear still reaches the matching
+		// runtime. A different profile/port starts an unowned legacy binding.
+		generation = s.activeGeneration
+	}
 	s.activePort = profile.DebugPort
 	s.activeID = profile.ProfileId
 	s.activeName = profile.ProfileName
+	s.activeGeneration = generation
 	s.activeMu.Unlock()
 }
 
@@ -281,8 +307,30 @@ func (s *LaunchServer) ClearActiveProfile(profileID string) {
 		s.activePort = 0
 		s.activeID = ""
 		s.activeName = ""
+		s.activeGeneration = 0
 	}
 	s.activeMu.Unlock()
+}
+
+// ClearActiveProfileIfGeneration clears the binding only while it still
+// belongs to the same service runtime generation. A stale monitor callback
+// therefore becomes a no-op after a replacement runtime is activated.
+func (s *LaunchServer) ClearActiveProfileIfGeneration(profileID string, generation uint64) bool {
+	profileID = strings.TrimSpace(profileID)
+	if profileID == "" || generation == 0 {
+		return false
+	}
+
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if s.activeID != profileID || s.activeGeneration != generation {
+		return false
+	}
+	s.activePort = 0
+	s.activeID = ""
+	s.activeName = ""
+	s.activeGeneration = 0
+	return true
 }
 
 func (s *LaunchServer) activeTarget() (int, string, string) {

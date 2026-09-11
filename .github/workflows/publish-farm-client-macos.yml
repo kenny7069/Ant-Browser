@@ -1,0 +1,125 @@
+name: Publish Farm Client macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version
+        required: false
+        default: "1.5.0"
+        type: string
+  push:
+    branches: ["farm-client-dev"]
+    tags: ["farm-client-v*"]
+
+permissions:
+  contents: write
+
+env:
+  FARM_CLIENT_CI_VERSION: "1.5.1"
+
+concurrency:
+  group: publish-farm-client-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: macos-15-intel }
+          - { arch: arm64, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: Test Farm Client backend
+        run: go test ./backend/... -count=1
+      - name: Build dedicated unsigned artifact
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
+          if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
+          bash publish/farm-client/macos/package.sh --arch "${{ matrix.arch }}" --version "$version"
+      - name: Validate app and signing gate
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
+          if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
+          app="$(ls -d publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.app)"
+          zip="$(ls publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.zip)"
+          update="$(ls publish/farm-client/macos/dist/AntFarmClient-*-darwin-${{ matrix.arch }}.update.bin)"
+          test -x "$app/Contents/MacOS/ant-farm-client"
+          test -x "$app/Contents/Resources/bin/xray"
+          test -x "$app/Contents/Resources/bin/sing-box"
+          plutil -lint "$app/Contents/Info.plist"
+          test -f "$zip"
+          "$app/Contents/MacOS/ant-farm-client" -version | grep -Fq "\"version\":\"$version\""
+          "$update" -version | grep -Fq "\"version\":\"$version\""
+          if [[ "${{ startsWith(github.ref, 'refs/tags/farm-client-v') }}" == "true" ]]; then
+            echo "Release tags require a later C10 Developer ID/notarization job; unsigned upload is intentionally refused."
+            exit 1
+          fi
+      - name: Exercise installed artifact with real Chrome
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-$FARM_CLIENT_CI_VERSION}"
+          if [[ "$GITHUB_REF" == refs/tags/farm-client-v* ]]; then version="${GITHUB_REF_NAME#farm-client-v}"; fi
+          artifact="$(cd "$(dirname "$(ls publish/farm-client/macos/dist/AntFarmClient-${version}-macos-${{ matrix.arch }}.zip)")" && pwd -P)/AntFarmClient-${version}-macos-${{ matrix.arch }}.zip"
+          install_root="$RUNNER_TEMP/AntFarmClient-C8-Installed"
+          mkdir -p "$install_root"
+          ditto -x -k "$artifact" "$install_root"
+          installed_app="$(find "$install_root" -maxdepth 1 -name '*.app' -type d -print -quit)"
+          test -n "$installed_app"
+          artifact_sha="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+          C8_INSTALLED_ARTIFACT_E2E=1 \
+          C8_INSTALLED_RECONNECT_RECONCILE_E2E=1 \
+          C8_INSTALLED_CLIENT="$installed_app/Contents/MacOS/ant-farm-client" \
+          C8_INSTALLED_ROOT="$install_root" \
+          C8_RELEASE_ARTIFACT="$artifact" \
+          C8_RELEASE_ARTIFACT_SHA256="$artifact_sha" \
+          C8_INSTALLED_VERSION="$version" \
+          C8_REAL_CHROME_CORE="/Applications" \
+          go test ./backend -run '^TestFarmClientInstalledArtifact(RealChrome|ReconnectReconcile)$' -count=1 -v
+          C8_INSTALLED_AUTOSTART_E2E=1 \
+          C8_INSTALLED_CLIENT="$installed_app/Contents/MacOS/ant-farm-client" \
+          C8_INSTALLED_ROOT="$install_root" \
+          C8_AUTOSTART_METHOD="launchagent" \
+          go test ./backend -run '^TestFarmClientInstalledArtifactAutostartNative$' -count=1 -v
+          base_version="${version%%-*}"
+          IFS=. read -r major minor patch <<< "$base_version"
+          [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]]
+          version_b="$major.$minor.$((10#$patch + 1))"
+          release_a="$RUNNER_TEMP/AntFarmClient-${version}-darwin-${{ matrix.arch }}.update.bin"
+          cp "$(cd "$(dirname "$(ls publish/farm-client/macos/dist/AntFarmClient-${version}-darwin-${{ matrix.arch }}.update.bin)")" && pwd -P)/AntFarmClient-${version}-darwin-${{ matrix.arch }}.update.bin" "$release_a"
+          release_b="$RUNNER_TEMP/AntFarmClient-${version_b}-darwin-${{ matrix.arch }}.update.bin"
+          GOOS=darwin GOARCH="${{ matrix.arch }}" CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X ant-chrome/backend.FarmClientVersion=$version_b" \
+            -o "$release_b" ./backend/cmd/ant-farm-client
+          C8_INSTALLED_UPDATE_E2E=1 \
+          C8_UPDATE_INSTALLED_CLIENT="$installed_app/Contents/MacOS/ant-farm-client" \
+          C8_UPDATE_INSTALLED_ROOT="$install_root" \
+          C8_UPDATE_RELEASE_A="$release_a" \
+          C8_UPDATE_RELEASE_B="$release_b" \
+          C8_UPDATE_RELEASE_A_SHA256="$(shasum -a 256 "$release_a" | awk '{print $1}')" \
+          C8_UPDATE_RELEASE_B_SHA256="$(shasum -a 256 "$release_b" | awk '{print $1}')" \
+          C8_UPDATE_VERSION_A="$version" \
+          C8_UPDATE_VERSION_B="$version_b" \
+          go test ./backend -run '^TestFarmClientInstalledArtifactSignedUpdateRollback$' -count=1 -timeout=10m -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ant-farm-client-macos-${{ matrix.arch }}-unsigned
+          path: |
+            publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.app
+            publish/farm-client/macos/dist/AntFarmClient-*-macos-${{ matrix.arch }}.zip
+            publish/farm-client/macos/dist/AntFarmClient-*-darwin-${{ matrix.arch }}.update.bin
+          if-no-files-found: error

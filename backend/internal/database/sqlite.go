@@ -259,6 +259,22 @@ var migrations = []migration{
 			`UPDATE browser_extensions SET default_install = 0`,
 		},
 	},
+	{
+		version: 18,
+		desc:    "添加不可變实例世代标识用于 Farm 配对 ABA 防护",
+		stmts: []string{
+			`ALTER TABLE browser_profiles ADD COLUMN incarnation_id TEXT NOT NULL DEFAULT ''`,
+			`UPDATE browser_profiles SET incarnation_id = lower(hex(randomblob(16))) WHERE incarnation_id = ''`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_profiles_incarnation_id ON browser_profiles(incarnation_id)`,
+			`CREATE TRIGGER IF NOT EXISTS trg_browser_profiles_incarnation_after_insert
+			 AFTER INSERT ON browser_profiles
+			 WHEN NEW.incarnation_id = ''
+			 BEGIN
+			   UPDATE browser_profiles SET incarnation_id = lower(hex(randomblob(16)))
+				   WHERE profile_id = NEW.profile_id AND incarnation_id = '';
+				 END`,
+		},
+	},
 	// ── 新版本在此追加，格式：
 	// {
 	//     version: 4,

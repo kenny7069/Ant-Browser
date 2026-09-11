@@ -19,7 +19,11 @@ func (a *App) BrowserInstanceOpenFingerprintCheck(profileId string) (*BrowserPro
 	if profileId == "" {
 		return nil, fmt.Errorf("实例 ID 不能为空")
 	}
-	return a.browserInstanceStartInternal(profileId, nil, []string{fingerprintCheckBookmarkURL}, true, true, false, "", "")
+	return a.browserInstanceStartWithRuntimeOptions(profileId, BrowserRuntimeStartOptions{
+		StartURLs:            []string{fingerprintCheckBookmarkURL},
+		SkipDefaultStartURLs: true,
+		PreferVisibleWindow:  true,
+	})
 }
 
 func (a *App) ensureFingerprintCheckPageURL(profileId string) (string, error) {

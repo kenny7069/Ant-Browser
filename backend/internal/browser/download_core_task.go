@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +15,7 @@ import (
 )
 
 // DownloadAndExtractCore 执行异步下载解压并在过程中发送事件
-func (m *Manager) DownloadAndExtractCore(ctx context.Context, coreName string, targetUrl string, proxyConfig string) {
+func (m *Manager) DownloadAndExtractCore(ctx context.Context, coreName string, targetUrl string, client *http.Client) {
 	coreName = strings.TrimSpace(coreName)
 	for _, core := range m.ListCores() {
 		if strings.EqualFold(core.CoreName, coreName) || filepath.Base(core.CorePath) == coreName {
@@ -25,15 +24,15 @@ func (m *Manager) DownloadAndExtractCore(ctx context.Context, coreName string, t
 				CoreName:  core.CoreName,
 				CorePath:  core.CorePath,
 				IsDefault: core.IsDefault,
-			}, targetUrl, proxyConfig, false)
+			}, targetUrl, client, false)
 			return
 		}
 	}
-	m.downloadAndExtractCore(ctx, CoreInput{CoreName: coreName}, targetUrl, proxyConfig, false)
+	m.downloadAndExtractCore(ctx, CoreInput{CoreName: coreName}, targetUrl, client, false)
 }
 
 // RedownloadCore 重新下载指定内核，验证成功后替换原目录并保留原配置。
-func (m *Manager) RedownloadCore(ctx context.Context, coreId string, targetUrl string, proxyConfig string) {
+func (m *Manager) RedownloadCore(ctx context.Context, coreId string, targetUrl string, client *http.Client) {
 	core, ok := m.GetCore(coreId)
 	if !ok {
 		m.emitRuntimeEvent(ctx, "download:progress", DownloadProgress{Phase: "error", Progress: 0, Message: "内核不存在"})
@@ -44,10 +43,10 @@ func (m *Manager) RedownloadCore(ctx context.Context, coreId string, targetUrl s
 		CoreName:  core.CoreName,
 		CorePath:  core.CorePath,
 		IsDefault: core.IsDefault,
-	}, targetUrl, proxyConfig, true)
+	}, targetUrl, client, true)
 }
 
-func (m *Manager) downloadAndExtractCore(ctx context.Context, coreInput CoreInput, targetUrl string, proxyConfig string, replaceExisting bool) {
+func (m *Manager) downloadAndExtractCore(ctx context.Context, coreInput CoreInput, targetUrl string, client *http.Client, replaceExisting bool) {
 	log := logger.New("Browser")
 	t := time.Now()
 
@@ -57,6 +56,10 @@ func (m *Manager) downloadAndExtractCore(ctx context.Context, coreInput CoreInpu
 			Progress: progress,
 			Message:  msg,
 		})
+	}
+	if client == nil {
+		sendEvent("error", 0, "下載客戶端未初始化")
+		return
 	}
 
 	sendEvent("downloading", 0, "开始解析地址并创建下载请求: "+targetUrl)
@@ -94,48 +97,6 @@ func (m *Manager) downloadAndExtractCore(ctx context.Context, coreInput CoreInpu
 	} else if err != nil && !os.IsNotExist(err) {
 		sendEvent("error", 0, "检查内核目录失败: "+err.Error())
 		return
-	}
-
-	// 2. 准备 HttpClient。系统代理保留平台专用处理，实际代理节点由应用层统一连接栈提供。
-	var client *http.Client
-	var err error
-	if proxyConfig != "__system__" && m.CoreDownloadHTTPClientFactory != nil {
-		client, err = m.CoreDownloadHTTPClientFactory(proxyConfig, 0)
-		if err != nil {
-			sendEvent("error", 0, "创建下载代理客户端失败: "+err.Error())
-			return
-		}
-	} else {
-		transport := &http.Transport{}
-		if proxyConfig == "__system__" {
-			// http.ProxyFromEnvironment 只读环境变量，而 Clash 的全局代理写在 Windows 注册表里
-			// 必须直接读取注册表才能拿到正确的代理地址
-			if sysProxy, rErr := readSystemProxy(); rErr == nil && sysProxy != "" {
-				if proxyURL, pErr := url.Parse(sysProxy); pErr == nil {
-					transport.Proxy = http.ProxyURL(proxyURL)
-					sendEvent("downloading", 0, "已从系统注册表读取代理: "+sysProxy)
-				} else {
-					// 解析失败则回退到环境变量
-					transport.Proxy = http.ProxyFromEnvironment
-				}
-			} else {
-				// 没有系统代理配置或读取失败，尝试环境变量兜底
-				transport.Proxy = http.ProxyFromEnvironment
-				sendEvent("downloading", 0, "系统注册表无代理配置，使用环境变量兜底")
-			}
-		} else if proxyConfig != "" && proxyConfig != "direct://" && proxyConfig != "__direct__" {
-			if proxyURL, pErr := url.Parse(proxyConfig); pErr == nil {
-				transport.Proxy = http.ProxyURL(proxyURL)
-			} else {
-				sendEvent("error", 0, "代理地址解析失败: "+pErr.Error())
-				return
-			}
-		}
-
-		client = &http.Client{
-			Timeout:   0,
-			Transport: transport,
-		}
 	}
 
 	tempFile, err := os.CreateTemp(parentDir, coreArchiveTempPattern(targetUrl))
