@@ -113,6 +113,14 @@ func productionCanonicalSetupOperations() canonicalSetupOperations {
 
 func runSetupCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	jsonOutput := setupArgsWantJSON(args)
+	if !farmV3SetupEnabled() {
+		writeSetupError(stderr, jsonOutput, setupCommandError{
+			Code: "SETUP_DISABLED", Stage: "INPUT_VALIDATION",
+			SafeMessage: "Browser Farm v3 setup 尚未啟用。",
+			Remediation: "由管理員完成部署前置後設定 FARM_V3_SETUP_ENABLED=1。",
+		})
+		return setupExitInput
+	}
 	flags := flag.NewFlagSet("ant-farm-client setup", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	server := flags.String("server", "", "trusted HTTPS Server origin")
@@ -186,7 +194,7 @@ func runSetupCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) i
 	if jsonOutput {
 		fmt.Fprintln(stdout, string(encoded))
 	} else {
-		fmt.Fprintln(stdout, "Setup 已完成：ENROLLED；下一步：service。")
+		fmt.Fprintln(stdout, "Setup 已完成：ENROLLED；下一步：service_activation。")
 	}
 	return 0
 }
@@ -290,7 +298,7 @@ func runCanonicalSetupWithOperations(ctx context.Context, bootstrap backend.Boot
 	if err := advance("ENROLLMENT_FINALIZE", backend.SetupEnrolled, ops.EnrollmentFinish); err != nil {
 		return setupCommandResult{}, err
 	}
-	return setupCommandResult{State: backend.SetupEnrolled, NextAction: "service"}, nil
+	return setupCommandResult{State: backend.SetupEnrolled, NextAction: "service_activation"}, nil
 }
 
 func loadEmbeddedSuiteRelease(suiteRoot, binaryVersion string) (backend.VerifiedSuiteRelease, error) {
@@ -324,6 +332,15 @@ func verifyEmbeddedSuiteRelease(manifest, envelope []byte) (backend.VerifiedSuit
 func clearSetupBytes(value []byte) {
 	for index := range value {
 		value[index] = 0
+	}
+}
+
+func farmV3SetupEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FARM_V3_SETUP_ENABLED"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

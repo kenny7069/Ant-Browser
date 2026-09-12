@@ -55,7 +55,8 @@ running executable and cannot be overridden:
 
 Setup resumes from the last durable canonical stage, prompts once for the
 one-time enrollment code only when `IDENTITY_READY` has no durable
-acknowledgment, and finishes at `ENROLLED`. The next action is `service`.
+acknowledgment, and finishes at `ENROLLED`. The next action is
+`service_activation`; setup does not expose a service-start command.
 The durable handoff created during finalization is ownership evidence, but
 `ENROLLED` does not authorize service activation by itself. GUI launching and
 desktop shortcuts remain deferred until T08 provides a strict GUI mode that

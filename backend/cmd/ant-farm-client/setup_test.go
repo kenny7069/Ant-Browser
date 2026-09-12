@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -27,6 +28,7 @@ func setupCommandFixture(t *testing.T) backend.SuiteUserRoots {
 
 func withSetupRoots(t *testing.T, roots backend.SuiteUserRoots) {
 	t.Helper()
+	t.Setenv("FARM_V3_SETUP_ENABLED", "1")
 	previous := resolveSetupUserRoots
 	resolveSetupUserRoots = func() (backend.SuiteUserRoots, error) { return roots, nil }
 	t.Cleanup(func() { resolveSetupUserRoots = previous })
@@ -40,12 +42,72 @@ func withCanonicalSetupRunner(t *testing.T, runner func(context.Context, backend
 }
 
 func successfulSetupRunner(_ context.Context, _ backend.BootstrapConfig, _ backend.SuiteUserRoots, _ io.Reader, _ io.Writer) (setupCommandResult, error) {
-	return setupCommandResult{State: backend.SetupEnrolled, NextAction: "service"}, nil
+	return setupCommandResult{State: backend.SetupEnrolled, NextAction: "service_activation"}, nil
 }
 
 type setupPanicReader struct{}
 
 func (setupPanicReader) Read([]byte) (int, error) { panic("setup unexpectedly read enrollment input") }
+
+func TestSetupSubcommandDefaultOffGateHasNoSideEffects(t *testing.T) {
+	for _, value := range []string{"", "false", "unknown"} {
+		name := value
+		if name == "" {
+			name = "unset"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("FARM_V3_SETUP_ENABLED", "restore-after-test")
+			if value == "" {
+				if err := os.Unsetenv("FARM_V3_SETUP_ENABLED"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				t.Setenv("FARM_V3_SETUP_ENABLED", value)
+			}
+			rootCalls, canonicalCalls := 0, 0
+			previousRoots := resolveSetupUserRoots
+			resolveSetupUserRoots = func() (backend.SuiteUserRoots, error) {
+				rootCalls++
+				return backend.SuiteUserRoots{}, errors.New("must not resolve roots")
+			}
+			t.Cleanup(func() { resolveSetupUserRoots = previousRoots })
+			withCanonicalSetupRunner(t, func(context.Context, backend.BootstrapConfig, backend.SuiteUserRoots, io.Reader, io.Writer) (setupCommandResult, error) {
+				canonicalCalls++
+				return setupCommandResult{}, errors.New("must not execute setup")
+			})
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"setup", "--server", "value-that-must-not-be-parsed", "--json"}, setupPanicReader{}, &stdout, &stderr)
+			if code != setupExitInput || stdout.Len() != 0 || rootCalls != 0 || canonicalCalls != 0 {
+				t.Fatalf("code=%d roots=%d canonical=%d stdout=%q stderr=%q", code, rootCalls, canonicalCalls, stdout.String(), stderr.String())
+			}
+			var problem setupCommandError
+			if err := json.Unmarshal(stderr.Bytes(), &problem); err != nil || problem.Code != "SETUP_DISABLED" {
+				t.Fatalf("problem=%+v err=%v", problem, err)
+			}
+		})
+	}
+}
+
+func TestSetupSubcommandGateAllowsOnlyDocumentedTrueValues(t *testing.T) {
+	for _, value := range []string{"1", "true", "yes", "on"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("FARM_V3_SETUP_ENABLED", value)
+			roots := setupCommandFixture(t)
+			previousRoots := resolveSetupUserRoots
+			resolveSetupUserRoots = func() (backend.SuiteUserRoots, error) { return roots, nil }
+			t.Cleanup(func() { resolveSetupUserRoots = previousRoots })
+			withCanonicalSetupRunner(t, successfulSetupRunner)
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{"setup", "--server", "https://farm.example.test", "--json"}, setupPanicReader{}, &stdout, &stderr); code != 0 || stderr.Len() != 0 {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+			var result setupCommandResult
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result.State != backend.SetupEnrolled || result.NextAction != "service_activation" {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
 
 func TestSetupSubcommandRunsCanonicalSetupAndReportsOnlyFinalState(t *testing.T) {
 	roots := setupCommandFixture(t)
@@ -70,7 +132,7 @@ func TestSetupSubcommandRunsCanonicalSetupAndReportsOnlyFinalState(t *testing.T)
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(result, map[string]any{"state": "ENROLLED", "next_action": "service"}) {
+	if !reflect.DeepEqual(result, map[string]any{"state": "ENROLLED", "next_action": "service_activation"}) {
 		t.Fatalf("result=%v", result)
 	}
 	for _, forbidden := range []string{"secret-must-not-be-read", "request_uid", "identity", "control"} {
@@ -205,7 +267,7 @@ func TestCanonicalSetupResumesEachDurableStageInOrder(t *testing.T) {
 				ApplicationInit: step("application", backend.SetupIdentityReady), EnrollmentFinish: step("finalize", backend.SetupEnrolled),
 			}
 			result, err := runCanonicalSetupWithOperations(context.Background(), backend.BootstrapConfig{}, backend.SuiteUserRoots{}, setupPanicReader{}, &bytes.Buffer{}, ops)
-			if err != nil || result.State != backend.SetupEnrolled || result.NextAction != "service" {
+			if err != nil || result.State != backend.SetupEnrolled || result.NextAction != "service_activation" {
 				t.Fatalf("result=%+v err=%v calls=%v", result, err, calls)
 			}
 			all := []string{"precheck", "stage", "config", "transport", "identity", "probe-ack", "application", "finalize"}
