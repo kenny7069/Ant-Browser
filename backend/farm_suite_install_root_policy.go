@@ -33,13 +33,34 @@ func classifySuiteInstallACEType(aceType uint8) (allowed, objectACE, unknownAllo
 	switch aceType {
 	case 0: // ACCESS_ALLOWED_ACE_TYPE
 		return true, false, false
-	case 5: // ACCESS_ALLOWED_OBJECT_ACE_TYPE
-		return true, true, false
 	case 4, 9, 11: // compound/callback allow forms are not accepted by this parser
 		return false, false, true
+	case 5: // object ACE has variable GUID fields and is deliberately rejected
+		return false, true, true
 	default:
 		return false, false, false
 	}
+}
+
+func validateSuiteInstallACEHeaderMaskSize(aceSize uint16) error {
+	if aceSize < 8 {
+		return fmt.Errorf("%w: truncated immutable tree ACE", ErrSuiteServiceActivation)
+	}
+	return nil
+}
+
+func validateSuiteInstallAllowedSIDLayout(aceSize uint16, revision, subAuthorityCount uint8) (uint16, error) {
+	if err := validateSuiteInstallACEHeaderMaskSize(aceSize); err != nil {
+		return 0, err
+	}
+	if revision != 1 || subAuthorityCount > 15 {
+		return 0, fmt.Errorf("%w: invalid immutable tree ACE SID header", ErrSuiteServiceActivation)
+	}
+	sidLength := uint16(8 + 4*uint16(subAuthorityCount))
+	if uint32(8)+uint32(sidLength) > uint32(aceSize) {
+		return 0, fmt.Errorf("%w: immutable tree ACE SID exceeds ACE", ErrSuiteServiceActivation)
+	}
+	return sidLength, nil
 }
 
 func validateSuiteInstallDACLPolicy(policy suiteInstallDACLPolicy) error {

@@ -38,13 +38,39 @@ func TestSuiteInstallDangerousMaskIncludesIndividualRights(t *testing.T) {
 	}
 }
 
-func TestSuiteInstallACETypeFourFailsClosedAsUnknownAllow(t *testing.T) {
-	allowed, objectACE, unknownAllow := classifySuiteInstallACEType(4)
-	if allowed || objectACE || !unknownAllow {
-		t.Fatalf("type 4 classification allowed=%v object=%v unknown=%v", allowed, objectACE, unknownAllow)
+func TestSuiteInstallAmbiguousAllowACETypesFailClosed(t *testing.T) {
+	for _, aceType := range []uint8{4, 5, 9, 11} {
+		allowed, objectACE, unknownAllow := classifySuiteInstallACEType(aceType)
+		if allowed || !unknownAllow || (aceType == 5 && !objectACE) {
+			t.Fatalf("type %d classification allowed=%v object=%v unknown=%v", aceType, allowed, objectACE, unknownAllow)
+		}
+		policy := suiteInstallDACLPolicy{TrustedOwner: true, DACLPresent: true, ACEs: []suiteInstallACEPolicy{{UnknownAllowType: unknownAllow}}}
+		if err := validateSuiteInstallDACLPolicy(policy); !errors.Is(err, ErrSuiteServiceActivation) {
+			t.Fatalf("ambiguous allow ACE type %d accepted: %v", aceType, err)
+		}
 	}
-	policy := suiteInstallDACLPolicy{TrustedOwner: true, DACLPresent: true, ACEs: []suiteInstallACEPolicy{{UnknownAllowType: unknownAllow}}}
-	if err := validateSuiteInstallDACLPolicy(policy); !errors.Is(err, ErrSuiteServiceActivation) {
-		t.Fatalf("compound allow ACE accepted: %v", err)
+}
+
+func TestSuiteInstallACELayoutRejectsTruncationAndInvalidSIDHeader(t *testing.T) {
+	for _, size := range []uint16{0, 4, 7} {
+		if err := validateSuiteInstallACEHeaderMaskSize(size); !errors.Is(err, ErrSuiteServiceActivation) {
+			t.Fatalf("short ACE size %d accepted: %v", size, err)
+		}
+	}
+	for _, test := range []struct {
+		size     uint16
+		revision uint8
+		count    uint8
+	}{
+		{size: 16, revision: 1, count: 1},
+		{size: 64, revision: 2, count: 1},
+		{size: 80, revision: 1, count: 16},
+	} {
+		if _, err := validateSuiteInstallAllowedSIDLayout(test.size, test.revision, test.count); !errors.Is(err, ErrSuiteServiceActivation) {
+			t.Fatalf("invalid SID layout accepted: %+v err=%v", test, err)
+		}
+	}
+	if length, err := validateSuiteInstallAllowedSIDLayout(20, 1, 1); err != nil || length != 12 {
+		t.Fatalf("valid SID layout length=%d err=%v", length, err)
 	}
 }

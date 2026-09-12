@@ -178,11 +178,22 @@ func suiteWindowsDACLPolicy(descriptor *windows.SECURITY_DESCRIPTOR) (suiteInsta
 		if windows.GetAce(dacl, uint32(index), &ace) != nil || ace == nil {
 			return policy, ErrSuiteServiceActivation
 		}
+		if err := validateSuiteInstallACEHeaderMaskSize(ace.Header.AceSize); err != nil {
+			return policy, err
+		}
 		header := (*suiteWindowsACEMask)(unsafe.Pointer(ace))
 		allowed, objectACE, unknownAllowed := classifySuiteInstallACEType(header.Header.AceType)
 		entry := suiteInstallACEPolicy{Allowed: allowed, UnknownAllowType: unknownAllowed, ObjectACE: objectACE, Mask: uint32(header.Mask), InheritOnly: header.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0}
 		if allowed && !objectACE {
+			if ace.Header.AceSize < 16 {
+				return policy, ErrSuiteServiceActivation
+			}
 			sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+			sidHeader := (*[2]byte)(unsafe.Pointer(sid))
+			sidLength, layoutErr := validateSuiteInstallAllowedSIDLayout(ace.Header.AceSize, sidHeader[0], sidHeader[1])
+			if layoutErr != nil || !sid.IsValid() || windows.GetLengthSid(sid) != uint32(sidLength) {
+				return policy, ErrSuiteServiceActivation
+			}
 			entry.TrustedPrincipal = suiteWindowsSIDTrusted(sid, trusted)
 			creatorOwner, _ := windows.CreateWellKnownSid(windows.WinCreatorOwnerSid)
 			entry.CreatorOwner = creatorOwner != nil && sid.Equals(creatorOwner)
