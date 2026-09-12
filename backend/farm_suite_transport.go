@@ -2,8 +2,6 @@ package backend
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -114,12 +112,11 @@ func runSuiteCanonicalTransportWithDependencies(ctx context.Context, bootstrap B
 	if err != nil {
 		return SuiteCanonicalTransportResult{}, ErrSuiteCanonicalTransport
 	}
-	tempName, err := suiteTransportReceiptTempName(receipt, bootstrap)
-	if err != nil || inspectSuiteTransportFootprint(roots, bootstrap, preparation.RequestUID, plan.StageID, tempName, false) != nil || cleanupSuiteTransportReceiptTemp(roots, tempName) != nil || inspectSuiteTransportFootprint(roots, bootstrap, preparation.RequestUID, plan.StageID, "", false) != nil {
+	if inspectSuiteTransportFootprint(roots, bootstrap, preparation.RequestUID) != nil {
 		return SuiteCanonicalTransportResult{}, ErrSuiteCanonicalTransport
 	}
-	existing, err := LoadSuiteTransportReceipt(roots, bootstrap)
-	if err != nil || (existing != nil && !reflect.DeepEqual(*existing, receipt)) || (checkpoint.Stage == SetupTransportVerified && existing == nil) {
+	existingState, err := inspectSuiteTransportReceiptState(roots, bootstrap, checkpoint.Stage)
+	if err != nil || (existingState.Receipt != nil && !reflect.DeepEqual(*existingState.Receipt, receipt)) || (checkpoint.Stage == SetupTransportVerified && existingState.Receipt == nil) {
 		return SuiteCanonicalTransportResult{}, ErrSuiteCanonicalTransport
 	}
 	if err := revalidateSuiteTransportLocalEvidence(ctx, bootstrap, roots, release, installedSuiteRoot, layout, installedEvidence, applicationInfo, *preparation, *plan, *checkpoint, stageReceipt, *draft, &receipt, false, deps); err != nil {
@@ -147,11 +144,7 @@ func suiteTransportDraftMatchesChain(draft SuiteClientConfigDraft, bootstrap Boo
 }
 
 func revalidateSuiteTransportLocalEvidence(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, installedSuiteRoot string, layout *suitePrecheckRootLayoutSnapshot, installedEvidence suiteStageInstallEvidence, applicationInfo os.FileInfo, preparation SetupPreparationCheckpoint, plan SuiteSetupPlan, checkpoint SetupCheckpoint, stageReceipt SuiteStageReceipt, draft SuiteClientConfigDraft, expectedReceipt *SuiteTransportReceipt, requireReceipt bool, deps suiteCanonicalTransportDependencies) error {
-	allowedTemp := ""
-	if expectedReceipt != nil {
-		allowedTemp, _ = suiteTransportReceiptTempName(*expectedReceipt, bootstrap)
-	}
-	if ctx.Err() != nil || layout.revalidate(roots, installedSuiteRoot) != nil || inspectSuiteTransportFootprint(roots, bootstrap, preparation.RequestUID, plan.StageID, allowedTemp, expectedReceipt == nil) != nil {
+	if ctx.Err() != nil || layout.revalidate(roots, installedSuiteRoot) != nil || inspectSuiteTransportFootprint(roots, bootstrap, preparation.RequestUID) != nil {
 		return ErrSuiteCanonicalTransport
 	}
 	confirmedPreparation, confirmedPlan, err := loadSuitePrecheckProofChain(bootstrap, roots, release)
@@ -178,14 +171,14 @@ func revalidateSuiteTransportLocalEvidence(ctx context.Context, bootstrap Bootst
 	if err != nil || confirmedApplication == nil || !os.SameFile(applicationInfo, confirmedApplication) {
 		return ErrSuiteCanonicalTransport
 	}
-	confirmedReceipt, err := LoadSuiteTransportReceipt(roots, bootstrap)
-	if err != nil || (confirmedReceipt != nil && expectedReceipt != nil && !reflect.DeepEqual(*confirmedReceipt, *expectedReceipt)) || (requireReceipt && confirmedReceipt == nil) {
+	confirmedState, err := inspectSuiteTransportReceiptState(roots, bootstrap, checkpoint.Stage)
+	if err != nil || (confirmedState.Receipt != nil && expectedReceipt != nil && !reflect.DeepEqual(*confirmedState.Receipt, *expectedReceipt)) || (requireReceipt && confirmedState.Receipt == nil) {
 		return ErrSuiteCanonicalTransport
 	}
 	return nil
 }
 
-func inspectSuiteTransportFootprint(roots SuiteUserRoots, bootstrap BootstrapConfig, requestUID, setupStageID, allowedTempName string, allowCandidateTemp bool) error {
+func inspectSuiteTransportFootprint(roots SuiteUserRoots, bootstrap BootstrapConfig, requestUID string) error {
 	checkpoint, err := LoadSetupCheckpoint(bootstrap.StatePath)
 	if err != nil || checkpoint == nil || checkpoint.RequestUID != requestUID || (checkpoint.Stage != SetupConfigDrafted && checkpoint.Stage != SetupTransportVerified) {
 		return ErrSuiteCanonicalTransport
@@ -195,10 +188,6 @@ func inspectSuiteTransportFootprint(roots SuiteUserRoots, bootstrap BootstrapCon
 		roots.AgentState: {suitePreparationStateName: {}, suiteSetupLockName: {}, suiteSetupPlanName: {}, suiteSetupPlanName + ".lock": {}, ".ant-farm-client.lock": {}, filepath.Base(bootstrap.StatePath): {}, filepath.Base(bootstrap.StatePath) + ".bak": {}, SuiteStageReceiptName: {}, SuiteTransportReceiptName: {}},
 		roots.Logs:       {},
 	}
-	if allowedTempName != "" {
-		allowed[roots.AgentState][allowedTempName] = struct{}{}
-	}
-	candidateTemps := 0
 	for root, names := range allowed {
 		if validateSuiteSetupPathSecurity(root, true) != nil {
 			return ErrSuiteCanonicalTransport
@@ -209,10 +198,6 @@ func inspectSuiteTransportFootprint(roots SuiteUserRoots, bootstrap BootstrapCon
 		}
 		for _, entry := range entries {
 			_, permitted := names[entry.Name()]
-			if !permitted && root == roots.AgentState && allowCandidateTemp && suiteTransportCandidateTempName(entry.Name(), requestUID, setupStageID) {
-				candidateTemps++
-				permitted = candidateTemps == 1
-			}
 			if !permitted {
 				return ErrSuiteCanonicalTransport
 			}
@@ -234,22 +219,4 @@ func inspectSuiteTransportFootprint(roots SuiteUserRoots, bootstrap BootstrapCon
 		return ErrSuiteCanonicalTransport
 	}
 	return nil
-}
-
-func suiteTransportCandidateTempName(name, requestUID, setupStageID string) bool {
-	stageDigest := sha256.Sum256([]byte(setupStageID))
-	prefix := suiteTransportTempPrefix + requestUID + "-" + hex.EncodeToString(stageDigest[:6]) + "-"
-	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".tmp") {
-		return false
-	}
-	digest := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".tmp")
-	if len(digest) != 32 {
-		return false
-	}
-	for _, character := range digest {
-		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
-			return false
-		}
-	}
-	return true
 }

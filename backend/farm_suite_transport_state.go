@@ -10,13 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 )
 
 const (
 	SuiteTransportReceiptName     = "setup-transport-receipt.json"
 	suiteTransportReceiptMaxBytes = 64 << 10
-	suiteTransportTempPrefix      = ".setup-transport-receipt-"
 )
 
 var (
@@ -219,72 +217,126 @@ func marshalSuiteTransportReceipt(receipt SuiteTransportReceipt, bootstrap Boots
 	return append(raw, '\n'), nil
 }
 
-func suiteTransportReceiptTempName(receipt SuiteTransportReceipt, bootstrap BootstrapConfig) (string, error) {
-	raw, err := marshalSuiteTransportReceipt(receipt, bootstrap)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(raw)
-	stageDigest := sha256.Sum256([]byte(receipt.SetupStageID))
-	return suiteTransportTempPrefix + receipt.RequestUID + "-" + hex.EncodeToString(stageDigest[:6]) + "-" + hex.EncodeToString(digest[:16]) + ".tmp", nil
+func saveSuiteTransportReceipt(roots SuiteUserRoots, bootstrap BootstrapConfig, receipt SuiteTransportReceipt) error {
+	return saveSuiteTransportReceiptWithDependencies(roots, bootstrap, receipt, suiteTransportReceiptSaveDependencies{
+		Open: openSuiteTransportReceiptHandle, Write: writeSuiteTransportReceiptHandle,
+	})
 }
 
-func saveSuiteTransportReceipt(roots SuiteUserRoots, bootstrap BootstrapConfig, receipt SuiteTransportReceipt) error {
+type suiteTransportReceiptState struct {
+	Receipt     *SuiteTransportReceipt
+	Recoverable bool
+	Info        os.FileInfo
+}
+
+func inspectSuiteTransportReceiptState(roots SuiteUserRoots, bootstrap BootstrapConfig, checkpointStage SetupStage) (suiteTransportReceiptState, error) {
+	receipt, loadErr := LoadSuiteTransportReceipt(roots, bootstrap)
+	if loadErr == nil {
+		return suiteTransportReceiptState{Receipt: receipt}, nil
+	}
+	if checkpointStage != SetupConfigDrafted {
+		return suiteTransportReceiptState{}, ErrSuiteTransportReceipt
+	}
+	path := filepath.Join(roots.AgentState, SuiteTransportReceiptName)
+	info, raw, err := readSuiteTransportReceiptRecoveryCandidate(roots, path)
+	if err != nil || json.Valid(raw) {
+		return suiteTransportReceiptState{}, ErrSuiteTransportReceipt
+	}
+	return suiteTransportReceiptState{Recoverable: true, Info: info}, nil
+}
+
+func readSuiteTransportReceiptRecoveryCandidate(roots SuiteUserRoots, path string) (os.FileInfo, []byte, error) {
+	configInfo, configErr := captureSuiteConfigDraftRoot(roots.Config)
+	stateInfo, stateErr := captureSuiteConfigDraftRoot(roots.AgentState)
+	info, statErr := os.Lstat(path)
+	if configErr != nil || stateErr != nil || statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > suiteTransportReceiptMaxBytes || validateSuiteSetupPathSecurity(path, false) != nil {
+		return nil, nil, ErrSuiteTransportReceipt
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, ErrSuiteTransportReceipt
+	}
+	defer file.Close()
+	handleInfo, err := file.Stat()
+	if err != nil || !handleInfo.Mode().IsRegular() || !os.SameFile(info, handleInfo) || handleInfo.Size() < 0 || handleInfo.Size() > suiteTransportReceiptMaxBytes {
+		return nil, nil, ErrSuiteTransportReceipt
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, suiteTransportReceiptMaxBytes+1))
+	if err != nil || len(raw) > suiteTransportReceiptMaxBytes || int64(len(raw)) != handleInfo.Size() || revalidateSuiteConfigDraftRoot(roots.Config, configInfo) != nil || revalidateSuiteConfigDraftRoot(roots.AgentState, stateInfo) != nil {
+		return nil, nil, ErrSuiteTransportReceipt
+	}
+	finalInfo, err := os.Lstat(path)
+	if err != nil || !os.SameFile(handleInfo, finalInfo) || validateSuiteSetupPathSecurity(path, false) != nil {
+		return nil, nil, ErrSuiteTransportReceipt
+	}
+	return handleInfo, raw, nil
+}
+
+type suiteTransportReceiptSaveDependencies struct {
+	Open      func(string, bool) (*os.File, error)
+	Write     func(*os.File, os.FileInfo, []byte) error
+	AfterOpen func(string, *os.File) error
+}
+
+func saveSuiteTransportReceiptWithDependencies(roots SuiteUserRoots, bootstrap BootstrapConfig, receipt SuiteTransportReceipt, dependencies suiteTransportReceiptSaveDependencies) (resultErr error) {
 	raw, err := marshalSuiteTransportReceipt(receipt, bootstrap)
 	if err != nil {
 		return err
 	}
-	existing, err := LoadSuiteTransportReceipt(roots, bootstrap)
+	if dependencies.Open == nil || dependencies.Write == nil {
+		return ErrSuiteTransportReceipt
+	}
+	checkpoint, err := LoadSetupCheckpoint(bootstrap.StatePath)
+	if err != nil || checkpoint == nil || checkpoint.RequestUID != receipt.RequestUID || (checkpoint.Stage != SetupConfigDrafted && checkpoint.Stage != SetupTransportVerified) {
+		return ErrSuiteTransportReceipt
+	}
+	state, err := inspectSuiteTransportReceiptState(roots, bootstrap, checkpoint.Stage)
 	if err != nil {
 		return err
 	}
-	if existing != nil {
-		if !reflect.DeepEqual(*existing, receipt) {
+	if state.Receipt != nil {
+		if !reflect.DeepEqual(*state.Receipt, receipt) {
 			return ErrSuiteTransportReceiptConflict
 		}
 		return nil
 	}
-	name, err := suiteTransportReceiptTempName(receipt, bootstrap)
+	if checkpoint.Stage != SetupConfigDrafted {
+		return ErrSuiteTransportReceipt
+	}
+	path := filepath.Join(roots.AgentState, SuiteTransportReceiptName)
+	file, err := dependencies.Open(path, !state.Recoverable)
 	if err != nil {
-		return err
-	}
-	temporaryPath := filepath.Join(roots.AgentState, name)
-	temporary, err := os.OpenFile(temporaryPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
 		return ErrSuiteTransportReceipt
 	}
-	defer os.Remove(temporaryPath)
-	if secureSuiteSetupPath(temporaryPath, false) != nil {
-		_ = temporary.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			if err := file.Close(); resultErr == nil && err != nil {
+				resultErr = ErrSuiteTransportReceipt
+			}
+		}
+	}()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || (state.Recoverable && (state.Info == nil || !os.SameFile(state.Info, openedInfo))) || (!state.Recoverable && openedInfo.Size() != 0) {
 		return ErrSuiteTransportReceipt
 	}
-	if _, err := temporary.Write(raw); err != nil || temporary.Sync() != nil || temporary.Close() != nil {
-		_ = temporary.Close()
+	if dependencies.AfterOpen != nil && dependencies.AfterOpen(path, file) != nil {
 		return ErrSuiteTransportReceipt
 	}
-	if replaceSuiteSetupFile(temporaryPath, filepath.Join(roots.AgentState, SuiteTransportReceiptName)) != nil || syncSuiteSetupDirectory(roots.AgentState) != nil {
+	if dependencies.Write(file, openedInfo, raw) != nil {
 		return ErrSuiteTransportReceipt
 	}
+	handleInfo, err := file.Stat()
+	pathInfo, pathErr := os.Lstat(path)
+	if err != nil || pathErr != nil || !os.SameFile(openedInfo, handleInfo) || !os.SameFile(handleInfo, pathInfo) || validateSuiteSetupPathSecurity(path, false) != nil {
+		return ErrSuiteTransportReceipt
+	}
+	if err := file.Close(); err != nil {
+		return ErrSuiteTransportReceipt
+	}
+	closed = true
 	written, err := LoadSuiteTransportReceipt(roots, bootstrap)
-	if err != nil || written == nil || !reflect.DeepEqual(*written, receipt) {
-		return ErrSuiteTransportReceipt
-	}
-	return nil
-}
-
-func cleanupSuiteTransportReceiptTemp(roots SuiteUserRoots, name string) error {
-	if filepath.Base(name) != name || !strings.HasPrefix(name, suiteTransportTempPrefix) || !strings.HasSuffix(name, ".tmp") {
-		return ErrSuiteTransportReceipt
-	}
-	path := filepath.Join(roots.AgentState, name)
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || validateSuiteSetupPathSecurity(path, false) != nil {
-		return ErrSuiteTransportReceipt
-	}
-	if os.Remove(path) != nil || syncSuiteSetupDirectory(roots.AgentState) != nil {
+	if err != nil || written == nil || !reflect.DeepEqual(*written, receipt) || syncSuiteSetupDirectory(roots.AgentState) != nil {
 		return ErrSuiteTransportReceipt
 	}
 	return nil

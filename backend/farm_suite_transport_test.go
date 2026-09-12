@@ -254,6 +254,27 @@ func TestSuiteTransportReceiptLoadFencesConfigAndStateRootIdentity(t *testing.T)
 }
 
 func TestSuiteCanonicalTransportFaultsAndCommitUnknown(t *testing.T) {
+	t.Run("handle security failure leaves recoverable final", func(t *testing.T) {
+		fixture := newSuiteTransportFixture(t)
+		deps := suiteTransportTestDependencies(fixture.discovery)
+		deps.SaveReceipt = func(r SuiteUserRoots, b BootstrapConfig, receipt SuiteTransportReceipt) error {
+			return saveSuiteTransportReceiptWithDependencies(r, b, receipt, suiteTransportReceiptSaveDependencies{
+				Open:  openSuiteTransportReceiptHandle,
+				Write: func(*os.File, os.FileInfo, []byte) error { return errors.New("injected handle security failure") },
+			})
+		}
+		if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
+			t.Fatal("handle security failure accepted")
+		}
+		path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+		if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
+			t.Fatalf("recoverable final info=%v err=%v", info, err)
+		}
+		assertSuiteTransportCheckpoint(t, fixture, SetupConfigDrafted)
+		if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err != nil {
+			t.Fatalf("recover empty final: %v", err)
+		}
+	})
 	t.Run("receipt write", func(t *testing.T) {
 		fixture := newSuiteTransportFixture(t)
 		deps := suiteTransportTestDependencies(fixture.discovery)
@@ -453,56 +474,80 @@ func TestSuiteCanonicalTransportLocksAndHundredCallers(t *testing.T) {
 	})
 }
 
-func TestSuiteTransportExactTempRecoveryPreservesForeign(t *testing.T) {
+func TestSuiteTransportFinalJournalRecoveryIsClosed(t *testing.T) {
+	for _, raw := range [][]byte{{}, []byte(`{"schema_version":`)} {
+		fixture := newSuiteTransportFixture(t)
+		path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err != nil {
+			t.Fatalf("invalid JSON recovery: %v", err)
+		}
+		if receipt, err := LoadSuiteTransportReceipt(fixture.roots, fixture.bootstrap); err != nil || receipt == nil {
+			t.Fatalf("receipt=%+v err=%v", receipt, err)
+		}
+	}
+	for _, raw := range [][]byte{[]byte(`{"unknown":true}`), []byte(`{"secret":"keep"}`), []byte(`[]`)} {
+		fixture := newSuiteTransportFixture(t)
+		path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err == nil {
+			t.Fatal("valid JSON drift overwritten")
+		}
+		if preserved, err := os.ReadFile(path); err != nil || string(preserved) != string(raw) {
+			t.Fatalf("valid drift mutated=%q err=%v", preserved, err)
+		}
+	}
+	fixture := newSuiteTransportFixture(t)
+	if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+	if err := os.WriteFile(path, []byte(`{"schema_version":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err == nil {
+		t.Fatal("TRANSPORT_VERIFIED corrupt receipt recovered")
+	}
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != `{"schema_version":` {
+		t.Fatalf("completed corrupt receipt mutated=%q err=%v", raw, err)
+	}
+}
+
+func TestSuiteTransportHandleWriteNeverMutatesPathReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows handle/DACL evidence not run")
+	}
 	fixture := newSuiteTransportFixture(t)
 	draft, _ := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap)
 	receipt, err := newSuiteTransportReceipt(fixture.preparation, fixture.plan, *draft, fixture.bootstrap, fixture.roots, fixture.release.manifest.Version, fixture.discovery)
 	if err != nil {
 		t.Fatal(err)
 	}
-	name, _ := suiteTransportReceiptTempName(receipt, fixture.bootstrap)
-	exact := filepath.Join(fixture.roots.AgentState, name)
-	if err := os.WriteFile(exact, []byte("partial"), 0o600); err != nil {
-		t.Fatal(err)
+	path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+	openedPath := path + ".opened"
+	dependencies := suiteTransportReceiptSaveDependencies{
+		Open: openSuiteTransportReceiptHandle, Write: writeSuiteTransportReceiptHandle,
+		AfterOpen: func(path string, _ *os.File) error {
+			if err := os.Rename(path, openedPath); err != nil {
+				return err
+			}
+			return os.WriteFile(path, []byte("foreign"), 0o644)
+		},
 	}
-	if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err != nil {
-		t.Fatal(err)
+	if err := saveSuiteTransportReceiptWithDependencies(fixture.roots, fixture.bootstrap, receipt, dependencies); err == nil {
+		t.Fatal("pathname replacement reported success")
 	}
-	if _, err := os.Stat(exact); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("temp remains: %v", err)
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != "foreign" {
+		t.Fatalf("replacement content mutated=%q err=%v", raw, err)
 	}
-
-	fixture = newSuiteTransportFixture(t)
-	foreign := filepath.Join(fixture.roots.AgentState, suiteTransportTempPrefix+"foreign.tmp")
-	if err := os.WriteFile(foreign, []byte("foreign"), 0o600); err != nil {
-		t.Fatal(err)
+	if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("replacement mode mutated info=%v err=%v", info, err)
 	}
-	if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err == nil {
-		t.Fatal("foreign temp accepted")
-	}
-	if raw, err := os.ReadFile(foreign); err != nil || string(raw) != "foreign" {
-		t.Fatalf("foreign=%q err=%v", raw, err)
-	}
-
-	fixture = newSuiteTransportFixture(t)
-	draft, _ = LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap)
-	receipt, _ = newSuiteTransportReceipt(fixture.preparation, fixture.plan, *draft, fixture.bootstrap, fixture.roots, fixture.release.manifest.Version, fixture.discovery)
-	exactName, _ := suiteTransportReceiptTempName(receipt, fixture.bootstrap)
-	stem := strings.TrimSuffix(exactName, ".tmp")
-	replacement := byte('0')
-	if stem[len(stem)-1] == replacement {
-		replacement = '1'
-	}
-	reservedConflict := filepath.Join(fixture.roots.AgentState, stem[:len(stem)-1]+string(replacement)+".tmp")
-	if err := os.WriteFile(reservedConflict, []byte("foreign"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err == nil {
-		t.Fatal("mismatched reserved temp accepted")
-	}
-	if raw, err := os.ReadFile(reservedConflict); err != nil || string(raw) != "foreign" {
-		t.Fatalf("reserved conflict mutated=%q err=%v", raw, err)
-	}
+	assertSuiteTransportCheckpoint(t, fixture, SetupConfigDrafted)
 }
 
 func assertSuiteTransportCheckpoint(t *testing.T, f suiteTransportFixture, stage SetupStage) {
