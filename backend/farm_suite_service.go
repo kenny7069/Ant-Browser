@@ -101,6 +101,12 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		}
 		return nil
 	}
+	ensureEnabledEvidence := func() error {
+		if err := revalidate(); err != nil {
+			return err
+		}
+		return inspectExact(suiteServiceRegistrationExactEnabled)
+	}
 	if journal.Stage == SuiteActivationValidated {
 		observed, inspectErr := c.Platform.InspectRegistration(*handoff, taskIdentity)
 		if inspectErr != nil || (observed != suiteServiceRegistrationAbsent && observed != suiteServiceRegistrationExactDisabled) {
@@ -146,11 +152,7 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		}
 	}
 	if journal.Stage == SuiteActivationEnabled {
-		if err := revalidate(); err != nil {
-			markReconcile()
-			return err
-		}
-		if err := inspectExact(suiteServiceRegistrationExactEnabled); err != nil {
+		if err := ensureEnabledEvidence(); err != nil {
 			markReconcile()
 			return err
 		}
@@ -164,7 +166,12 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		}
 	}
 	if journal.Stage == SuiteActivationStartRequested {
+		if err := ensureEnabledEvidence(); err != nil {
+			markReconcile()
+			return err
+		}
 		if err := c.ResidentProof(ctx, handoff.ClientConfigPath); err != nil {
+			markReconcile()
 			return ErrSuiteServiceActivation
 		}
 		if err := advance(SuiteActivationResidentProved); err != nil {
@@ -172,11 +179,29 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		}
 	}
 	if journal.Stage == SuiteActivationResidentProved {
+		if err := ensureEnabledEvidence(); err != nil {
+			markReconcile()
+			return err
+		}
+		if err := c.ResidentProof(ctx, handoff.ClientConfigPath); err != nil {
+			markReconcile()
+			return ErrSuiteServiceActivation
+		}
 		if err := SaveSetupCheckpoint(checkpointPath, SetupCheckpoint{SchemaVersion: 1, Stage: SetupServiceStarted, RequestUID: journal.RequestUID}); err != nil {
 			markReconcile()
 			return ErrSuiteServiceActivation
 		}
 		if err := advance(SuiteActivationCheckpointWritten); err != nil {
+			markReconcile()
+			return ErrSuiteServiceActivation
+		}
+	}
+	if journal.Stage == SuiteActivationCheckpointWritten {
+		if err := ensureEnabledEvidence(); err != nil {
+			markReconcile()
+			return err
+		}
+		if err := c.ResidentProof(ctx, handoff.ClientConfigPath); err != nil {
 			markReconcile()
 			return ErrSuiteServiceActivation
 		}

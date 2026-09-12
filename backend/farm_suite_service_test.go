@@ -95,7 +95,7 @@ func TestSuiteServiceCoordinatorSeparatesDurableTransitions(t *testing.T) {
 	if err := coordinator.Activate(context.Background(), roots); err != nil {
 		t.Fatal(err)
 	}
-	want := "validate,inspect-absent,register-disabled,inspect-exact_disabled,validate,inspect-exact_disabled,enable,validate,inspect-exact_enabled,start"
+	want := "validate,inspect-absent,register-disabled,inspect-exact_disabled,validate,inspect-exact_disabled,enable,validate,inspect-exact_enabled,start,validate,inspect-exact_enabled,validate,inspect-exact_enabled,validate,inspect-exact_enabled"
 	if strings.Join(platform.calls, ",") != want {
 		t.Fatalf("calls=%v", platform.calls)
 	}
@@ -108,7 +108,7 @@ func TestSuiteServiceCoordinatorSeparatesDurableTransitions(t *testing.T) {
 		t.Fatalf("checkpoint=%+v err=%v", cp, err)
 	}
 	platform.calls = nil
-	if err := coordinator.Activate(context.Background(), roots); err != nil || len(platform.calls) != 1 {
+	if err := coordinator.Activate(context.Background(), roots); err != nil || strings.Join(platform.calls, ",") != "validate,validate,inspect-exact_enabled" {
 		t.Fatalf("retry calls=%v err=%v", platform.calls, err)
 	}
 }
@@ -220,6 +220,88 @@ func TestSuiteServiceRechecksDisabledBeforeEnableAndEnabledBeforeStart(t *testin
 				t.Fatalf("journal=%+v", current)
 			}
 		})
+	}
+}
+
+func TestSuiteServiceRecoveryRequiresEnabledEvidenceAtEveryPostEnableStage(t *testing.T) {
+	for _, stage := range []SuiteActivationStage{SuiteActivationStartRequested, SuiteActivationResidentProved, SuiteActivationCheckpointWritten} {
+		for _, state := range []suiteServiceRegistrationState{suiteServiceRegistrationAbsent, suiteServiceRegistrationDrift} {
+			t.Run(string(stage)+"/"+string(state), func(t *testing.T) {
+				roots, preparation := enrolledSuiteFixture(t)
+				advanceActivationJournalForTest(t, roots, preparation, stage)
+				platform := &fakeSuiteServicePlatform{registration: state}
+				residentCalls := 0
+				coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error {
+					residentCalls++
+					return nil
+				}}
+				if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+					t.Fatalf("err=%v", err)
+				}
+				if residentCalls != 0 {
+					t.Fatalf("resident proof ran with registration %s", state)
+				}
+				journal, err := LoadSuiteActivationJournal(roots)
+				if err != nil || journal == nil || journal.Stage != SuiteActivationReconcileRequired {
+					t.Fatalf("journal=%+v err=%v", journal, err)
+				}
+			})
+		}
+	}
+}
+
+func TestSuiteServiceCompletedRecoveryRequiresResidentProof(t *testing.T) {
+	roots, _ := enrolledSuiteFixture(t)
+	platform := &fakeSuiteServicePlatform{}
+	coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error { return nil }}
+	if err := coordinator.Activate(context.Background(), roots); err != nil {
+		t.Fatal(err)
+	}
+	coordinator.ResidentProof = func(context.Context, string) error { return errors.New("resident disappeared") }
+	if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+		t.Fatalf("completed recovery=%v", err)
+	}
+	journal, err := LoadSuiteActivationJournal(roots)
+	if err != nil || journal == nil || journal.Stage != SuiteActivationReconcileRequired {
+		t.Fatalf("journal=%+v err=%v", journal, err)
+	}
+}
+
+func TestSuiteServiceResidentProvedRecoveryRechecksResidentBeforeCheckpoint(t *testing.T) {
+	roots, preparation := enrolledSuiteFixture(t)
+	advanceActivationJournalForTest(t, roots, preparation, SuiteActivationResidentProved)
+	platform := &fakeSuiteServicePlatform{registration: suiteServiceRegistrationExactEnabled}
+	coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error { return errors.New("resident disappeared") }}
+	if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+		t.Fatalf("resident recovery=%v", err)
+	}
+	checkpoint, err := LoadSetupCheckpoint(filepath.Join(roots.AgentState, "setup.json"))
+	if err != nil || checkpoint == nil || checkpoint.Stage != SetupEnrolled {
+		t.Fatalf("checkpoint=%+v err=%v", checkpoint, err)
+	}
+	journal, err := LoadSuiteActivationJournal(roots)
+	if err != nil || journal == nil || journal.Stage != SuiteActivationReconcileRequired {
+		t.Fatalf("journal=%+v err=%v", journal, err)
+	}
+}
+
+func advanceActivationJournalForTest(t *testing.T, roots SuiteUserRoots, preparation SetupPreparationCheckpoint, target SuiteActivationStage) {
+	t.Helper()
+	handoff, err := LoadSuiteOwnershipHandoff(roots)
+	if err != nil || handoff == nil {
+		t.Fatal(err)
+	}
+	taskHash := sha256.Sum256([]byte("task-current-user"))
+	journal := SuiteActivationJournal{SchemaVersion: 1, Stage: SuiteActivationValidated, RequestUID: preparation.RequestUID, Generation: 1, ClientConfigSHA256: handoff.ClientConfigSHA256, ManifestSHA256: handoff.ManifestSHA256, SetupStageID: handoff.SetupStageID, TaskIdentityDigest: hex.EncodeToString(taskHash[:])}
+	if err := saveSuiteActivationJournal(roots, journal); err != nil {
+		t.Fatal(err)
+	}
+	stages := []SuiteActivationStage{SuiteActivationValidated, SuiteActivationRegisterDisabled, SuiteActivationTaskAudited, SuiteActivationEnabled, SuiteActivationStartRequested, SuiteActivationResidentProved, SuiteActivationCheckpointWritten}
+	for suiteActivationStageIndex(journal.Stage) < suiteActivationStageIndex(target) {
+		journal.Stage = stages[suiteActivationStageIndex(journal.Stage)+1]
+		if err := saveSuiteActivationJournal(roots, journal); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -352,8 +434,8 @@ func TestSuiteActivationJournalRejectsSkipRollbackAndConcurrentDoubleStart(t *te
 func TestSuiteDoctorRequiresPlatformObservationAndTypedExit(t *testing.T) {
 	roots, _ := enrolledSuiteFixture(t)
 	platform := &fakeSuiteServicePlatform{}
-	coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error { return errors.New("not resident") }}
-	if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+	coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error { return nil }}
+	if err := coordinator.Activate(context.Background(), roots); err != nil {
 		t.Fatalf("activation=%v", err)
 	}
 	report := doctorSuiteWithPlatform(context.Background(), roots, platform)
