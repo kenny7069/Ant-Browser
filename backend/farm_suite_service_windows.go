@@ -26,8 +26,8 @@ func (windowsSuiteServicePlatform) ValidateInstall(h SuiteOwnershipHandoff) (str
 func (windowsSuiteServicePlatform) RegisterDisabled(SuiteOwnershipHandoff, string) error {
 	return ErrSuiteServiceActivation
 }
-func (windowsSuiteServicePlatform) Audit(SuiteOwnershipHandoff, string, bool) error {
-	return ErrSuiteServiceActivation
+func (windowsSuiteServicePlatform) InspectRegistration(SuiteOwnershipHandoff, string) (suiteServiceRegistrationState, error) {
+	return suiteServiceRegistrationDrift, ErrSuiteServiceActivation
 }
 func (windowsSuiteServicePlatform) Enable(SuiteOwnershipHandoff, string) error {
 	return ErrSuiteServiceActivation

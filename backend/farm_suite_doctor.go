@@ -77,8 +77,17 @@ func doctorSuiteWithPlatform(ctx context.Context, roots SuiteUserRoots, platform
 		block("resident_ipc", "control", "browser_smoke", "ready")
 		return report
 	}
-	wantEnabled := suiteActivationStageIndex(journal.Stage) >= suiteActivationStageIndex(SuiteActivationEnabled)
-	if platform.Audit(*handoff, identity, wantEnabled) != nil {
+	wantRegistration := suiteServiceRegistrationExactDisabled
+	if suiteActivationStageIndex(journal.Stage) >= suiteActivationStageIndex(SuiteActivationEnabled) {
+		wantRegistration = suiteServiceRegistrationExactEnabled
+	}
+	observedRegistration, inspectErr := platform.InspectRegistration(*handoff, identity)
+	if inspectErr != nil {
+		add("registration", "UNKNOWN", "REGISTRATION_OBSERVATION_DEFERRED", false)
+		block("resident_ipc", "control", "browser_smoke", "ready")
+		return report
+	}
+	if observedRegistration != wantRegistration {
 		add("registration", "FAIL", "REGISTRATION_AUDIT_FAILED", true)
 		block("resident_ipc", "control", "browser_smoke", "ready")
 		return report

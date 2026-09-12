@@ -2,6 +2,8 @@ package backend
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -12,8 +14,9 @@ import (
 )
 
 type fakeSuiteServicePlatform struct {
-	calls []string
-	fail  string
+	calls        []string
+	fail         string
+	registration suiteServiceRegistrationState
 }
 
 type fakeLegacyAutostartManager struct {
@@ -45,16 +48,28 @@ func (f *fakeSuiteServicePlatform) ValidateInstall(SuiteOwnershipHandoff) (strin
 	return "task-current-user", nil
 }
 func (f *fakeSuiteServicePlatform) RegisterDisabled(SuiteOwnershipHandoff, string) error {
-	return f.call("register-disabled")
-}
-func (f *fakeSuiteServicePlatform) Audit(_ SuiteOwnershipHandoff, _ string, enabled bool) error {
-	if enabled {
-		return f.call("audit-enabled")
+	if err := f.call("register-disabled"); err != nil {
+		return err
 	}
-	return f.call("audit-disabled")
+	f.registration = suiteServiceRegistrationExactDisabled
+	return nil
+}
+func (f *fakeSuiteServicePlatform) InspectRegistration(SuiteOwnershipHandoff, string) (suiteServiceRegistrationState, error) {
+	state := f.registration
+	if state == "" {
+		state = suiteServiceRegistrationAbsent
+	}
+	if err := f.call("inspect-" + strings.ToLower(string(state))); err != nil {
+		return suiteServiceRegistrationDrift, err
+	}
+	return state, nil
 }
 func (f *fakeSuiteServicePlatform) Enable(SuiteOwnershipHandoff, string) error {
-	return f.call("enable")
+	if err := f.call("enable"); err != nil {
+		return err
+	}
+	f.registration = suiteServiceRegistrationExactEnabled
+	return nil
 }
 func (f *fakeSuiteServicePlatform) Start(SuiteOwnershipHandoff, string) error { return f.call("start") }
 
@@ -80,7 +95,7 @@ func TestSuiteServiceCoordinatorSeparatesDurableTransitions(t *testing.T) {
 	if err := coordinator.Activate(context.Background(), roots); err != nil {
 		t.Fatal(err)
 	}
-	want := "validate,register-disabled,audit-disabled,validate,enable,validate,audit-enabled,validate,start"
+	want := "validate,inspect-absent,register-disabled,inspect-exact_disabled,validate,inspect-exact_disabled,enable,validate,inspect-exact_enabled,start"
 	if strings.Join(platform.calls, ",") != want {
 		t.Fatalf("calls=%v", platform.calls)
 	}
@@ -122,6 +137,99 @@ func TestSuiteServiceRequiresExactEnrolledAndMarksUnknownSideEffect(t *testing.T
 	if j == nil || j.Stage != SuiteActivationReconcileRequired {
 		t.Fatalf("journal=%+v", j)
 	}
+}
+
+func TestSuiteServiceRecoversDisabledRegistrationAndRejectsDrift(t *testing.T) {
+	roots, preparation := enrolledSuiteFixture(t)
+	handoff, err := LoadSuiteOwnershipHandoff(roots)
+	if err != nil || handoff == nil {
+		t.Fatal(err)
+	}
+	taskHash := sha256.Sum256([]byte("task-current-user"))
+	journal := SuiteActivationJournal{SchemaVersion: 1, Stage: SuiteActivationValidated, RequestUID: preparation.RequestUID, Generation: 1, ClientConfigSHA256: handoff.ClientConfigSHA256, ManifestSHA256: handoff.ManifestSHA256, SetupStageID: handoff.SetupStageID, TaskIdentityDigest: hex.EncodeToString(taskHash[:])}
+	if err := saveSuiteActivationJournal(roots, journal); err != nil {
+		t.Fatal(err)
+	}
+	platform := &fakeSuiteServicePlatform{registration: suiteServiceRegistrationExactDisabled}
+	coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error { return nil }}
+	if err := coordinator.Activate(context.Background(), roots); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(platform.calls, ","), "register-disabled") {
+		t.Fatalf("recovery re-registered task: %v", platform.calls)
+	}
+
+	for _, state := range []suiteServiceRegistrationState{suiteServiceRegistrationDrift, suiteServiceRegistrationExactEnabled} {
+		roots, preparation = enrolledSuiteFixture(t)
+		handoff, err = LoadSuiteOwnershipHandoff(roots)
+		if err != nil || handoff == nil {
+			t.Fatal(err)
+		}
+		journal = SuiteActivationJournal{SchemaVersion: 1, Stage: SuiteActivationValidated, RequestUID: preparation.RequestUID, Generation: 1, ClientConfigSHA256: handoff.ClientConfigSHA256, ManifestSHA256: handoff.ManifestSHA256, SetupStageID: handoff.SetupStageID, TaskIdentityDigest: hex.EncodeToString(taskHash[:])}
+		if err := saveSuiteActivationJournal(roots, journal); err != nil {
+			t.Fatal(err)
+		}
+		platform = &fakeSuiteServicePlatform{registration: state}
+		coordinator.Platform = platform
+		if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+			t.Fatalf("state=%s err=%v", state, err)
+		}
+		current, loadErr := LoadSuiteActivationJournal(roots)
+		if loadErr != nil || current == nil || current.Stage != SuiteActivationReconcileRequired {
+			t.Fatalf("state=%s journal=%+v err=%v", state, current, loadErr)
+		}
+		if containsSuiteServiceCall(platform.calls, "enable") || containsSuiteServiceCall(platform.calls, "start") {
+			t.Fatalf("state=%s unsafe calls=%v", state, platform.calls)
+		}
+	}
+}
+
+func TestSuiteServiceRechecksDisabledBeforeEnableAndEnabledBeforeStart(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		stage SuiteActivationStage
+		state suiteServiceRegistrationState
+	}{
+		{name: "drift before enable", stage: SuiteActivationTaskAudited, state: suiteServiceRegistrationDrift},
+		{name: "disabled before start", stage: SuiteActivationEnabled, state: suiteServiceRegistrationExactDisabled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			roots, preparation := enrolledSuiteFixture(t)
+			handoff, err := LoadSuiteOwnershipHandoff(roots)
+			if err != nil || handoff == nil {
+				t.Fatal(err)
+			}
+			taskHash := sha256.Sum256([]byte("task-current-user"))
+			journal := SuiteActivationJournal{SchemaVersion: 1, Stage: SuiteActivationValidated, RequestUID: preparation.RequestUID, Generation: 1, ClientConfigSHA256: handoff.ClientConfigSHA256, ManifestSHA256: handoff.ManifestSHA256, SetupStageID: handoff.SetupStageID, TaskIdentityDigest: hex.EncodeToString(taskHash[:])}
+			for suiteActivationStageIndex(journal.Stage) < suiteActivationStageIndex(test.stage) {
+				journal.Stage = []SuiteActivationStage{SuiteActivationValidated, SuiteActivationRegisterDisabled, SuiteActivationTaskAudited, SuiteActivationEnabled}[suiteActivationStageIndex(journal.Stage)+1]
+				if err := saveSuiteActivationJournal(roots, journal); err != nil {
+					t.Fatal(err)
+				}
+			}
+			platform := &fakeSuiteServicePlatform{registration: test.state}
+			coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error { return nil }}
+			if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+				t.Fatalf("err=%v", err)
+			}
+			if containsSuiteServiceCall(platform.calls, "enable") || containsSuiteServiceCall(platform.calls, "start") {
+				t.Fatalf("unsafe calls=%v", platform.calls)
+			}
+			current, _ := LoadSuiteActivationJournal(roots)
+			if current == nil || current.Stage != SuiteActivationReconcileRequired {
+				t.Fatalf("journal=%+v", current)
+			}
+		})
+	}
+}
+
+func containsSuiteServiceCall(calls []string, want string) bool {
+	for _, call := range calls {
+		if call == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSuiteActivationJournalStrictAndDoctorSecretFree(t *testing.T) {
@@ -260,6 +368,13 @@ func TestSuiteDoctorRequiresPlatformObservationAndTypedExit(t *testing.T) {
 	}
 	if !foundRegistration || report.Overall == "READY" || SuiteDoctorExitCode(report) == 0 {
 		t.Fatalf("report=%+v", report)
+	}
+	platform.registration = suiteServiceRegistrationDrift
+	drifted := doctorSuiteWithPlatform(context.Background(), roots, platform)
+	for _, layer := range drifted.Layers {
+		if layer.Name == "registration" && (layer.Status != "FAIL" || layer.Code != "REGISTRATION_AUDIT_FAILED") {
+			t.Fatalf("drift registration=%+v", layer)
+		}
 	}
 	deferred := doctorSuiteWithPlatform(context.Background(), roots, &fakeSuiteServicePlatform{fail: "validate"})
 	if deferred.ExitClass != "DEFERRED" || SuiteDoctorExitCode(deferred) != 5 {

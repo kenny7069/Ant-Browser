@@ -11,11 +11,20 @@ import (
 
 type suiteServicePlatform interface {
 	ValidateInstall(SuiteOwnershipHandoff) (string, error)
+	InspectRegistration(SuiteOwnershipHandoff, string) (suiteServiceRegistrationState, error)
 	RegisterDisabled(SuiteOwnershipHandoff, string) error
-	Audit(SuiteOwnershipHandoff, string, bool) error
 	Enable(SuiteOwnershipHandoff, string) error
 	Start(SuiteOwnershipHandoff, string) error
 }
+
+type suiteServiceRegistrationState string
+
+const (
+	suiteServiceRegistrationAbsent        suiteServiceRegistrationState = "ABSENT"
+	suiteServiceRegistrationExactDisabled suiteServiceRegistrationState = "EXACT_DISABLED"
+	suiteServiceRegistrationExactEnabled  suiteServiceRegistrationState = "EXACT_ENABLED"
+	suiteServiceRegistrationDrift         suiteServiceRegistrationState = "DRIFT"
+)
 
 type SuiteServiceCoordinator struct {
 	Platform      suiteServicePlatform
@@ -85,10 +94,24 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		}
 		return nil
 	}
+	inspectExact := func(expected suiteServiceRegistrationState) error {
+		observed, err := c.Platform.InspectRegistration(*handoff, taskIdentity)
+		if err != nil || observed != expected {
+			return ErrSuiteServiceActivation
+		}
+		return nil
+	}
 	if journal.Stage == SuiteActivationValidated {
-		if err := c.Platform.RegisterDisabled(*handoff, taskIdentity); err != nil {
+		observed, inspectErr := c.Platform.InspectRegistration(*handoff, taskIdentity)
+		if inspectErr != nil || (observed != suiteServiceRegistrationAbsent && observed != suiteServiceRegistrationExactDisabled) {
 			markReconcile()
 			return ErrSuiteServiceActivation
+		}
+		if observed == suiteServiceRegistrationAbsent {
+			if err := c.Platform.RegisterDisabled(*handoff, taskIdentity); err != nil {
+				markReconcile()
+				return ErrSuiteServiceActivation
+			}
 		}
 		if err := advance(SuiteActivationRegisterDisabled); err != nil {
 			markReconcile()
@@ -96,7 +119,7 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		}
 	}
 	if journal.Stage == SuiteActivationRegisterDisabled {
-		if err := c.Platform.Audit(*handoff, taskIdentity, false); err != nil {
+		if err := inspectExact(suiteServiceRegistrationExactDisabled); err != nil {
 			markReconcile()
 			return ErrSuiteServiceActivation
 		}
@@ -106,6 +129,11 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 	}
 	if journal.Stage == SuiteActivationTaskAudited {
 		if err := revalidate(); err != nil {
+			markReconcile()
+			return err
+		}
+		if err := inspectExact(suiteServiceRegistrationExactDisabled); err != nil {
+			markReconcile()
 			return err
 		}
 		if err := c.Platform.Enable(*handoff, taskIdentity); err != nil {
@@ -122,11 +150,7 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 			markReconcile()
 			return err
 		}
-		if err := c.Platform.Audit(*handoff, taskIdentity, true); err != nil {
-			markReconcile()
-			return ErrSuiteServiceActivation
-		}
-		if err := revalidate(); err != nil {
+		if err := inspectExact(suiteServiceRegistrationExactEnabled); err != nil {
 			markReconcile()
 			return err
 		}

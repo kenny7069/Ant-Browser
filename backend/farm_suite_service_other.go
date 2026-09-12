@@ -13,8 +13,8 @@ func (unsupportedSuiteServicePlatform) ValidateInstall(SuiteOwnershipHandoff) (s
 func (unsupportedSuiteServicePlatform) RegisterDisabled(SuiteOwnershipHandoff, string) error {
 	return ErrSuiteServiceActivation
 }
-func (unsupportedSuiteServicePlatform) Audit(SuiteOwnershipHandoff, string, bool) error {
-	return ErrSuiteServiceActivation
+func (unsupportedSuiteServicePlatform) InspectRegistration(SuiteOwnershipHandoff, string) (suiteServiceRegistrationState, error) {
+	return suiteServiceRegistrationDrift, ErrSuiteServiceActivation
 }
 func (unsupportedSuiteServicePlatform) Enable(SuiteOwnershipHandoff, string) error {
 	return ErrSuiteServiceActivation
