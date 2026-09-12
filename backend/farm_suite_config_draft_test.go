@@ -367,13 +367,13 @@ func TestSuiteCanonicalConfigDraftFailuresAndCommitUnknownRecover(t *testing.T) 
 		fixture := newSuiteConfigDraftFixture(t)
 		applicationRoot := filepath.Join(fixture.roots.BrowserData, suiteConfigDraftApplicationDir)
 		operations := defaultSuiteConfigDraftApplicationRootOperations()
-		operations.Secure = func(path string, _ bool) error {
+		operations.SecureHandle = func(path string, _ os.FileInfo) (os.FileInfo, error) {
 			if runtime.GOOS != "windows" {
 				if err := os.Chmod(path, 0o755); err != nil {
-					return err
+					return nil, err
 				}
 			}
-			return errors.New("injected secure failure")
+			return nil, errors.New("injected secure failure")
 		}
 		deps := suiteConfigDraftTestDependencies()
 		deps.EnsureApplication = func(path string, allowCreate bool) (os.FileInfo, error) {
@@ -397,18 +397,18 @@ func TestSuiteCanonicalConfigDraftFailuresAndCommitUnknownRecover(t *testing.T) 
 		fixture := newSuiteConfigDraftFixture(t)
 		applicationRoot := filepath.Join(fixture.roots.BrowserData, suiteConfigDraftApplicationDir)
 		replacement := filepath.Join(t.TempDir(), "replacement")
-		if err := os.Mkdir(replacement, 0o700); err != nil {
+		if err := os.Mkdir(replacement, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		operations := defaultSuiteConfigDraftApplicationRootOperations()
-		operations.Secure = func(path string, _ bool) error {
+		operations.SecureHandle = func(path string, expected os.FileInfo) (os.FileInfo, error) {
 			if err := os.Remove(path); err != nil {
-				return err
+				return nil, err
 			}
 			if err := os.Rename(replacement, path); err != nil {
-				return err
+				return nil, err
 			}
-			return errors.New("injected secure failure after replacement")
+			return secureSuiteConfigDraftApplicationRootHandle(path, expected)
 		}
 		deps := suiteConfigDraftTestDependencies()
 		deps.EnsureApplication = func(path string, allowCreate bool) (os.FileInfo, error) {
@@ -419,6 +419,8 @@ func TestSuiteCanonicalConfigDraftFailuresAndCommitUnknownRecover(t *testing.T) 
 		}
 		if info, err := os.Lstat(applicationRoot); err != nil || !info.IsDir() {
 			t.Fatalf("replacement deleted: info=%v err=%v", info, err)
+		} else if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
+			t.Fatalf("replacement chmodded through stale pathname: mode=%o", info.Mode().Perm())
 		}
 		assertSuiteConfigDraftCheckpoint(t, fixture, SetupStaged)
 		if draft, err := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap); err != nil || draft != nil {
@@ -429,11 +431,11 @@ func TestSuiteCanonicalConfigDraftFailuresAndCommitUnknownRecover(t *testing.T) 
 		fixture := newSuiteConfigDraftFixture(t)
 		applicationRoot := filepath.Join(fixture.roots.BrowserData, suiteConfigDraftApplicationDir)
 		operations := defaultSuiteConfigDraftApplicationRootOperations()
-		operations.Secure = func(path string, _ bool) error {
+		operations.SecureHandle = func(path string, _ os.FileInfo) (os.FileInfo, error) {
 			if err := os.WriteFile(filepath.Join(path, "foreign"), []byte("keep"), 0o600); err != nil {
-				return err
+				return nil, err
 			}
-			return errors.New("injected secure failure after foreign write")
+			return nil, errors.New("injected secure failure after foreign write")
 		}
 		deps := suiteConfigDraftTestDependencies()
 		deps.EnsureApplication = func(path string, allowCreate bool) (os.FileInfo, error) {

@@ -28,17 +28,17 @@ type suiteCanonicalConfigDraftDependencies struct {
 }
 
 type suiteConfigDraftApplicationRootOperations struct {
-	Mkdir      func(string, os.FileMode) error
-	Lstat      func(string) (os.FileInfo, error)
-	Secure     func(string, bool) error
-	SyncParent func(string) error
-	ReadDir    func(string) ([]os.DirEntry, error)
-	Resolve    func(string) (string, os.FileInfo, error)
+	Mkdir        func(string, os.FileMode) error
+	Lstat        func(string) (os.FileInfo, error)
+	SecureHandle func(string, os.FileInfo) (os.FileInfo, error)
+	SyncParent   func(string) error
+	ReadDir      func(string) ([]os.DirEntry, error)
+	Resolve      func(string) (string, os.FileInfo, error)
 }
 
 func defaultSuiteConfigDraftApplicationRootOperations() suiteConfigDraftApplicationRootOperations {
 	return suiteConfigDraftApplicationRootOperations{
-		Mkdir: os.Mkdir, Lstat: os.Lstat, Secure: secureSuiteSetupPath,
+		Mkdir: os.Mkdir, Lstat: os.Lstat, SecureHandle: secureSuiteConfigDraftApplicationRootHandle,
 		SyncParent: syncSuiteSetupDirectory, ReadDir: os.ReadDir,
 		Resolve: suitePrecheckResolvedPath,
 	}
@@ -184,7 +184,7 @@ func ensureSuiteConfigDraftApplicationRoot(path string, allowCreate bool) (os.Fi
 }
 
 func ensureSuiteConfigDraftApplicationRootWithOperations(path string, allowCreate bool, operations suiteConfigDraftApplicationRootOperations) (os.FileInfo, error) {
-	if operations.Mkdir == nil || operations.Lstat == nil || operations.Secure == nil || operations.SyncParent == nil || operations.ReadDir == nil || operations.Resolve == nil {
+	if operations.Mkdir == nil || operations.Lstat == nil || operations.SecureHandle == nil || operations.SyncParent == nil || operations.ReadDir == nil || operations.Resolve == nil {
 		return nil, ErrSuiteCanonicalConfigDraft
 	}
 	info, err := operations.Lstat(path)
@@ -211,7 +211,8 @@ func ensureSuiteConfigDraftApplicationRootWithOperations(path string, allowCreat
 		if parentErr != nil || parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() || validateSuiteSetupPathSecurity(filepath.Dir(path), true) != nil || resolveErr != nil || resolvedParent == nil || !os.SameFile(parentInfo, resolvedParent) {
 			return nil, ErrSuiteCanonicalConfigDraft
 		}
-		if operations.Secure(path, true) != nil || operations.SyncParent(filepath.Dir(path)) != nil {
+		securedInfo, secureErr := operations.SecureHandle(path, info)
+		if secureErr != nil || securedInfo == nil || !os.SameFile(info, securedInfo) || operations.SyncParent(filepath.Dir(path)) != nil {
 			return nil, ErrSuiteCanonicalConfigDraft
 		}
 	}
