@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 type suiteEnrollmentMemoryStore struct {
@@ -128,6 +129,19 @@ func TestLoadSuiteBootstrapEnrollmentPreparationRequiresDraftedExactBootstrap(t 
 	missing.StatePath = filepath.Join(missingRoots.AgentState, "setup.json")
 	if _, err := loadSuiteBootstrapEnrollmentPreparation(missing, missingRoots); !errors.Is(err, ErrSuiteBootstrapEnrollmentConfig) {
 		t.Fatalf("missing preparation error=%v", err)
+	}
+}
+
+func TestSuiteBootstrapEnrollmentNodeUIDWireContract(t *testing.T) {
+	for _, value := range []string{strings.Repeat("é", 128), " leading and trailing "} {
+		if !validSuiteBootstrapEnrollmentNodeUID(value) {
+			t.Fatalf("valid node UID rejected: rune_count=%d", utf8.RuneCountInString(value))
+		}
+	}
+	for _, value := range []string{strings.Repeat("é", 129), "node\x00uid", string([]byte{0xff})} {
+		if validSuiteBootstrapEnrollmentNodeUID(value) {
+			t.Fatalf("invalid node UID accepted: %q", value)
+		}
 	}
 }
 

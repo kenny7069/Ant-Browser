@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -125,6 +126,13 @@ func loadSuiteBootstrapEnrollmentAttempt(roots SuiteUserRoots) (*SuiteBootstrapE
 			return nil, candidateErr
 		}
 	}
+	if primary != nil && backup != nil {
+		primaryStage := suiteBootstrapEnrollmentStageIndex(primary.Stage)
+		backupStage := suiteBootstrapEnrollmentStageIndex(backup.Stage)
+		if !sameSuiteBootstrapEnrollmentBinding(*primary, *backup) || backupStage > primaryStage || primaryStage-backupStage > 1 || (backupStage == primaryStage && *backup != *primary) {
+			return nil, ErrSuiteBootstrapEnrollmentState
+		}
+	}
 	if primaryErr == nil && primary != nil {
 		if backupErr != nil {
 			return nil, backupErr
@@ -215,7 +223,7 @@ func suiteBootstrapEnrollmentRawContainsSecret(raw []byte) bool {
 }
 
 func validSuiteBootstrapEnrollmentNodeUID(value string) bool {
-	if len(value) == 0 || len(value) > 128 || strings.TrimSpace(value) != value {
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) == 0 || utf8.RuneCountInString(value) > 128 {
 		return false
 	}
 	for _, character := range value {

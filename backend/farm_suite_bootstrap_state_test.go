@@ -162,3 +162,48 @@ func TestSuiteBootstrapEnrollmentAttemptRejectsSecretBackupEvenWithValidPrimary(
 		t.Fatalf("secret backup error=%v", err)
 	}
 }
+
+func TestSuiteBootstrapEnrollmentAttemptRejectsConflictingOrFutureBackup(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		primary SuiteBootstrapEnrollmentAttempt
+		backup  SuiteBootstrapEnrollmentAttempt
+	}{
+		{
+			name:    "conflicting binding",
+			primary: suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapRequestReady),
+			backup: func() SuiteBootstrapEnrollmentAttempt {
+				value := suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapIdentityReady)
+				value.MetadataSHA256 = strings.Repeat("8", 64)
+				return value
+			}(),
+		},
+		{
+			name:    "future backup",
+			primary: suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapIdentityReady),
+			backup:  suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapRequestReady),
+		},
+		{
+			name:    "same stage different ACK",
+			primary: suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapAcknowledged),
+			backup: func() SuiteBootstrapEnrollmentAttempt {
+				value := suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapAcknowledged)
+				value.NodeUID = "other-node"
+				return value
+			}(),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			roots := suiteBootstrapEnrollmentTestRoots(t)
+			if err := writeSuiteBootstrapEnrollmentAttemptFile(filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName), test.primary); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeSuiteBootstrapEnrollmentAttemptFile(filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName+".bak"), test.backup); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadSuiteBootstrapEnrollmentAttempt(roots); !errors.Is(err, ErrSuiteBootstrapEnrollmentState) {
+				t.Fatalf("conflicting backup accepted: %v", err)
+			}
+		})
+	}
+}
