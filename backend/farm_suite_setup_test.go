@@ -238,6 +238,9 @@ func TestSetupCheckpointClosedJSONCannotBeHiddenByOtherCopy(t *testing.T) {
 		"duplicate":         []byte(`{"schema_version":1,"stage":"PRECHECK","stage":"PRECHECK","request_uid":"b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"}`),
 		"unknown":           []byte(`{"schema_version":1,"stage":"PRECHECK","request_uid":"b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6","private_key":"secret"}`),
 		"unknown truncated": []byte(`{"schema_version":1,"private_key":"secret",`),
+		"array":             []byte(`[]`),
+		"scalar":            []byte(`"checkpoint"`),
+		"field type":        []byte(`{"schema_version":"1","stage":"PRECHECK","request_uid":"b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"}`),
 		"trailing":          append(append([]byte{}, valid...), []byte(` {}`)...),
 	}
 	for _, location := range []string{"primary", "backup"} {

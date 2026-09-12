@@ -124,6 +124,9 @@ func readSetupCheckpointFile(path string) (*SetupCheckpoint, error) {
 		if strings.HasPrefix(err.Error(), "json: unknown field") {
 			return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnknownField)
 		}
+		if json.Valid(data) {
+			return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointSchema)
+		}
 		return nil, fmt.Errorf("%w: decode", ErrSetupCheckpoint)
 	}
 	if duplicateErr != nil {
