@@ -23,7 +23,7 @@ func suiteReleaseManifestFixture() SuiteReleaseManifest {
 		ConfigSchema:  3,
 		Capabilities:  []string{"setup-plan", "signed-release"},
 		CoreVersions:  map[string]string{"chromium": "128.0.0", "xray": "25.1.1"},
-		Dependencies:  []SuiteReleaseDependency{{Name: "glibc", Version: "2.31", SPDXExpression: "LGPL-2.1-or-later"}},
+		Dependencies:  []SuiteReleaseDependency{{Name: "glibc", Version: "2.31", LicenseRef: "LICENSE"}},
 		Entries: []SuiteReleaseEntry{{
 			Path: "bin/ant-farm-agent", Role: SuiteReleaseEntryBinary, Size: 12,
 			SHA256: hex.EncodeToString(digest[:]), Executable: true,
@@ -115,8 +115,15 @@ func TestSuiteReleaseManifestStrictJSONAndEntryRules(t *testing.T) {
 			}
 		})
 	}
+	legacyLicenseField := strings.Replace(string(raw), `"license_ref":"LICENSE"`, `"spdx_expression":"MIT"`, 1)
+	if _, err := ParseSuiteReleaseManifest([]byte(legacyLicenseField)); !errors.Is(err, ErrSuiteReleaseManifest) {
+		t.Fatalf("legacy SPDX-shaped dependency accepted: %v", err)
+	}
 
-	for _, badPath := range []string{"/bin/agent", "../agent", "bin/../agent", `bin\agent.exe`, "bin/agent.exe:stream", "./bin/agent"} {
+	for _, badPath := range []string{
+		"/bin/agent", "../agent", "bin/../agent", `bin\agent.exe`, "bin/agent.exe:stream", "./bin/agent",
+		"bad?.txt", "bad\x01.txt", "COM¹", "CON .txt", "caf\u00e9.txt", "cafe\u0301.txt", "legal/LICENSE.",
+	} {
 		t.Run(badPath, func(t *testing.T) {
 			manifest := suiteReleaseManifestFixture()
 			manifest.Entries[0].Path = badPath
@@ -128,7 +135,6 @@ func TestSuiteReleaseManifestStrictJSONAndEntryRules(t *testing.T) {
 
 	for name, mutate := range map[string]func(*SuiteReleaseManifest){
 		"case fold collision": func(manifest *SuiteReleaseManifest) {
-			manifest.Target.OS = "windows"
 			entry := manifest.Entries[0]
 			entry.Path = "BIN/ANT-FARM-AGENT"
 			manifest.Entries = append(manifest.Entries, entry)
@@ -144,8 +150,17 @@ func TestSuiteReleaseManifestStrictJSONAndEntryRules(t *testing.T) {
 			manifest.Capabilities = append(manifest.Capabilities, "SETUP-PLAN")
 		},
 		"non semver version": func(manifest *SuiteReleaseManifest) { manifest.Version = "dev" },
-		"dependency without license": func(manifest *SuiteReleaseManifest) {
-			manifest.Dependencies[0].SPDXExpression = ""
+		"dependency without license ref": func(manifest *SuiteReleaseManifest) {
+			manifest.Dependencies[0].LicenseRef = ""
+		},
+		"dangling license ref": func(manifest *SuiteReleaseManifest) {
+			manifest.Dependencies[0].LicenseRef = "NOTICE"
+		},
+		"nonlegal license ref": func(manifest *SuiteReleaseManifest) {
+			manifest.Dependencies[0].LicenseRef = "bin/ant-farm-agent"
+		},
+		"case equivalent license ref": func(manifest *SuiteReleaseManifest) {
+			manifest.Dependencies[0].LicenseRef = "license"
 		},
 		"missing legal": func(manifest *SuiteReleaseManifest) { manifest.Entries = manifest.Entries[:1] },
 		"ancestor collision": func(manifest *SuiteReleaseManifest) {
@@ -154,7 +169,6 @@ func TestSuiteReleaseManifestStrictJSONAndEntryRules(t *testing.T) {
 			manifest.Entries = append(manifest.Entries, entry)
 		},
 		"windows reserved basename": func(manifest *SuiteReleaseManifest) {
-			manifest.Target.OS = "windows"
 			manifest.Entries[1].Path = "legal/CON.txt"
 		},
 		"windows trailing dot": func(manifest *SuiteReleaseManifest) {
@@ -203,7 +217,7 @@ func TestSuiteReleaseManifestResourceAndReleasePolicyLimits(t *testing.T) {
 		"too many capabilities": func(manifest *SuiteReleaseManifest) {
 			manifest.Capabilities = make([]string, maxSuiteReleaseCapabilities+1)
 		},
-		"dependency license": func(manifest *SuiteReleaseManifest) { manifest.Dependencies[0].SPDXExpression = "MIT;rm -rf" },
+		"dependency license path": func(manifest *SuiteReleaseManifest) { manifest.Dependencies[0].LicenseRef = "LICENSE.txt" },
 		"core case fold collision": func(manifest *SuiteReleaseManifest) {
 			manifest.CoreVersions["XRAY"] = manifest.CoreVersions["xray"]
 		},

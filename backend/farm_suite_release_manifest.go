@@ -40,7 +40,7 @@ const (
 var suiteReleaseTokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 var suiteReleaseCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 var suiteReleaseSemverPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
-var suiteReleaseSPDXPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]*( (AND|OR|WITH) [A-Za-z0-9][A-Za-z0-9.-]*)*$`)
+var suiteReleasePathSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*$`)
 
 type SuiteReleaseTarget struct {
 	OS   string `json:"os"`
@@ -54,9 +54,9 @@ type SuiteReleaseCommits struct {
 }
 
 type SuiteReleaseDependency struct {
-	Name           string `json:"name"`
-	Version        string `json:"version"`
-	SPDXExpression string `json:"spdx_expression"`
+	Name       string `json:"name"`
+	Version    string `json:"version"`
+	LicenseRef string `json:"license_ref"`
 }
 
 type SuiteReleaseEntry struct {
@@ -135,8 +135,7 @@ func (m SuiteReleaseManifest) Validate() error {
 	seenDependencies := map[string]struct{}{}
 	for _, dependency := range m.Dependencies {
 		key := strings.ToLower(dependency.Name)
-		if !suiteReleaseTokenPattern.MatchString(dependency.Name) || !suiteReleaseTokenPattern.MatchString(dependency.Version) ||
-			!validSuiteReleaseSPDX(dependency.SPDXExpression) {
+		if !suiteReleaseTokenPattern.MatchString(dependency.Name) || !suiteReleaseTokenPattern.MatchString(dependency.Version) {
 			return fmt.Errorf("%w: invalid dependency", ErrSuiteReleaseManifest)
 		}
 		if _, exists := seenDependencies[key]; exists {
@@ -145,10 +144,11 @@ func (m SuiteReleaseManifest) Validate() error {
 		seenDependencies[key] = struct{}{}
 	}
 	seenPaths := map[string]struct{}{}
+	legalPaths := map[string]string{}
 	hasBinary, hasLegal := false, false
 	totalSize := int64(0)
 	for _, entry := range m.Entries {
-		normalized, canonical, err := normalizeSuiteReleasePath(entry.Path, m.Target)
+		normalized, canonical, err := normalizeSuiteReleasePath(entry.Path)
 		if err != nil || normalized != entry.Path {
 			return fmt.Errorf("%w: invalid entry path %q", ErrSuiteReleaseManifest, entry.Path)
 		}
@@ -183,6 +183,7 @@ func (m SuiteReleaseManifest) Validate() error {
 			if entry.Size == 0 {
 				return fmt.Errorf("%w: legal entry cannot be empty", ErrSuiteReleaseManifest)
 			}
+			legalPaths[canonical] = entry.Path
 		}
 		if entry.Size > maxSuiteReleaseTotalBytes-totalSize {
 			return fmt.Errorf("%w: aggregate unpacked size exceeds limit", ErrSuiteReleaseManifest)
@@ -191,6 +192,12 @@ func (m SuiteReleaseManifest) Validate() error {
 	}
 	if !hasBinary || !hasLegal {
 		return fmt.Errorf("%w: binary and legal entries are required", ErrSuiteReleaseManifest)
+	}
+	for _, dependency := range m.Dependencies {
+		normalized, canonical, err := normalizeSuiteReleasePath(dependency.LicenseRef)
+		if err != nil || normalized != dependency.LicenseRef || legalPaths[canonical] != dependency.LicenseRef {
+			return fmt.Errorf("%w: dependency license_ref must exactly name a legal entry", ErrSuiteReleaseManifest)
+		}
 	}
 	return nil
 }
@@ -278,7 +285,7 @@ func SuiteReleaseManifestSHA256(raw []byte) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func normalizeSuiteReleasePath(raw string, target SuiteReleaseTarget) (string, string, error) {
+func normalizeSuiteReleasePath(raw string) (string, string, error) {
 	if raw == "" || strings.TrimSpace(raw) != raw || strings.Contains(raw, `\`) || strings.Contains(raw, ":") ||
 		strings.IndexByte(raw, 0) >= 0 || strings.HasPrefix(raw, "/") || filepath.IsAbs(raw) || len(raw) > maxSuiteReleasePathBytes {
 		return "", "", ErrSuiteReleaseManifest
@@ -288,18 +295,12 @@ func normalizeSuiteReleasePath(raw string, target SuiteReleaseTarget) (string, s
 		return "", "", ErrSuiteReleaseManifest
 	}
 	for _, segment := range strings.Split(cleaned, "/") {
-		if segment == "" || segment == "." || segment == ".." || len(segment) > maxSuiteReleaseSegmentBytes {
-			return "", "", ErrSuiteReleaseManifest
-		}
-		if target.OS == "windows" && (strings.HasSuffix(segment, ".") || strings.HasSuffix(segment, " ") || isWindowsReservedSuiteBasename(segment)) {
+		if segment == "" || segment == "." || segment == ".." || len(segment) > maxSuiteReleaseSegmentBytes ||
+			!suiteReleasePathSegmentPattern.MatchString(segment) || strings.HasSuffix(segment, ".") || isWindowsReservedSuiteBasename(segment) {
 			return "", "", ErrSuiteReleaseManifest
 		}
 	}
-	canonical := cleaned
-	if target.OS == "windows" || target.OS == "darwin" {
-		canonical = strings.ToLower(canonical)
-	}
-	return cleaned, canonical, nil
+	return cleaned, strings.ToLower(cleaned), nil
 }
 
 func validSuiteReleaseTarget(target SuiteReleaseTarget) bool {
@@ -365,10 +366,6 @@ func validSuiteReleaseSemver(version string) bool {
 	return true
 }
 
-func validSuiteReleaseSPDX(expression string) bool {
-	return len(expression) <= 256 && suiteReleaseSPDXPattern.MatchString(expression)
-}
-
 func isWindowsReservedSuiteBasename(segment string) bool {
 	base := strings.ToUpper(strings.SplitN(segment, ".", 2)[0])
 	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" {
@@ -411,7 +408,7 @@ func decodeSuiteReleaseManifestJSON(raw []byte, destination *SuiteReleaseManifes
 		return err
 	}
 	for _, dependency := range dependencies {
-		if _, err := exactSuiteReleaseJSONObject(dependency, []string{"name", "version", "spdx_expression"}); err != nil {
+		if _, err := exactSuiteReleaseJSONObject(dependency, []string{"name", "version", "license_ref"}); err != nil {
 			return err
 		}
 	}
