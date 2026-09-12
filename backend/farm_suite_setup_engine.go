@@ -32,6 +32,7 @@ var (
 	ErrSuiteSetupLocked        = errors.New("suite setup is already running")
 	ErrSuiteSetupCorrupt       = errors.New("suite setup state is corrupt")
 	ErrSuiteSetupExistingState = errors.New("existing suite state requires explicit handling")
+	errSuiteSetupUnknownField  = errors.New("unknown suite setup field")
 )
 
 var setupPreparationStageOrder = []SetupStage{SetupInputValidated, SetupUserRootsReady, SetupBootstrapDrafted}
@@ -62,6 +63,7 @@ type legacySetupMigration struct {
 	BackupSHA256    string     `json:"backup_sha256,omitempty"`
 	primaryRaw      []byte
 	backupRaw       []byte
+	journaled       bool
 }
 
 func preparationStageIndex(stage SetupStage) int {
@@ -158,6 +160,13 @@ func (c *SuiteSetupCoordinator) Run() (SuiteSetupResult, error) {
 		return SuiteSetupResult{Classification: SuiteSetupCorrupt, BootstrapPath: c.bootstrapPath()}, err
 	}
 	if legacy != nil {
+		current, loadErr := loadSetupPreparationCheckpoint(c.preparationPath())
+		if loadErr != nil {
+			return SuiteSetupResult{Classification: SuiteSetupCorrupt, BootstrapPath: c.bootstrapPath()}, loadErr
+		}
+		if err := validateLegacyPreparationConsistency(current, legacy); err != nil {
+			return SuiteSetupResult{Classification: SuiteSetupCorrupt, BootstrapPath: c.bootstrapPath()}, err
+		}
 		if err := migrateLegacySetupPreparation(c.Roots, config, legacy); err != nil {
 			return SuiteSetupResult{Classification: SuiteSetupExisting, BootstrapPath: c.bootstrapPath()}, err
 		}
@@ -248,6 +257,9 @@ func classifySuiteSetup(roots SuiteUserRoots, config BootstrapConfig) (SuiteSetu
 		return SuiteSetupCorrupt, nil, legacyErr
 	}
 	if legacy != nil {
+		if err := validateLegacyPreparationConsistency(checkpoint, legacy); err != nil {
+			return SuiteSetupCorrupt, nil, err
+		}
 		return SuiteSetupExisting, checkpoint, nil
 	}
 	draft, draftExists, draftErr := loadBootstrapDraft(filepath.Join(roots.Config, suiteBootstrapDraftName))
@@ -297,6 +309,7 @@ func inspectLegacySetupMigration(roots SuiteUserRoots, config BootstrapConfig) (
 		if err := hydrateLegacyMigration(&marker, config); err != nil {
 			return nil, err
 		}
+		marker.journaled = true
 		return &marker, nil
 	}
 
@@ -318,7 +331,7 @@ func inspectLegacySetupMigration(roots SuiteUserRoots, config BootstrapConfig) (
 	if backupErr != nil {
 		return nil, fmt.Errorf("%w: invalid legacy backup", ErrSuiteSetupCorrupt)
 	}
-	if primaryErr != nil && !(backup != nil && errors.Is(primaryErr, io.ErrUnexpectedEOF)) {
+	if primaryErr != nil && (backup == nil || errors.Is(primaryErr, errSuiteSetupUnknownField)) {
 		return nil, fmt.Errorf("%w: invalid legacy primary", ErrSuiteSetupCorrupt)
 	}
 	target := primary
@@ -377,6 +390,22 @@ func (m *legacySetupMigration) validate() error {
 	return nil
 }
 
+func validateLegacyPreparationConsistency(checkpoint *SetupPreparationCheckpoint, migration *legacySetupMigration) error {
+	if checkpoint == nil {
+		return nil
+	}
+	if checkpoint.RequestUID != migration.RequestUID || checkpoint.BootstrapSHA256 != migration.BootstrapSHA256 {
+		return fmt.Errorf("%w: preparation checkpoint conflicts with legacy migration identity", ErrSuiteSetupCorrupt)
+	}
+	checkpointIndex := preparationStageIndex(checkpoint.Stage)
+	migrationIndex := preparationStageIndex(migration.Stage)
+	if checkpointIndex < 0 || migrationIndex < 0 || (!migration.journaled && checkpointIndex != migrationIndex) ||
+		(migration.journaled && checkpointIndex > migrationIndex) {
+		return fmt.Errorf("%w: preparation checkpoint conflicts with legacy migration stage", ErrSuiteSetupCorrupt)
+	}
+	return nil
+}
+
 func hydrateLegacyMigration(migration *legacySetupMigration, config BootstrapConfig) error {
 	for _, item := range []struct {
 		source, archive, digest string
@@ -427,8 +456,8 @@ func migrateLegacySetupPreparation(roots SuiteUserRoots, config BootstrapConfig,
 	if err != nil {
 		return err
 	}
-	if current != nil && (current.RequestUID != migration.RequestUID || current.BootstrapSHA256 != migration.BootstrapSHA256) {
-		return fmt.Errorf("%w: preparation checkpoint conflicts with migration", ErrSuiteSetupCorrupt)
+	if err := validateLegacyPreparationConsistency(current, migration); err != nil {
+		return err
 	}
 	start := 0
 	if current != nil {
@@ -507,6 +536,9 @@ func decodeStrictJSON(raw []byte, destination any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
+		if strings.HasPrefix(err.Error(), "json: unknown field") {
+			return fmt.Errorf("%w: %v", errSuiteSetupUnknownField, err)
+		}
 		return err
 	}
 	return requireJSONEOF(decoder)
