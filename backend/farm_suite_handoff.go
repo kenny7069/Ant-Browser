@@ -30,9 +30,12 @@ var (
 	ErrSuiteOwnershipHandoffConflict = errors.New("suite ownership handoff conflicts with durable intent")
 )
 
-// SuiteOwnershipHandoff is the durable boundary between setup and service or
-// GUI startup. It contains paths and digests only; identity keys and enrollment
-// material remain in the protected client configuration and secret store.
+// SuiteOwnershipHandoff is durable ownership intent. It is necessary evidence,
+// but is not READY and must never authorize service or GUI startup by itself.
+// T07 must additionally resolve the canonical machine install root and ACL and
+// revalidate the release immediately before a process is started. This record
+// contains paths and digests only; identity keys and enrollment material remain
+// in the protected client configuration and secret store.
 type SuiteOwnershipHandoff struct {
 	SchemaVersion      int                `json:"schema_version"`
 	HandoffState       string             `json:"handoff_state"`
@@ -336,7 +339,8 @@ func validateInstalledSuiteRelease(suiteBinaryRoot string, plan SuiteSetupPlan) 
 	}
 	digestBytes := sha256.Sum256(raw)
 	digest := hex.EncodeToString(digestBytes[:])
-	if digest != plan.ManifestSHA256 || manifest.Target != plan.Target {
+	currentTarget := SuiteReleaseTarget{OS: runtime.GOOS, Arch: runtime.GOARCH}
+	if digest != plan.ManifestSHA256 || manifest.Target != plan.Target || plan.Target != currentTarget {
 		return SuiteReleaseManifest{}, "", fmt.Errorf("%w: release manifest does not match setup plan", ErrSuiteOwnershipHandoff)
 	}
 	required := map[string]bool{
@@ -369,7 +373,56 @@ func validateInstalledSuiteRelease(suiteBinaryRoot string, plan SuiteSetupPlan) 
 			return SuiteReleaseManifest{}, "", fmt.Errorf("%w: release manifest omits %s", ErrSuiteOwnershipHandoff, path)
 		}
 	}
+	if err := validateInstalledSuiteTree(suiteBinaryRoot, manifest); err != nil {
+		return SuiteReleaseManifest{}, "", err
+	}
 	return manifest, digest, nil
+}
+
+func validateInstalledSuiteTree(root string, manifest SuiteReleaseManifest) error {
+	allowedFiles := map[string]struct{}{
+		"release-manifest.json":          {},
+		"release-manifest.envelope.json": {},
+	}
+	allowedDirectories := map[string]struct{}{".": {}}
+	for _, entry := range manifest.Entries {
+		relative := filepath.ToSlash(filepath.Clean(filepath.FromSlash(entry.Path)))
+		allowedFiles[relative] = struct{}{}
+		for directory := filepath.ToSlash(filepath.Dir(filepath.FromSlash(entry.Path))); directory != "."; directory = filepath.ToSlash(filepath.Dir(filepath.FromSlash(directory))) {
+			allowedDirectories[directory] = struct{}{}
+		}
+	}
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("%w: walk installed Suite tree", ErrSuiteOwnershipHandoff)
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("%w: installed Suite tree path", ErrSuiteOwnershipHandoff)
+		}
+		relative = filepath.ToSlash(relative)
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: symlink in installed Suite tree", ErrSuiteOwnershipHandoff)
+		}
+		isReparsePoint, err := suitePathIsReparsePoint(path)
+		if err != nil || isReparsePoint {
+			return fmt.Errorf("%w: reparse point in installed Suite tree", ErrSuiteOwnershipHandoff)
+		}
+		if entry.IsDir() {
+			if _, allowed := allowedDirectories[relative]; !allowed {
+				return fmt.Errorf("%w: unexpected directory in installed Suite tree", ErrSuiteOwnershipHandoff)
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("%w: unsupported installed Suite tree entry", ErrSuiteOwnershipHandoff)
+		}
+		if _, allowed := allowedFiles[relative]; !allowed {
+			return fmt.Errorf("%w: unexpected file in installed Suite tree", ErrSuiteOwnershipHandoff)
+		}
+		return nil
+	})
 }
 
 func streamSuiteInstalledEntryDigest(path string, expectedSize int64) (digest string, resultErr error) {

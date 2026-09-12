@@ -92,7 +92,7 @@ func suiteHandoffFixture(t *testing.T) (SuiteUserRoots, SetupPreparationCheckpoi
 	}
 	commit := strings.Repeat("a", 40)
 	manifest := SuiteReleaseManifest{
-		SchemaVersion: 1, Version: "1.2.3", Target: SuiteReleaseTarget{OS: "windows", Arch: "amd64"},
+		SchemaVersion: 1, Version: "1.2.3", Target: SuiteReleaseTarget{OS: runtime.GOOS, Arch: runtime.GOARCH},
 		Commits: SuiteReleaseCommits{AntBrowser: commit, FarmAgent: commit, FarmControl: commit}, ConfigSchema: 1,
 		Capabilities: []string{"setup-plan", "signed-release"}, CoreVersions: map[string]string{"chromium": "128.0.0"},
 		Dependencies: []SuiteReleaseDependency{
@@ -115,6 +115,9 @@ func suiteHandoffFixture(t *testing.T) (SuiteUserRoots, SetupPreparationCheckpoi
 	}
 	envelope, err := SignSuiteReleaseManifest(manifestRaw, "suite-test-key", privateKey)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(suiteBinaryRoot, "release-manifest.envelope.json"), envelope, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	verified, err := VerifySuiteReleaseManifest(manifestRaw, envelope, SuiteReleaseTrustAnchor{KeyID: "suite-test-key", PublicKey: publicKey})
@@ -253,6 +256,17 @@ func TestSuiteOwnershipHandoffFailsClosedOnMismatchAndUnsafePaths(t *testing.T) 
 }
 
 func TestSuiteOwnershipHandoffBindsInstalledReleaseBytesAndRoot(t *testing.T) {
+	t.Run("cross target", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
+		otherTarget := SuiteReleaseTarget{OS: "windows", Arch: "amd64"}
+		if otherTarget == (SuiteReleaseTarget{OS: runtime.GOOS, Arch: runtime.GOARCH}) {
+			otherTarget = SuiteReleaseTarget{OS: "linux", Arch: "arm64"}
+		}
+		rewriteSuiteHandoffReleaseTarget(t, roots, checkpoint, suiteBinaryRoot, otherTarget)
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("cross target = %v", err)
+		}
+	})
 	t.Run("manifest mismatch", func(t *testing.T) {
 		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
 		manifestPath := filepath.Join(suiteBinaryRoot, "release-manifest.json")
@@ -286,6 +300,24 @@ func TestSuiteOwnershipHandoffBindsInstalledReleaseBytesAndRoot(t *testing.T) {
 			t.Fatalf("tampered entry = %v", err)
 		}
 	})
+	t.Run("unexpected regular file", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
+		if err := os.WriteFile(filepath.Join(suiteBinaryRoot, "evil.dll"), []byte("not manifest covered"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("unexpected file = %v", err)
+		}
+	})
+	t.Run("unexpected symlink", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
+		if err := os.Symlink(guiPath, filepath.Join(suiteBinaryRoot, "gui-link.exe")); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("unexpected symlink = %v", err)
+		}
+	})
 	t.Run("unplanned version root", func(t *testing.T) {
 		roots, checkpoint, suiteBinaryRoot, originalGUIPath := suiteHandoffFixture(t)
 		unplanned := filepath.Join(filepath.Dir(suiteBinaryRoot), "unplanned")
@@ -297,6 +329,52 @@ func TestSuiteOwnershipHandoffBindsInstalledReleaseBytesAndRoot(t *testing.T) {
 			t.Fatalf("unplanned root = %v", err)
 		}
 	})
+}
+
+func rewriteSuiteHandoffReleaseTarget(t *testing.T, roots SuiteUserRoots, checkpoint SetupPreparationCheckpoint, suiteBinaryRoot string, target SuiteReleaseTarget) {
+	t.Helper()
+	manifestPath := filepath.Join(suiteBinaryRoot, "release-manifest.json")
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := ParseSuiteReleaseManifest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Target = target
+	raw, err = MarshalSuiteReleaseManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := SignSuiteReleaseManifest(raw, "cross-target-key", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(suiteBinaryRoot, "release-manifest.envelope.json"), envelope, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := VerifySuiteReleaseManifest(raw, envelope, SuiteReleaseTrustAnchor{KeyID: "cross-target-key", PublicKey: publicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewSuiteSetupPlan(checkpoint, verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(roots.AgentState, suiteSetupPlanName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSuiteSetupPlan(roots, plan); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStreamSuiteInstalledEntryDigestDoesNotRequireWholeFileBuffer(t *testing.T) {
@@ -397,6 +475,17 @@ func TestSuiteWindowsPackageScaffoldFailsClosedAndSeparatesRoots(t *testing.T) {
 	for _, check := range []string{"require-tool", "assert-authenticode", "sha256 mismatch", "license manifest"} {
 		if index := strings.Index(script, check); index < 0 || index > preflightEnd {
 			t.Fatalf("preflight %q occurs after staging mutation", check)
+		}
+	}
+	executableCheck := strings.Index(script, "if ([bool]$entry.executable)")
+	requiredCoverage := strings.Index(script, `foreach ($relative in @("antbrowser.exe"`)
+	if executableCheck < 0 || requiredCoverage < 0 || executableCheck > requiredCoverage ||
+		!strings.Contains(script[executableCheck:requiredCoverage], "assert-authenticode $path") {
+		t.Fatal("publisher does not Authenticode-check every manifest executable before required-file coverage")
+	}
+	for _, required := range []string{"numeric prerelease identifier with a leading zero", "$identifier -match '^[0-9]+$'"} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("publisher SemVer validation missing %q", required)
 		}
 	}
 	installer := strings.ToLower(contents["publish/suite/windows/installer.nsi"])

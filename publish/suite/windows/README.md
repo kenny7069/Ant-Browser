@@ -31,6 +31,11 @@ Run from a Windows release worker with `makensis.exe` and `signtool.exe` on
   -ReleaseKeyID suite-release-2026 -ReleasePublicKey BASE64_ED25519_PUBLIC_KEY
 ```
 
+The manifest schema accepts SemVer build metadata. This Windows scaffold keeps
+its existing filesystem version policy and accepts release SemVer without a
+`+build` suffix; numeric prerelease identifiers with leading zeroes are rejected
+by both paths.
+
 The installer does not start the Agent. Setup must first create the canonical
 owner-only `%LocalAppData%\AntSuite\config\client.yaml`, finish the durable
 preparation checkpoint, and run:
@@ -47,6 +52,8 @@ the Suite is `READY` and does not authorize service activation by itself. A
 later workflow must finish the canonical setup stages. GUI launching and
 desktop shortcuts remain deferred until T08 provides a strict GUI mode that
 consumes the verified handoff. T07 owns safe activation, repair rotation,
-rollback, and a signed uninstaller, so this scaffold deliberately does not
-register or emit an uninstaller. This slice does not claim service activation,
-enrollment, Control connectivity, or a native installed browser smoke test.
+canonical Program Files resolution and DACL validation, immediate pre-spawn
+release revalidation, rollback, and a signed uninstaller, so this scaffold
+deliberately does not register or emit an uninstaller. This slice does not claim
+service activation, enrollment, Control connectivity, or a native installed
+browser smoke test.

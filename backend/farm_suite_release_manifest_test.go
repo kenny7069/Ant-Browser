@@ -248,3 +248,16 @@ func TestSuiteReleaseManifestResourceAndReleasePolicyLimits(t *testing.T) {
 		t.Fatalf("oversize envelope accepted: %v", err)
 	}
 }
+
+func TestSuiteReleaseSemverPrereleaseNumericIdentifiers(t *testing.T) {
+	for _, version := range []string{"1.2.3-01", "1.2.3-alpha.01", "1.2.3-0.01+build.7"} {
+		if validSuiteReleaseSemver(version) {
+			t.Fatalf("numeric prerelease leading zero accepted: %q", version)
+		}
+	}
+	for _, version := range []string{"1.2.3-0", "1.2.3-alpha.0", "1.2.3-01a", "1.2.3+build.01"} {
+		if !validSuiteReleaseSemver(version) {
+			t.Fatalf("valid release SemVer rejected: %q", version)
+		}
+	}
+}

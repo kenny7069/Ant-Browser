@@ -39,6 +39,15 @@ function Resolve-PayloadPath([string]$RelativePath) {
 }
 
 if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$') { Fail "Version is not release SemVer" }
+$versionWithoutBuild = $Version.Split('+')[0]
+$prereleaseSeparator = $versionWithoutBuild.IndexOf('-')
+if ($prereleaseSeparator -ge 0) {
+  foreach ($identifier in $versionWithoutBuild.Substring($prereleaseSeparator + 1).Split('.')) {
+    if ($identifier.Length -gt 1 -and $identifier.StartsWith('0') -and $identifier -match '^[0-9]+$') {
+      Fail "Version has a numeric prerelease identifier with a leading zero"
+    }
+  }
+}
 $PayloadRoot = [System.IO.Path]::GetFullPath($PayloadRoot)
 if (-not (Test-Path -LiteralPath $PayloadRoot -PathType Container)) { Fail "payload root is missing" }
 $makeNSIS = Require-Tool "makensis.exe"
@@ -78,10 +87,10 @@ foreach ($entry in $manifest.entries) {
   if ($item.Length -ne [int64]$entry.size) { Fail "size mismatch: $($entry.path)" }
   $digest = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($digest -cne [string]$entry.sha256) { Fail "SHA256 mismatch: $($entry.path)" }
+  if ([bool]$entry.executable) { Assert-Authenticode $path }
 }
 foreach ($relative in @("AntBrowser.exe", "ant-farm-client.exe", "runtime/xray.exe", "runtime/sing-box.exe", "runtime/chrome/chrome.exe")) {
   if (-not $seen.ContainsKey($relative.ToLowerInvariant())) { Fail "manifest does not cover $relative" }
-  Assert-Authenticode (Resolve-PayloadPath $relative)
 }
 if (-not $seen.ContainsKey("licenses.json")) { Fail "manifest does not cover LICENSES.json" }
 & (Resolve-PayloadPath "ant-farm-client.exe") suite verify-release `
