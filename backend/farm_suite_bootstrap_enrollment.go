@@ -78,6 +78,7 @@ type suiteBootstrapEnrollmentDependencies struct {
 	AfterResponse           func() error
 	RequireExistingIdentity bool
 	RevalidateIdentity      func() error
+	AttemptLockHeld         bool
 }
 
 // EnrollSuiteBootstrap is retained only as a fail-closed compatibility surface.
@@ -113,11 +114,15 @@ func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRo
 	if err := ensureOwnerDirectory(roots.AgentState); err != nil {
 		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentState
 	}
-	lock, err := acquireSuiteSetupLock(filepathJoinAgentState(roots, suiteBootstrapEnrollmentLockName))
-	if err != nil {
-		return SuiteBootstrapEnrollmentResult{}, err
+	var lock *suiteSetupLock
+	var err error
+	if !deps.AttemptLockHeld {
+		lock, err = acquireSuiteSetupLock(filepathJoinAgentState(roots, suiteBootstrapEnrollmentLockName))
+		if err != nil {
+			return SuiteBootstrapEnrollmentResult{}, err
+		}
+		defer lock.release()
 	}
-	defer lock.release()
 
 	discoveryRaw, err := json.Marshal(discovery)
 	if err != nil {

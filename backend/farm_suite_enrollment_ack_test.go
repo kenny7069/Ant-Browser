@@ -211,3 +211,95 @@ func TestSuiteCanonicalEnrollmentACKHundredCallersUseLocks(t *testing.T) {
 		t.Fatal("no caller completed enrollment")
 	}
 }
+
+func TestSuiteCanonicalEnrollmentACKActiveAttemptLockStopsStoreAndNetwork(t *testing.T) {
+	fixture := newSuiteEnrollmentACKFixture(t)
+	held, err := acquireSuiteSetupLock(filepath.Join(fixture.roots.AgentState, suiteBootstrapEnrollmentLockName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.release()
+	var stores, fetches, posts atomic.Int32
+	deps := suiteEnrollmentACKDependencies(fixture, func(*http.Request) (*http.Response, error) {
+		posts.Add(1)
+		return suiteEnrollmentACKSuccessResponse(fixture.discovery, "ENROLLED"), nil
+	})
+	deps.AcquireInstance = func(root string) (suitePrecheckInstanceLock, error) { return AcquireFarmClientInstanceLock(root) }
+	deps.NewStore = func(string) (FarmClientIdentityStore, error) { stores.Add(1); return fixture.store, nil }
+	deps.Fetch = func(context.Context, BootstrapConfig) (SuiteBootstrapDiscovery, error) {
+		fetches.Add(1)
+		return fixture.discovery, nil
+	}
+	if _, err := runSuiteCanonicalEnrollmentACKWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteEnrollmentCode(0x55), deps); !errors.Is(err, ErrSuiteSetupLocked) {
+		t.Fatalf("err=%v", err)
+	}
+	if stores.Load()+fetches.Load()+posts.Load() != 0 {
+		t.Fatalf("store=%d fetch=%d post=%d", stores.Load(), fetches.Load(), posts.Load())
+	}
+	setup, err := acquireSuiteSetupLock(filepath.Join(fixture.roots.AgentState, suiteSetupLockName))
+	if err != nil {
+		t.Fatalf("setup lock leaked: %v", err)
+	}
+	setup.release()
+	instance, err := AcquireFarmClientInstanceLock(fixture.roots.AgentState)
+	if err != nil {
+		t.Fatalf("instance lock leaked: %v", err)
+	}
+	instance.Release()
+}
+
+func TestSuiteCanonicalEnrollmentACKHoldsAllLocksAcrossExternalSteps(t *testing.T) {
+	fixture := newSuiteEnrollmentACKFixture(t)
+	deps := suiteEnrollmentACKDependencies(fixture, nil)
+	deps.AcquireInstance = func(root string) (suitePrecheckInstanceLock, error) { return AcquireFarmClientInstanceLock(root) }
+	assertHeld := func() error {
+		if lock, err := acquireSuiteSetupLock(filepath.Join(fixture.roots.AgentState, suiteSetupLockName)); err == nil {
+			lock.release()
+			return errors.New("setup lock not held")
+		}
+		if lock, err := AcquireFarmClientInstanceLock(fixture.roots.AgentState); err == nil {
+			lock.Release()
+			return errors.New("instance lock not held")
+		}
+		if lock, err := acquireSuiteSetupLock(filepath.Join(fixture.roots.AgentState, suiteBootstrapEnrollmentLockName)); err == nil {
+			lock.release()
+			return errors.New("attempt lock not held")
+		}
+		return nil
+	}
+	deps.Fetch = func(context.Context, BootstrapConfig) (SuiteBootstrapDiscovery, error) {
+		if err := assertHeld(); err != nil {
+			return SuiteBootstrapDiscovery{}, err
+		}
+		return fixture.discovery, nil
+	}
+	deps.Client = &http.Client{Transport: suiteEnrollmentRoundTripper(func(*http.Request) (*http.Response, error) {
+		if err := assertHeld(); err != nil {
+			return nil, err
+		}
+		return suiteEnrollmentACKSuccessResponse(fixture.discovery, "ENROLLED"), nil
+	})}
+	deps.AfterResponse = assertHeld
+	deps.BeforeFinalReadback = assertHeld
+	if _, err := runSuiteCanonicalEnrollmentACKWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteEnrollmentCode(0x56), deps); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSuiteCanonicalEnrollmentACKFinalReadbackRejectsReplacement(t *testing.T) {
+	fixture := newSuiteEnrollmentACKFixture(t)
+	deps := suiteEnrollmentACKDependencies(fixture, func(*http.Request) (*http.Response, error) {
+		return suiteEnrollmentACKSuccessResponse(fixture.discovery, "ENROLLED"), nil
+	})
+	deps.BeforeFinalReadback = func() error {
+		attempt, err := loadSuiteBootstrapEnrollmentAttempt(fixture.roots)
+		if err != nil || attempt == nil {
+			return errors.New("missing attempt")
+		}
+		attempt.NodeUID = "different-node"
+		return writeSuiteBootstrapEnrollmentAttemptFile(filepath.Join(fixture.roots.AgentState, SuiteBootstrapEnrollmentAttemptName), *attempt)
+	}
+	if _, err := runSuiteCanonicalEnrollmentACKWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteEnrollmentCode(0x57), deps); err == nil {
+		t.Fatal("replaced final attempt accepted")
+	}
+}

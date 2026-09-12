@@ -5,7 +5,9 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -27,6 +29,8 @@ type suiteCanonicalEnrollmentACKDependencies struct {
 	SecureInstance      func(string) error
 	EnsureApplication   func(string, bool) (os.FileInfo, error)
 	AfterFetch          func() error
+	AfterResponse       func() error
+	BeforeFinalReadback func() error
 }
 
 func suiteCanonicalEnrollmentACKProductionDependencies() suiteCanonicalEnrollmentACKDependencies {
@@ -95,6 +99,11 @@ func runSuiteCanonicalEnrollmentACKWithDependencies(ctx context.Context, bootstr
 	if deps.SecureInstance(filepath.Join(roots.AgentState, ".ant-farm-client.lock")) != nil {
 		return SuiteBootstrapEnrollmentResult{}, ErrSuiteCanonicalEnrollmentACK
 	}
+	attemptLock, err := acquireSuiteSetupLock(filepath.Join(roots.AgentState, suiteBootstrapEnrollmentLockName))
+	if err != nil {
+		return SuiteBootstrapEnrollmentResult{}, err
+	}
+	defer attemptLock.release()
 	evidence, err := loadSuiteCanonicalEnrollmentEvidence(budget, bootstrap, roots, release, installedSuiteRoot, deps)
 	if err != nil || layout.revalidate(roots, installedSuiteRoot) != nil || inspectSuiteCanonicalEnrollmentFootprint(roots, bootstrap, evidence.preparation.RequestUID, evidence.ref) != nil {
 		return SuiteBootstrapEnrollmentResult{}, ErrSuiteCanonicalEnrollmentACK
@@ -116,8 +125,13 @@ func runSuiteCanonicalEnrollmentACKWithDependencies(ctx context.Context, bootstr
 	if err := revalidateSuiteCanonicalEnrollmentEvidence(budget, bootstrap, roots, release, installedSuiteRoot, layout, evidence, store, deps); err != nil {
 		return SuiteBootstrapEnrollmentResult{}, err
 	}
+	priorAttempt, err := loadSuiteBootstrapEnrollmentAttempt(roots)
+	if err != nil {
+		return SuiteBootstrapEnrollmentResult{}, err
+	}
 	result, err := enrollSuiteBootstrapWithDependencies(budget, roots, evidence.preparation.RequestUID, bootstrap.NodeName, deps.CurrentSuiteVersion, enrollmentCode, discovery, suiteBootstrapEnrollmentDependencies{
-		IdentityStore: store, Client: deps.Client, RequireExistingIdentity: true,
+		IdentityStore: store, Client: deps.Client, RequireExistingIdentity: true, AttemptLockHeld: true,
+		AfterResponse: deps.AfterResponse,
 		RevalidateIdentity: func() error {
 			return revalidateSuiteCanonicalEnrollmentEvidence(budget, bootstrap, roots, release, installedSuiteRoot, layout, evidence, store, deps)
 		},
@@ -125,14 +139,78 @@ func runSuiteCanonicalEnrollmentACKWithDependencies(ctx context.Context, bootstr
 	if err != nil {
 		return SuiteBootstrapEnrollmentResult{}, err
 	}
+	if deps.BeforeFinalReadback != nil && deps.BeforeFinalReadback() != nil {
+		return SuiteBootstrapEnrollmentResult{}, ErrSuiteCanonicalEnrollmentACK
+	}
 	if err := revalidateSuiteCanonicalEnrollmentEvidence(budget, bootstrap, roots, release, installedSuiteRoot, layout, evidence, store, deps); err != nil {
 		return SuiteBootstrapEnrollmentResult{}, err
 	}
-	attempt, err := loadSuiteBootstrapEnrollmentAttempt(roots)
-	if err != nil || attempt == nil || attempt.Stage != SuiteBootstrapAcknowledged || suiteBootstrapEnrollmentResultFromAttempt(*attempt) != result {
+	if !validateSuiteCanonicalEnrollmentAttempt(roots, evidence, discovery, bootstrap.NodeName, deps.CurrentSuiteVersion, enrollmentCode, store, priorAttempt, result) {
 		return SuiteBootstrapEnrollmentResult{}, ErrSuiteCanonicalEnrollmentACK
 	}
 	return result, nil
+}
+
+func validateSuiteCanonicalEnrollmentAttempt(roots SuiteUserRoots, evidence suiteCanonicalEnrollmentEvidence, discovery SuiteBootstrapDiscovery, nodeName, suiteVersion, enrollmentCode string, store FarmClientIdentityStore, prior *SuiteBootstrapEnrollmentAttempt, result SuiteBootstrapEnrollmentResult) bool {
+	final, err := loadSuiteBootstrapEnrollmentAttempt(roots)
+	if err != nil || final == nil || final.Stage != SuiteBootstrapAcknowledged || suiteBootstrapEnrollmentResultFromAttempt(*final) != result {
+		return false
+	}
+	if prior != nil && prior.Stage == SuiteBootstrapAcknowledged && enrollmentCode == "" {
+		discoveryRaw, discoveryErr := json.Marshal(discovery)
+		metadataRaw, metadataErr := json.Marshal(suiteBootstrapEnrollmentMetadata{NodeName: strings.TrimSpace(nodeName), SuiteVersion: suiteVersion})
+		return discoveryErr == nil && metadataErr == nil && *final == *prior &&
+			final.PreparationRequestUID == evidence.preparation.RequestUID && final.DeploymentUID == discovery.DeploymentUID &&
+			final.DiscoverySHA256 == suiteBootstrapSHA256(discoveryRaw) && final.MetadataSHA256 == suiteBootstrapSHA256(metadataRaw) &&
+			final.IdentityRef == string(evidence.ref) && final.PublicKeySHA256 == evidence.identity.PublicKeySHA256 &&
+			final.IdempotencySHA256 == suiteBootstrapSHA256([]byte(suiteBootstrapEnrollmentIdempotencyKey(evidence.preparation.RequestUID))) &&
+			final.ControlEndpoint == discovery.ControlEndpoint
+	}
+	if enrollmentCode == "" {
+		return false
+	}
+	key, err := store.Load(evidence.ref)
+	if err != nil || len(key) != ed25519.PrivateKeySize {
+		clearBytes(key)
+		return false
+	}
+	public := farmClientIdentityPublicKey(key)
+	clearBytes(key)
+	defer clearBytes(public)
+	discoveryRaw, err := json.Marshal(discovery)
+	if err != nil {
+		return false
+	}
+	metadata := suiteBootstrapEnrollmentMetadata{NodeName: strings.TrimSpace(nodeName), SuiteVersion: suiteVersion}
+	metadataRaw, err := json.Marshal(metadata)
+	if err != nil {
+		return false
+	}
+	requestUID, err := canonicalSuiteBootstrapRequestUID(evidence.preparation.RequestUID)
+	if err != nil {
+		return false
+	}
+	codeRaw, err := decodeSuiteBootstrapEnrollmentCode(enrollmentCode)
+	if err != nil {
+		return false
+	}
+	codeDigest := suiteBootstrapSHA256(codeRaw)
+	clearBytes(codeRaw)
+	idempotencyKey := suiteBootstrapEnrollmentIdempotencyKey(requestUID)
+	requestRaw, err := json.Marshal(suiteBootstrapEnrollmentRequest{RequestUID: requestUID, EnrollmentCode: enrollmentCode, DevicePublicKeyEd25519Base64: base64.StdEncoding.EncodeToString(public), Metadata: metadata})
+	if err != nil {
+		return false
+	}
+	expected := SuiteBootstrapEnrollmentAttempt{
+		SchemaVersion: suiteBootstrapEnrollmentSchema, Stage: SuiteBootstrapAcknowledged,
+		PreparationRequestUID: requestUID, DeploymentUID: discovery.DeploymentUID,
+		DiscoverySHA256: suiteBootstrapSHA256(discoveryRaw), MetadataSHA256: suiteBootstrapSHA256(metadataRaw),
+		IdentityRef: string(evidence.ref), PublicKeySHA256: evidence.identity.PublicKeySHA256,
+		EnrollmentCodeSHA256: codeDigest, RequestSHA256: suiteBootstrapSHA256(requestRaw),
+		IdempotencySHA256: suiteBootstrapSHA256([]byte(idempotencyKey)), NodeUID: result.NodeUID,
+		EnrollmentState: result.EnrollmentState, ControlEndpoint: result.ControlEndpoint,
+	}
+	return *final == expected && (prior == nil || sameSuiteBootstrapEnrollmentBinding(*prior, expected))
 }
 
 func loadSuiteCanonicalEnrollmentEvidence(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, installedRoot string, deps suiteCanonicalEnrollmentACKDependencies) (suiteCanonicalEnrollmentEvidence, error) {
