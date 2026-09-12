@@ -10,8 +10,8 @@ import (
 	"errors"
 	"io"
 	"mime"
-	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -25,7 +25,7 @@ import (
 
 const (
 	suiteBootstrapDiscoveryPath       = "/.well-known/ant-farm/bootstrap.json"
-	maxSuiteBootstrapBodyBytes        = 8192
+	maxSuiteBootstrapBodyBytes        = 64 << 10
 	maxSuiteBootstrapHeaderBytes      = 32 << 10
 	maxSuiteBootstrapCapabilities     = 64
 	maxSuiteBootstrapCapabilityBytes  = 80
@@ -253,12 +253,18 @@ func canonicalSuiteBootstrapOrigin(raw, scheme string) (string, error) {
 		return "", ErrSuiteBootstrapResponse
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme != scheme || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" || (parsed.Path != "" && parsed.Path != "/") {
+	if err != nil || parsed.Scheme != scheme || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" || parsed.Path != "" {
 		return "", ErrSuiteBootstrapResponse
 	}
 	hostname := strings.ToLower(parsed.Hostname())
-	if strings.Contains(hostname, "%") || (net.ParseIP(hostname) == nil && !validSuiteBootstrapDNSName(hostname)) {
-		return "", ErrSuiteBootstrapResponse
+	canonicalHost := hostname
+	address, addressErr := netip.ParseAddr(hostname)
+	if addressErr == nil {
+		canonicalHost = address.String()
+	} else {
+		if strings.Contains(hostname, "%") || looksLikeSuiteBootstrapIPv4(hostname) || !validSuiteBootstrapDNSName(hostname) {
+			return "", ErrSuiteBootstrapResponse
+		}
 	}
 	port := parsed.Port()
 	if port != "" {
@@ -270,14 +276,30 @@ func canonicalSuiteBootstrapOrigin(raw, scheme string) (string, error) {
 	if port == "443" {
 		port = ""
 	}
-	authority := hostname
-	if strings.Contains(hostname, ":") {
-		authority = "[" + hostname + "]"
+	authority := canonicalHost
+	if addressErr == nil && address.Is6() {
+		authority = "[" + canonicalHost + "]"
 	}
 	if port != "" {
-		authority = net.JoinHostPort(hostname, port)
+		authority += ":" + port
 	}
-	return scheme + "://" + authority, nil
+	canonical := scheme + "://" + authority
+	if raw != canonical {
+		return "", ErrSuiteBootstrapResponse
+	}
+	return canonical, nil
+}
+
+func looksLikeSuiteBootstrapIPv4(hostname string) bool {
+	if !strings.Contains(hostname, ".") {
+		return false
+	}
+	for _, character := range hostname {
+		if character != '.' && (character < '0' || character > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func validSuiteBootstrapDNSName(hostname string) bool {
@@ -316,7 +338,7 @@ func validateSuiteBootstrapEndpoint(raw, scheme, exactPath string) (string, erro
 }
 
 func validateSuiteBootstrapUpdate(update SuiteBootstrapUpdate) (string, error) {
-	if containsUnsafeSuiteBootstrapURLRune(update.ManifestURL) {
+	if containsUnsafeSuiteBootstrapURLRune(update.ManifestURL) || strings.Contains(update.ManifestURL, "%") {
 		return "", ErrSuiteBootstrapResponse
 	}
 	parsed, err := url.Parse(update.ManifestURL)

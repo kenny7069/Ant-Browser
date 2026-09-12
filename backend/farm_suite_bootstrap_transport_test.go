@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -262,6 +263,15 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 		"update query tab": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=a\tb"
 		},
+		"update escaped path": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/releases%2Fmanifest.json"
+		},
+		"update escaped query": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=a%20b"
+		},
+		"update empty query": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/m?"
+		},
 		"update uppercase host": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = "https://FARM.example.test/m"
 		},
@@ -300,7 +310,34 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 	}
 }
 
+func TestParseSuiteBootstrapDiscoveryBodyLimitIsInclusive(t *testing.T) {
+	origin := "https://farm.example.test"
+	raw, _ := json.Marshal(suiteBootstrapFixture(origin))
+	maximum := append(append([]byte{}, raw...), bytes.Repeat([]byte{' '}, maxSuiteBootstrapBodyBytes-len(raw))...)
+	if len(maximum) != maxSuiteBootstrapBodyBytes {
+		t.Fatalf("fixture size=%d", len(maximum))
+	}
+	if _, err := parseSuiteBootstrapDiscovery(maximum, origin, "3.0.0", "3.0.0"); err != nil {
+		t.Fatalf("maximum legal body rejected: %v", err)
+	}
+	if _, err := parseSuiteBootstrapDiscovery(append(maximum, ' '), origin, "3.0.0", "3.0.0"); !errors.Is(err, ErrSuiteBootstrapResponse) {
+		t.Fatalf("oversized body accepted: %v", err)
+	}
+}
+
 func TestSuiteBootstrapOriginRejectsMalformedDNSAndPorts(t *testing.T) {
+	for _, raw := range []string{
+		"https://farm.example.test",
+		"https://farm.example.test:8443",
+		"https://192.0.2.1",
+		"https://[2001:db8::1]",
+		"https://[2001:db8::1]:8443",
+	} {
+		canonical, err := canonicalSuiteBootstrapOrigin(raw, "https")
+		if err != nil || canonical != raw {
+			t.Fatalf("canonical origin %s => %s, %v", raw, canonical, err)
+		}
+	}
 	for _, raw := range []string{
 		"https://bad..example.test",
 		"https://-bad.example.test",
@@ -309,10 +346,29 @@ func TestSuiteBootstrapOriginRejectsMalformedDNSAndPorts(t *testing.T) {
 		"https://farm.example.test:bad",
 		"https://farm.example.test:0443",
 		"https://farm.example.test:65536",
+		"https://farm.example.test:443",
+		"https://farm.example.test/",
+		"https://farm.example.test?",
+		"https://farm.example.test#",
+		"https://192.168.001.001",
+		"https://[2001:0db8:0:0:0:0:0:1]",
 	} {
 		if _, err := canonicalSuiteBootstrapOrigin(raw, "https"); err == nil {
 			t.Fatalf("origin accepted: %s", raw)
 		}
+	}
+}
+
+func TestParseSuiteBootstrapDiscoveryRejectsEquivalentIPv6AllowlistEntries(t *testing.T) {
+	origin := "https://[2001:db8::1]"
+	fixture := suiteBootstrapFixture(origin)
+	fixture["endpoint_allowlist"] = []string{
+		"https://[2001:0db8:0:0:0:0:0:1]",
+		origin,
+	}
+	raw, _ := json.Marshal(fixture)
+	if _, err := parseSuiteBootstrapDiscovery(raw, origin, "3.0.0", "3.0.0"); !errors.Is(err, ErrSuiteBootstrapResponse) {
+		t.Fatalf("equivalent IPv6 allowlist entries accepted: %v", err)
 	}
 }
 
