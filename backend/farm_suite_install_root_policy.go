@@ -29,6 +29,19 @@ type suiteInstallDACLPolicy struct {
 	ACEs         []suiteInstallACEPolicy
 }
 
+func classifySuiteInstallACEType(aceType uint8) (allowed, objectACE, unknownAllow bool) {
+	switch aceType {
+	case 0: // ACCESS_ALLOWED_ACE_TYPE
+		return true, false, false
+	case 5: // ACCESS_ALLOWED_OBJECT_ACE_TYPE
+		return true, true, false
+	case 4, 9, 11: // compound/callback allow forms are not accepted by this parser
+		return false, false, true
+	default:
+		return false, false, false
+	}
+}
+
 func validateSuiteInstallDACLPolicy(policy suiteInstallDACLPolicy) error {
 	if !policy.TrustedOwner || !policy.DACLPresent {
 		return fmt.Errorf("%w: immutable tree owner or DACL invalid", ErrSuiteServiceActivation)

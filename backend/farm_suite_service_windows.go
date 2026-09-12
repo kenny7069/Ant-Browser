@@ -196,7 +196,7 @@ func (p windowsSuiteServicePlatform) Enable(h SuiteOwnershipHandoff, taskName st
 	if err != nil {
 		return err
 	}
-	result := p.run(schtasksPath, "/Change", "/TN", taskName, "/ENABLE", "/HRESULT")
+	result := p.run(schtasksPath, "/Change", "/TN", taskName, "/ENABLE")
 	if result.Err != nil || result.ExitCode != 0 {
 		return ErrSuiteServiceActivation
 	}
@@ -214,7 +214,7 @@ func (p windowsSuiteServicePlatform) Start(h SuiteOwnershipHandoff, taskName str
 	if err != nil {
 		return err
 	}
-	result := p.run(schtasksPath, "/Run", "/TN", taskName, "/HRESULT")
+	result := p.run(schtasksPath, "/Run", "/TN", taskName)
 	if result.Err != nil || result.ExitCode != 0 {
 		return ErrSuiteServiceActivation
 	}

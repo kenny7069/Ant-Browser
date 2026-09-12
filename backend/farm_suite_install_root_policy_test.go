@@ -37,3 +37,14 @@ func TestSuiteInstallDangerousMaskIncludesIndividualRights(t *testing.T) {
 		}
 	}
 }
+
+func TestSuiteInstallACETypeFourFailsClosedAsUnknownAllow(t *testing.T) {
+	allowed, objectACE, unknownAllow := classifySuiteInstallACEType(4)
+	if allowed || objectACE || !unknownAllow {
+		t.Fatalf("type 4 classification allowed=%v object=%v unknown=%v", allowed, objectACE, unknownAllow)
+	}
+	policy := suiteInstallDACLPolicy{TrustedOwner: true, DACLPresent: true, ACEs: []suiteInstallACEPolicy{{UnknownAllowType: unknownAllow}}}
+	if err := validateSuiteInstallDACLPolicy(policy); !errors.Is(err, ErrSuiteServiceActivation) {
+		t.Fatalf("compound allow ACE accepted: %v", err)
+	}
+}

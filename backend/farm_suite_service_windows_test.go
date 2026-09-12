@@ -83,8 +83,13 @@ func TestWindowsSuiteTaskMutationCommandsAreSeparatedAndNonzeroFails(t *testing.
 	if err := platform.Start(handoff, name); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 2 || !slices.Contains(calls[0], "/ENABLE") || slices.Contains(calls[0], "/Run") || !slices.Contains(calls[1], "/Run") || slices.Contains(calls[1], "/ENABLE") {
+	if len(calls) != 2 || !slices.Equal(calls[0][1:], []string{"/Change", "/TN", name, "/ENABLE"}) || !slices.Equal(calls[1][1:], []string{"/Run", "/TN", name}) {
 		t.Fatalf("mutation calls=%v", calls)
+	}
+	for _, call := range calls {
+		if slices.Contains(call, "/HRESULT") {
+			t.Fatalf("unsupported HRESULT switch on mutation call: %v", call)
+		}
 	}
 	platform.run = func(string, ...string) suiteWindowsTaskCommandResult {
 		return suiteWindowsTaskCommandResult{ExitCode: 1}

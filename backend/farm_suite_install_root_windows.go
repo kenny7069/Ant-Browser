@@ -179,10 +179,9 @@ func suiteWindowsDACLPolicy(descriptor *windows.SECURITY_DESCRIPTOR) (suiteInsta
 			return policy, ErrSuiteServiceActivation
 		}
 		header := (*suiteWindowsACEMask)(unsafe.Pointer(ace))
-		allowed := header.Header.AceType == windows.ACCESS_ALLOWED_ACE_TYPE || header.Header.AceType == 5
-		unknownAllowed := header.Header.AceType == 9 || header.Header.AceType == 11
-		entry := suiteInstallACEPolicy{Allowed: allowed, UnknownAllowType: unknownAllowed, ObjectACE: header.Header.AceType == 5, Mask: uint32(header.Mask), InheritOnly: header.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0}
-		if allowed && header.Header.AceType == windows.ACCESS_ALLOWED_ACE_TYPE {
+		allowed, objectACE, unknownAllowed := classifySuiteInstallACEType(header.Header.AceType)
+		entry := suiteInstallACEPolicy{Allowed: allowed, UnknownAllowType: unknownAllowed, ObjectACE: objectACE, Mask: uint32(header.Mask), InheritOnly: header.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0}
+		if allowed && !objectACE {
 			sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 			entry.TrustedPrincipal = suiteWindowsSIDTrusted(sid, trusted)
 			creatorOwner, _ := windows.CreateWellKnownSid(windows.WinCreatorOwnerSid)
