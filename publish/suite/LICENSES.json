@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "name": "Ant Browser Suite",
+      "license_expression": "LicenseRef-Ant-Browser-Suite",
+      "notice_file": "licenses/Ant-Browser-Suite-LICENSE.txt"
+    },
+    {
+      "name": "Xray-core",
+      "license_expression": "MPL-2.0",
+      "notice_file": "licenses/Xray-core-LICENSE.txt"
+    },
+    {
+      "name": "sing-box",
+      "license_expression": "GPL-3.0-or-later",
+      "notice_file": "licenses/sing-box-LICENSE.txt"
+    }
+  ]
+}

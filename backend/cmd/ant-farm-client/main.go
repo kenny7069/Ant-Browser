@@ -5,12 +5,15 @@ import (
 	"ant-chrome/backend"
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -46,6 +49,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// parser, which intentionally stops at the first positional argument.
 	if len(args) > 0 && args[0] == "setup" {
 		return runSetupCommand(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "suite" {
+		roots, err := backend.ResolveSuiteUserRoots()
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite roots unavailable")
+			return 1
+		}
+		return runSuiteCommand(roots, args[1:], stdout, stderr)
 	}
 	flags := flag.NewFlagSet("ant-farm-client", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -155,6 +166,106 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+var startSuiteGUIProcess = func(executable string, arguments ...string) error {
+	command := exec.Command(executable, arguments...)
+	if err := command.Start(); err != nil {
+		return err
+	}
+	return command.Process.Release()
+}
+
+var loadSuiteGUIInvocation = backend.LoadSuiteGUIInvocation
+
+func runSuiteCommand(roots backend.SuiteUserRoots, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite command")
+		return 2
+	}
+	switch args[0] {
+	case "finalize-handoff":
+		flags := flag.NewFlagSet("suite finalize-handoff", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		requestUID := flags.String("request-uid", "", "setup preparation request UID")
+		suiteRoot := flags.String("suite-root", "", "absolute immutable Suite version root")
+		guiPath := flags.String("gui", "", "absolute Ant GUI executable path")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || !filepath.IsAbs(*suiteRoot) || !filepath.IsAbs(*guiPath) {
+			fmt.Fprintln(stderr, "ant-farm-client: invalid Suite handoff arguments")
+			return 2
+		}
+		handoff, err := backend.FinalizeSuiteOwnershipHandoff(roots, *requestUID, filepath.Clean(*suiteRoot), filepath.Clean(*guiPath))
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite handoff failed")
+			return 1
+		}
+		encoded, _ := json.Marshal(map[string]string{"state": handoff.HandoffState, "request_uid": handoff.SetupRequestUID})
+		fmt.Fprintln(stdout, string(encoded))
+		return 0
+	case "launch-gui":
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "ant-farm-client: invalid Suite GUI command")
+			return 2
+		}
+		invocation, err := loadSuiteGUIInvocation(roots)
+		if err != nil || !filepath.IsAbs(invocation.Executable) || len(invocation.Arguments) != 2 ||
+			invocation.Arguments[0] != "--farm-client-config" || !filepath.IsAbs(invocation.Arguments[1]) {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite GUI handoff unavailable")
+			return 1
+		}
+		if err := startSuiteGUIProcess(invocation.Executable, invocation.Arguments...); err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite GUI launch failed")
+			return 1
+		}
+		return 0
+	case "verify-release":
+		flags := flag.NewFlagSet("suite verify-release", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		manifestPath := flags.String("manifest", "", "absolute Suite release manifest path")
+		envelopePath := flags.String("envelope", "", "absolute detached envelope path")
+		keyID := flags.String("key-id", "", "caller-pinned release key ID")
+		publicKeyValue := flags.String("public-key", "", "caller-pinned Ed25519 public key")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || !filepath.IsAbs(*manifestPath) || !filepath.IsAbs(*envelopePath) {
+			fmt.Fprintln(stderr, "ant-farm-client: invalid Suite release verification arguments")
+			return 2
+		}
+		manifest, err := readSuiteReleaseVerificationFile(filepath.Clean(*manifestPath), 1<<20)
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
+			return 1
+		}
+		envelope, err := readSuiteReleaseVerificationFile(filepath.Clean(*envelopePath), 16<<10)
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
+			return 1
+		}
+		publicKey, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(*publicKeyValue))
+		if err != nil || len(publicKey) != ed25519.PublicKeySize {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
+			return 1
+		}
+		_, err = backend.VerifySuiteReleaseManifest(manifest, envelope, backend.SuiteReleaseTrustAnchor{KeyID: strings.TrimSpace(*keyID), PublicKey: ed25519.PublicKey(publicKey)})
+		for index := range publicKey {
+			publicKey[index] = 0
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
+			return 1
+		}
+		fmt.Fprintln(stdout, `{"verified":true}`)
+		return 0
+	default:
+		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite command")
+		return 2
+	}
+}
+
+func readSuiteReleaseVerificationFile(path string, maximum int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maximum {
+		return nil, backend.ErrSuiteReleaseManifest
+	}
+	return os.ReadFile(path)
 }
 
 func farmAgentControlPreservesRuntimes(reader io.Reader) bool {
