@@ -89,7 +89,7 @@ func suiteEnrollmentCode(byteValue byte) string {
 }
 
 func suiteEnrollmentSuccessResponse(state string) *http.Response {
-	raw := `{"node_uid":"node accepted by server","enrollment_state":"` + state + `","control_endpoint":"wss://farm.example.test/control/ws"}`
+	raw := `{"node_uid":"node-accepted-by-server","enrollment_state":"` + state + `","control_endpoint":"wss://farm.example.test/control/ws"}`
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(raw))}
 }
 
@@ -164,12 +164,12 @@ func TestLoadSuiteBootstrapEnrollmentPreparationRequiresDraftedExactBootstrap(t 
 }
 
 func TestSuiteBootstrapEnrollmentNodeUIDWireContract(t *testing.T) {
-	for _, value := range []string{strings.Repeat("é", 128), " leading and trailing "} {
+	for _, value := range []string{"node-1", "node.example:8443", strings.Repeat("a", 128)} {
 		if !validSuiteBootstrapEnrollmentNodeUID(value) {
-			t.Fatalf("valid node UID rejected: rune_count=%d", utf8.RuneCountInString(value))
+			t.Fatalf("valid node UID rejected: %q", value)
 		}
 	}
-	for _, value := range []string{strings.Repeat("é", 129), "node\x00uid", string([]byte{0xff})} {
+	for _, value := range []string{strings.Repeat("a", 129), " leading", "trailing ", "node uid", "node\x00uid", "nøde", string([]byte{0xff})} {
 		if validSuiteBootstrapEnrollmentNodeUID(value) {
 			t.Fatalf("invalid node UID accepted: %q", value)
 		}
@@ -248,7 +248,7 @@ func TestEnrollSuiteBootstrapFreshPersistsBeforePOSTAndKeepsJournalSecretFree(t 
 		return suiteEnrollmentSuccessResponse("ENROLLED"), nil
 	})
 	result, err := enrollSuiteBootstrapWithDependencies(context.Background(), roots, "123e4567-e89b-12d3-a456-426614174001", "Node One", "0.1.0-dev", code, suiteEnrollmentDiscoveryFixture(), deps)
-	if err != nil || result.EnrollmentState != "ENROLLED" || result.NodeUID != "node accepted by server" {
+	if err != nil || result.EnrollmentState != "ENROLLED" || result.NodeUID != "node-accepted-by-server" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	raw, err := os.ReadFile(filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName))

@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -317,15 +316,9 @@ func suiteBootstrapEnrollmentSecretKeys() map[string]struct{} {
 }
 
 func validSuiteBootstrapEnrollmentNodeUID(value string) bool {
-	if !utf8.ValidString(value) || utf8.RuneCountInString(value) == 0 || utf8.RuneCountInString(value) > 128 {
-		return false
-	}
-	for _, character := range value {
-		if character < 0x20 || character == 0x7f {
-			return false
-		}
-	}
-	return true
+	// Acknowledged Node UIDs are written to the production Farm Client config.
+	// Keep this durable wire contract identical to the Host identity contract.
+	return strings.TrimSpace(value) == value && farmClientNodeUIDPattern.MatchString(value)
 }
 
 func saveSuiteBootstrapEnrollmentAttempt(roots SuiteUserRoots, next SuiteBootstrapEnrollmentAttempt) error {

@@ -27,7 +27,7 @@ func newSuiteEnrollmentACKFixture(t *testing.T) suiteIdentityFixture {
 }
 
 func suiteEnrollmentACKSuccessResponse(discovery SuiteBootstrapDiscovery, state string) *http.Response {
-	raw, _ := json.Marshal(suiteBootstrapEnrollmentResponse{NodeUID: "node accepted by server", EnrollmentState: state, ControlEndpoint: discovery.ControlEndpoint})
+	raw, _ := json.Marshal(suiteBootstrapEnrollmentResponse{NodeUID: "node-accepted-by-server", EnrollmentState: state, ControlEndpoint: discovery.ControlEndpoint})
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(raw)))}
 }
 
