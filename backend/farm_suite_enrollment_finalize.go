@@ -174,12 +174,24 @@ func runSuiteCanonicalEnrollmentFinalizeWithDependencies(ctx context.Context, bo
 		}
 	}
 	checkpoint, err := LoadSetupCheckpoint(bootstrap.StatePath)
+	finalEvidence, finalEvidenceErr := loadSuiteEnrollmentFinalizeEvidence(ctx, bootstrap, roots, release, installedSuiteRoot, layout, deps)
 	loadedHandoff, handoffErr := deps.LoadHandoff(roots)
 	loadedRaw, rawErr := readSuiteFinalClientConfigRaw(filepath.Join(roots.Config, SuiteClientConfigName))
-	if err != nil || checkpoint == nil || checkpoint.Stage != SetupEnrolled || checkpoint.RequestUID != evidence.canonical.preparation.RequestUID || handoffErr != nil || loadedHandoff == nil || *loadedHandoff != handoff || rawErr != nil || !bytes.Equal(loadedRaw, raw) || verifySuiteFinalClientConfig(filepath.Join(roots.Config, SuiteClientConfigName), config, raw) != nil || deps.Readback(evidence.init.AntConfigPath, evidence.appConfig, evidence.init.DatabasePath, evidence.core) != nil || verifySuiteCanonicalEnrollmentKey(evidence.store, evidence.canonical.ref, evidence.canonical.identity.PublicKeySHA256) != nil {
+	if err != nil || checkpoint == nil || checkpoint.Stage != SetupEnrolled || checkpoint.RequestUID != evidence.canonical.preparation.RequestUID || finalEvidenceErr != nil || !sameSuiteEnrollmentFinalizeBinding(finalEvidence, evidence, SetupEnrolled) || handoffErr != nil || loadedHandoff == nil || *loadedHandoff != handoff || rawErr != nil || !bytes.Equal(loadedRaw, raw) || verifySuiteFinalClientConfig(filepath.Join(roots.Config, SuiteClientConfigName), config, raw) != nil || deps.Readback(finalEvidence.init.AntConfigPath, finalEvidence.appConfig, finalEvidence.init.DatabasePath, finalEvidence.core) != nil || verifySuiteCanonicalEnrollmentKey(finalEvidence.store, finalEvidence.canonical.ref, finalEvidence.canonical.identity.PublicKeySHA256) != nil {
 		return SuiteCanonicalEnrollmentFinalizeResult{}, ErrSuiteCanonicalEnrollmentFinalize
 	}
 	return SuiteCanonicalEnrollmentFinalizeResult{Stage: SetupEnrolled, RequestUID: checkpoint.RequestUID, ClientConfigPath: filepath.Join(roots.Config, SuiteClientConfigName), ClientConfigSHA256: digest, HandoffState: handoff.HandoffState}, nil
+}
+
+func sameSuiteEnrollmentFinalizeBinding(current, expected suiteEnrollmentFinalizeEvidence, checkpointStage SetupStage) bool {
+	return current.canonical.preparation == expected.canonical.preparation &&
+		current.canonical.plan == expected.canonical.plan &&
+		current.canonical.checkpoint == (SetupCheckpoint{SchemaVersion: 1, Stage: checkpointStage, RequestUID: expected.canonical.preparation.RequestUID}) &&
+		current.canonical.stage == expected.canonical.stage && current.canonical.draft == expected.canonical.draft &&
+		reflect.DeepEqual(current.canonical.transport, expected.canonical.transport) && current.canonical.identity == expected.canonical.identity &&
+		current.canonical.installed.CanonicalRoot == expected.canonical.installed.CanonicalRoot && current.canonical.installed.RootInfo != nil && expected.canonical.installed.RootInfo != nil && os.SameFile(current.canonical.installed.RootInfo, expected.canonical.installed.RootInfo) &&
+		current.canonical.application != nil && expected.canonical.application != nil && os.SameFile(current.canonical.application, expected.canonical.application) &&
+		current.canonical.ref == expected.canonical.ref && current.attempt == expected.attempt && current.init == expected.init && current.core == expected.core && reflect.DeepEqual(current.appConfig, expected.appConfig)
 }
 
 func loadSuiteEnrollmentFinalizeEvidence(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, installedRoot string, layout *suitePrecheckRootLayoutSnapshot, deps suiteCanonicalEnrollmentFinalizeDependencies) (suiteEnrollmentFinalizeEvidence, error) {

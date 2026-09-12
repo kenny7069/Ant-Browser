@@ -361,6 +361,7 @@ func TestPostSuiteBootstrapEnrollmentClosedResponseAndStatusMatrix(t *testing.T)
 		{"unknown", 200, `{"node_uid":"node","enrollment_state":"ENROLLED","control_endpoint":"wss://farm.example.test/control/ws","secret":"x"}`, "application/json", ErrSuiteBootstrapEnrollmentResponse},
 		{"duplicate", 200, `{"node_uid":"node","node_uid":"node","enrollment_state":"ENROLLED","control_endpoint":"wss://farm.example.test/control/ws"}`, "application/json", ErrSuiteBootstrapEnrollmentResponse},
 		{"state", 200, `{"node_uid":"node","enrollment_state":"READY","control_endpoint":"wss://farm.example.test/control/ws"}`, "application/json", ErrSuiteBootstrapEnrollmentResponse},
+		{"legacy loose node uid", 200, `{"node_uid":"node accepted by server","enrollment_state":"ENROLLED","control_endpoint":"wss://farm.example.test/control/ws"}`, "application/json", ErrSuiteBootstrapEnrollmentResponse},
 		{"node control character", 200, "{\"node_uid\":\"node\\u0001\",\"enrollment_state\":\"ENROLLED\",\"control_endpoint\":\"wss://farm.example.test/control/ws\"}", "application/json", ErrSuiteBootstrapEnrollmentResponse},
 		{"invalid control endpoint", 200, `{"node_uid":"node","enrollment_state":"ENROLLED","control_endpoint":"wss://farm.example.test/control/ws?x=1"}`, "application/json", ErrSuiteBootstrapEnrollmentResponse},
 		{"control", 200, `{"node_uid":"node","enrollment_state":"ENROLLED","control_endpoint":"wss://evil.example.test/control/ws"}`, "application/json", nil},

@@ -152,6 +152,38 @@ func TestSuiteCanonicalEnrollmentFinalizeRecoversEveryCommitBoundary(t *testing.
 	}
 }
 
+func TestSuiteCanonicalEnrollmentFinalizeRejectsPostCheckpointEvidenceReplacement(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(suiteIdentityFixture) error
+	}{
+		{"durable ACK", func(fixture suiteIdentityFixture) error {
+			return os.WriteFile(filepath.Join(fixture.roots.AgentState, SuiteBootstrapEnrollmentAttemptName), []byte("{}\n"), 0o600)
+		}},
+		{"transport receipt", func(fixture suiteIdentityFixture) error {
+			return os.WriteFile(filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName), []byte("{}\n"), 0o600)
+		}},
+		{"installed entry", func(fixture suiteIdentityFixture) error {
+			return os.WriteFile(filepath.Join(fixture.source, "runtime", "xray.exe"), []byte("replaced after checkpoint"), 0o755)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSuiteEnrollmentFinalizeFixture(t, "node-post-checkpoint")
+			deps := suiteEnrollmentFinalizeTestDependencies(fixture)
+			deps.AfterCheckpoint = func() error { return test.mutate(fixture) }
+			result, err := runSuiteCanonicalEnrollmentFinalizeWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps)
+			if !errors.Is(err, ErrSuiteCanonicalEnrollmentFinalize) || result != (SuiteCanonicalEnrollmentFinalizeResult{}) {
+				t.Fatalf("mutation returned success: result=%+v err=%v", result, err)
+			}
+			checkpoint, loadErr := LoadSetupCheckpoint(fixture.bootstrap.StatePath)
+			if loadErr != nil || checkpoint == nil || checkpoint.Stage != SetupEnrolled {
+				t.Fatalf("checkpoint should remain reconcilable: %+v %v", checkpoint, loadErr)
+			}
+		})
+	}
+}
+
 func TestSuiteCanonicalEnrollmentFinalizeRecoversExactUnpublishedStaging(t *testing.T) {
 	fixture := newSuiteEnrollmentFinalizeFixture(t, "node-staging")
 	deps := suiteEnrollmentFinalizeTestDependencies(fixture)
