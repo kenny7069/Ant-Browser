@@ -41,6 +41,11 @@ func protectedRun(stderr io.Writer, action func() int) (code int) {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// v3 subcommands own their FlagSet. Dispatch before the legacy global
+	// parser, which intentionally stops at the first positional argument.
+	if len(args) > 0 && args[0] == "setup" {
+		return runSetupCommand(args[1:], stdout, stderr)
+	}
 	flags := flag.NewFlagSet("ant-farm-client", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "absolute path to the strict Ant Farm client YAML/JSON config")
