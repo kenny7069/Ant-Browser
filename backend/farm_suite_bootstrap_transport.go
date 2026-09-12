@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -366,7 +365,7 @@ func validateSuiteBootstrapUpdate(update SuiteBootstrapUpdate) (string, error) {
 
 func containsUnsafeSuiteBootstrapURLRune(value string) bool {
 	for _, character := range value {
-		if character <= 0x20 || character == 0x7f || unicode.IsSpace(character) {
+		if character <= 0x20 || character > 0x7e {
 			return true
 		}
 	}

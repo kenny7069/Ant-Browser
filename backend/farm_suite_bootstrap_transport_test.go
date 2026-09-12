@@ -224,6 +224,12 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 	if _, err := parseSuiteBootstrapDiscovery(originOnlyRaw, origin, "3.0.0", "3.0.0"); err != nil {
 		t.Fatalf("origin-only update URL rejected: %v", err)
 	}
+	asciiUpdate := suiteBootstrapFixture(origin)
+	asciiUpdate["update"] = map[string]any{"manifest_url": origin + "/releases/@manifest.json", "public_key_ed25519_b64": key, "channel": "stable"}
+	asciiUpdateRaw, _ := json.Marshal(asciiUpdate)
+	if _, err := parseSuiteBootstrapDiscovery(asciiUpdateRaw, origin, "3.0.0", "3.0.0"); err != nil {
+		t.Fatalf("visible ASCII update URL rejected: %v", err)
+	}
 	maximumUpdate := suiteBootstrapFixture(origin)
 	maximumUpdateURL := origin + "/" + strings.Repeat("a", maxSuiteBootstrapURLBytes-len(origin)-1)
 	maximumUpdate["update"] = map[string]any{"manifest_url": maximumUpdateURL, "public_key_ed25519_b64": key, "channel": "stable"}
@@ -290,6 +296,12 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 		},
 		"update escaped query": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=a%20b"
+		},
+		"update Unicode path": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/releases/café.json"
+		},
+		"update Unicode query": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=café"
 		},
 		"update empty query": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = origin + "/m?"
