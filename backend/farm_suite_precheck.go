@@ -30,6 +30,7 @@ type suiteCanonicalPrecheckDependencies struct {
 	ProbeRoot       func(string) error
 	AvailableSpace  func(string) (string, uint64, error)
 	AcquireInstance func(string) (suitePrecheckInstanceLock, error)
+	SecureInstance  func(string) error
 	ValidateSource  func(string, SuiteSetupPlan) (SuiteReleaseManifest, string, error)
 	SaveCheckpoint  func(string, SetupCheckpoint) error
 	AfterProbes     func() error
@@ -40,13 +41,14 @@ func RunSuiteCanonicalPrecheck(ctx context.Context, bootstrap BootstrapConfig, r
 		ProbeRoot:       probeSuitePrecheckOwnerRoot,
 		AvailableSpace:  suitePrecheckAvailableSpace,
 		AcquireInstance: func(root string) (suitePrecheckInstanceLock, error) { return AcquireFarmClientInstanceLock(root) },
+		SecureInstance:  func(path string) error { return secureSuiteSetupPath(path, false) },
 		ValidateSource:  validateInstalledSuiteRelease,
 		SaveCheckpoint:  SaveSetupCheckpoint,
 	})
 }
 
 func runSuiteCanonicalPrecheckWithDependencies(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, suiteSourceRoot string, deps suiteCanonicalPrecheckDependencies) (SuiteCanonicalPrecheckResult, error) {
-	if ctx == nil || deps.ProbeRoot == nil || deps.AvailableSpace == nil || deps.AcquireInstance == nil || deps.ValidateSource == nil || deps.SaveCheckpoint == nil {
+	if ctx == nil || deps.ProbeRoot == nil || deps.AvailableSpace == nil || deps.AcquireInstance == nil || deps.SecureInstance == nil || deps.ValidateSource == nil || deps.SaveCheckpoint == nil {
 		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
 	}
 	rawStatePath := bootstrap.StatePath
@@ -95,6 +97,9 @@ func runSuiteCanonicalPrecheckWithDependencies(ctx context.Context, bootstrap Bo
 		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
 	}
 	defer instanceLock.Release()
+	if err := deps.SecureInstance(filepath.Join(roots.AgentState, ".ant-farm-client.lock")); err != nil {
+		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
+	}
 	for _, root := range []string{roots.Config, roots.BrowserData, roots.AgentState, roots.Logs} {
 		if err := ctx.Err(); err != nil {
 			return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
@@ -195,7 +200,24 @@ func validateSuitePrecheckRootLayout(roots SuiteUserRoots, source string) error 
 	if !filepath.IsAbs(source) || source == "." {
 		return ErrSuiteCanonicalPrecheck
 	}
-	mutable := []string{filepath.Clean(roots.Config), filepath.Clean(roots.BrowserData), filepath.Clean(roots.AgentState), filepath.Clean(roots.Logs)}
+	mutable := []string{roots.Config, roots.BrowserData, roots.AgentState, roots.Logs}
+	allPaths := append(append([]string{}, mutable...), source)
+	resolved := make([]string, len(allPaths))
+	identities := make([]os.FileInfo, len(allPaths))
+	for index, path := range allPaths {
+		resolvedPath, info, err := suitePrecheckResolvedPath(path)
+		if err != nil || info == nil || !info.IsDir() {
+			return ErrSuiteCanonicalPrecheck
+		}
+		resolved[index], identities[index] = resolvedPath, info
+	}
+	for left := range resolved {
+		for right := left + 1; right < len(resolved); right++ {
+			if os.SameFile(identities[left], identities[right]) || suitePrecheckPathContains(resolved[left], resolved[right]) || suitePrecheckPathContains(resolved[right], resolved[left]) {
+				return ErrSuiteCanonicalPrecheck
+			}
+		}
+	}
 	for left := range mutable {
 		for right := left + 1; right < len(mutable); right++ {
 			if suitePrecheckPathContains(mutable[left], mutable[right]) || suitePrecheckPathContains(mutable[right], mutable[left]) {
@@ -257,6 +279,9 @@ func inspectSuitePrecheckFootprint(roots SuiteUserRoots, bootstrap BootstrapConf
 }
 
 func suitePrecheckPathContains(root, candidate string) bool {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		root, candidate = strings.ToLower(root), strings.ToLower(candidate)
+	}
 	relative, err := filepath.Rel(root, candidate)
 	return err == nil && (relative == "." || (relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator))))
 }

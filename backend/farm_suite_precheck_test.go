@@ -31,7 +31,15 @@ func (lock *suitePrecheckTestLock) Release() error { lock.released = true; retur
 
 func newSuitePrecheckFixture(t *testing.T) suitePrecheckFixture {
 	t.Helper()
-	roots, bootstrap := setupEngineFixture(t)
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := SuiteUserRoots{
+		Config: filepath.Join(base, "config"), BrowserData: filepath.Join(base, "browser-data"),
+		AgentState: filepath.Join(base, "agent-state"), Logs: filepath.Join(base, "logs"),
+	}
+	bootstrap := BootstrapConfig{ServerURL: "https://farm.example.test:8443", StatePath: filepath.Join(roots.AgentState, "setup.json"), NodeName: "Farm One"}
 	coordinator, err := NewSuiteSetupCoordinatorWithRoots(bootstrap, roots)
 	if err != nil {
 		t.Fatal(err)
@@ -108,8 +116,42 @@ func suitePrecheckTestDependencies() suiteCanonicalPrecheckDependencies {
 		AcquireInstance: func(string) (suitePrecheckInstanceLock, error) {
 			return &suitePrecheckTestLock{}, nil
 		},
+		SecureInstance: func(string) error { return nil },
 		ValidateSource: validateInstalledSuiteRelease,
 		SaveCheckpoint: SaveSetupCheckpoint,
+	}
+}
+
+func TestSuiteCanonicalPrecheckSecuresInstanceLockBeforeContinuing(t *testing.T) {
+	fixture := newSuitePrecheckFixture(t)
+	deps := suitePrecheckTestDependencies()
+	lock := &suitePrecheckTestLock{}
+	deps.AcquireInstance = func(string) (suitePrecheckInstanceLock, error) { return lock, nil }
+	calls := 0
+	deps.SecureInstance = func(path string) error {
+		calls++
+		if path != filepath.Join(fixture.roots.AgentState, ".ant-farm-client.lock") {
+			t.Fatalf("secure path=%q", path)
+		}
+		return errors.New("injected DACL failure")
+	}
+	if _, err := runSuiteCanonicalPrecheckWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); !errors.Is(err, ErrSuiteCanonicalPrecheck) {
+		t.Fatalf("secure failure error=%v", err)
+	}
+	if calls != 1 || !lock.released {
+		t.Fatalf("secure calls=%d lock released=%v", calls, lock.released)
+	}
+	if checkpoint, _ := LoadSetupCheckpoint(fixture.bootstrap.StatePath); checkpoint != nil {
+		t.Fatalf("secure failure wrote checkpoint: %+v", checkpoint)
+	}
+	for _, path := range []string{
+		filepath.Join(fixture.roots.Config, SuiteClientConfigName),
+		filepath.Join(fixture.roots.AgentState, SuiteBootstrapEnrollmentAttemptName),
+		filepath.Join(fixture.roots.AgentState, SuiteActivationJournalName),
+	} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("secure failure created later artifact %s: %v", filepath.Base(path), err)
+		}
 	}
 }
 
@@ -290,6 +332,34 @@ func TestSuiteCanonicalPrecheckRejectsUncleanPaths(t *testing.T) {
 		fixture.bootstrap.StatePath = fixture.roots.AgentState + string(filepath.Separator) + "." + string(filepath.Separator) + "setup.json"
 		if _, err := runSuiteCanonicalPrecheckWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suitePrecheckTestDependencies()); err == nil {
 			t.Fatal("unclean state path accepted")
+		}
+	})
+}
+
+func TestSuiteCanonicalPrecheckRejectsResolvedPathAliases(t *testing.T) {
+	t.Run("source ancestor symlink", func(t *testing.T) {
+		fixture := newSuitePrecheckFixture(t)
+		aliasParent := filepath.Join(t.TempDir(), "redirected")
+		if err := os.Symlink(filepath.Dir(fixture.source), aliasParent); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		aliasedSource := filepath.Join(aliasParent, filepath.Base(fixture.source))
+		if _, err := runSuiteCanonicalPrecheckWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, aliasedSource, suitePrecheckTestDependencies()); err == nil {
+			t.Fatal("source with redirected ancestor accepted")
+		}
+	})
+	t.Run("same inode case alias", func(t *testing.T) {
+		fixture := newSuitePrecheckFixture(t)
+		caseAlias := strings.ToUpper(fixture.roots.Config)
+		aliasInfo, aliasErr := os.Stat(caseAlias)
+		configInfo, configErr := os.Stat(fixture.roots.Config)
+		if aliasErr != nil || configErr != nil || !os.SameFile(aliasInfo, configInfo) || caseAlias == fixture.roots.Config {
+			t.Skip("filesystem has no usable case-fold alias")
+		}
+		aliasedRoots := fixture.roots
+		aliasedRoots.BrowserData = caseAlias
+		if err := validateSuitePrecheckRootLayout(aliasedRoots, fixture.source); err == nil {
+			t.Fatal("two roots sharing an inode through a case alias accepted")
 		}
 	})
 }
