@@ -12,7 +12,7 @@ import (
 
 func suitePrecheckResolvedPath(path string) (string, os.FileInfo, error) {
 	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil || resolved != path {
+	if err != nil || !suitePrecheckWindowsResolvedPathMatches(resolved, path) {
 		return "", nil, ErrSuiteCanonicalPrecheck
 	}
 	volume := filepath.VolumeName(path)

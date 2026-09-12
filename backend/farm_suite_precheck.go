@@ -52,7 +52,11 @@ func runSuiteCanonicalPrecheckWithDependencies(ctx context.Context, bootstrap Bo
 		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
 	}
 	rawStatePath := bootstrap.StatePath
-	if err := validateSuiteSetupInputs(&bootstrap, roots); err != nil || rawStatePath != filepath.Join(roots.AgentState, "setup.json") || validateSuitePrecheckRootLayout(roots, suiteSourceRoot) != nil {
+	if err := validateSuiteSetupInputs(&bootstrap, roots); err != nil || rawStatePath != filepath.Join(roots.AgentState, "setup.json") {
+		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
+	}
+	layoutSnapshot, err := captureSuitePrecheckRootLayout(roots, suiteSourceRoot)
+	if err != nil {
 		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
 	}
 	if err := ctx.Err(); err != nil {
@@ -135,6 +139,9 @@ func runSuiteCanonicalPrecheckWithDependencies(ctx context.Context, bootstrap Bo
 	if err := ctx.Err(); err != nil {
 		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
 	}
+	if err := layoutSnapshot.revalidate(roots, suiteSourceRoot); err != nil {
+		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
+	}
 	confirmedPreparation, confirmedPlan, err := loadSuitePrecheckProofChain(bootstrap, roots, release)
 	if err != nil || *confirmedPreparation != *preparation || *confirmedPlan != *expectedPlan {
 		return SuiteCanonicalPrecheckResult{}, ErrSuiteCanonicalPrecheck
@@ -189,16 +196,25 @@ func loadSuitePrecheckProofChain(bootstrap BootstrapConfig, roots SuiteUserRoots
 }
 
 func validateSuitePrecheckRootLayout(roots SuiteUserRoots, source string) error {
+	_, err := captureSuitePrecheckRootLayout(roots, source)
+	return err
+}
+
+type suitePrecheckRootLayoutSnapshot struct {
+	identities []os.FileInfo
+}
+
+func captureSuitePrecheckRootLayout(roots SuiteUserRoots, source string) (*suitePrecheckRootLayoutSnapshot, error) {
 	if source == "" || strings.TrimSpace(source) != source || filepath.Clean(source) != source {
-		return ErrSuiteCanonicalPrecheck
+		return nil, ErrSuiteCanonicalPrecheck
 	}
 	for _, root := range []string{roots.Config, roots.BrowserData, roots.AgentState, roots.Logs} {
 		if root == "" || strings.TrimSpace(root) != root || filepath.Clean(root) != root {
-			return ErrSuiteCanonicalPrecheck
+			return nil, ErrSuiteCanonicalPrecheck
 		}
 	}
 	if !filepath.IsAbs(source) || source == "." {
-		return ErrSuiteCanonicalPrecheck
+		return nil, ErrSuiteCanonicalPrecheck
 	}
 	mutable := []string{roots.Config, roots.BrowserData, roots.AgentState, roots.Logs}
 	allPaths := append(append([]string{}, mutable...), source)
@@ -207,7 +223,7 @@ func validateSuitePrecheckRootLayout(roots SuiteUserRoots, source string) error 
 	for index, path := range allPaths {
 		resolvedPath, info, err := suitePrecheckResolvedPath(path)
 		if err != nil || info == nil || !info.IsDir() {
-			return ErrSuiteCanonicalPrecheck
+			return nil, ErrSuiteCanonicalPrecheck
 		}
 		resolved[index], identities[index] = resolvedPath, info
 	}
@@ -216,17 +232,33 @@ func validateSuitePrecheckRootLayout(roots SuiteUserRoots, source string) error 
 			leftContainsRight, leftErr := suitePrecheckIdentityContains(resolved[left], identities[left], resolved[right])
 			rightContainsLeft, rightErr := suitePrecheckIdentityContains(resolved[right], identities[right], resolved[left])
 			if leftErr != nil || rightErr != nil || os.SameFile(identities[left], identities[right]) || leftContainsRight || rightContainsLeft {
-				return ErrSuiteCanonicalPrecheck
+				return nil, ErrSuiteCanonicalPrecheck
 			}
 		}
 	}
 	for left := range mutable {
 		for right := left + 1; right < len(mutable); right++ {
 			if suitePrecheckPathContains(mutable[left], mutable[right]) || suitePrecheckPathContains(mutable[right], mutable[left]) {
-				return ErrSuiteCanonicalPrecheck
+				return nil, ErrSuiteCanonicalPrecheck
 			}
 		}
 		if suitePrecheckPathContains(mutable[left], source) || suitePrecheckPathContains(source, mutable[left]) {
+			return nil, ErrSuiteCanonicalPrecheck
+		}
+	}
+	return &suitePrecheckRootLayoutSnapshot{identities: identities}, nil
+}
+
+func (snapshot *suitePrecheckRootLayoutSnapshot) revalidate(roots SuiteUserRoots, source string) error {
+	if snapshot == nil {
+		return ErrSuiteCanonicalPrecheck
+	}
+	current, err := captureSuitePrecheckRootLayout(roots, source)
+	if err != nil || len(current.identities) != len(snapshot.identities) {
+		return ErrSuiteCanonicalPrecheck
+	}
+	for index := range snapshot.identities {
+		if !os.SameFile(snapshot.identities[index], current.identities[index]) {
 			return ErrSuiteCanonicalPrecheck
 		}
 	}
@@ -283,6 +315,10 @@ func inspectSuitePrecheckFootprint(roots SuiteUserRoots, bootstrap BootstrapConf
 func suitePrecheckPathContains(root, candidate string) bool {
 	relative, err := filepath.Rel(root, candidate)
 	return err == nil && (relative == "." || (relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator))))
+}
+
+func suitePrecheckWindowsResolvedPathMatches(left, right string) bool {
+	return strings.EqualFold(left, right)
 }
 
 func suitePrecheckIdentityContains(root string, rootInfo os.FileInfo, candidate string) (bool, error) {

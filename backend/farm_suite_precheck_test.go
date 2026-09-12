@@ -47,7 +47,7 @@ func newSuitePrecheckFixture(t *testing.T) suitePrecheckFixture {
 	if _, err := coordinator.Run(); err != nil {
 		t.Fatal(err)
 	}
-	source := filepath.Join(t.TempDir(), "suite-source")
+	source := filepath.Join(t.TempDir(), "source-parent", "suite-source")
 	files := map[string][]byte{
 		"AntBrowser.exe":            []byte("gui"),
 		"ant-farm-client.exe":       []byte("agent"),
@@ -408,6 +408,17 @@ func TestSuitePrecheckContainmentUsesFilesystemIdentity(t *testing.T) {
 	})
 }
 
+func TestSuitePrecheckWindowsResolvedPathComparisonUsesCaseInsensitiveIdentity(t *testing.T) {
+	if !suitePrecheckWindowsResolvedPathMatches(`C:\Users\Farm\AntSuite`, `c:\users\farm\antsuite`) {
+		t.Fatal("Windows casing aliases were treated as different paths")
+	}
+	for _, candidate := range []string{`C:\Users\Farm\AntSuite2`, `D:\Users\Farm\AntSuite`, `C:\Users\Other\AntSuite`} {
+		if suitePrecheckWindowsResolvedPathMatches(`C:\Users\Farm\AntSuite`, candidate) {
+			t.Fatalf("different Windows path %q treated as equivalent", candidate)
+		}
+	}
+}
+
 func TestSuiteCanonicalPrecheckRejectsUnrecognizedMutableFootprint(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -537,6 +548,21 @@ func TestSuiteCanonicalPrecheckRevalidatesAfterProbes(t *testing.T) {
 			}
 			return writeOwnerAtomic(filepath.Join(fixture.roots.AgentState, suiteSetupPlanName), raw)
 		}},
+		{"source ancestor redirect", func(_ *testing.T, fixture suitePrecheckFixture) error {
+			parent := filepath.Dir(fixture.source)
+			moved := parent + "-moved"
+			if err := os.Rename(parent, moved); err != nil {
+				return err
+			}
+			return os.Symlink(moved, parent)
+		}},
+		{"source replaced by equal ordinary tree", func(t *testing.T, fixture suitePrecheckFixture) error {
+			original := fixture.source + "-original"
+			if err := os.Rename(fixture.source, original); err != nil {
+				return err
+			}
+			return cloneSuitePrecheckTree(t, original, fixture.source)
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newSuitePrecheckFixture(t)
@@ -550,6 +576,32 @@ func TestSuiteCanonicalPrecheckRevalidatesAfterProbes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func cloneSuitePrecheckTree(t *testing.T, source, destination string) error {
+	t.Helper()
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, raw, info.Mode().Perm())
+	})
 }
 
 func TestSuiteCanonicalPrecheckActiveAgentAndSetupLockFailClosed(t *testing.T) {
