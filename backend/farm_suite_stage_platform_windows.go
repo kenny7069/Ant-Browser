@@ -27,9 +27,14 @@ func validateSuiteStagePlatformInstall(installedSuiteRoot string, plan SuiteSetu
 	if err := validateCanonicalSuiteInstallRoot(handoff); err != nil {
 		return suiteStageInstallEvidence{}, ErrSuiteCanonicalStage
 	}
-	info, err := os.Lstat(installedSuiteRoot)
-	if err != nil || !info.IsDir() {
+	callerInfo, callerErr := os.Lstat(installedSuiteRoot)
+	canonicalInfo, canonicalErr := os.Lstat(canonicalRoot)
+	if callerErr != nil || canonicalErr != nil || !suiteStageWindowsInstallIdentityMatches(callerInfo, canonicalInfo) {
 		return suiteStageInstallEvidence{}, ErrSuiteCanonicalStage
 	}
-	return suiteStageInstallEvidence{CanonicalRoot: canonicalRoot, RootInfo: info}, nil
+	return suiteStageInstallEvidence{CanonicalRoot: canonicalRoot, RootInfo: canonicalInfo}, nil
+}
+
+func suiteStageWindowsInstallIdentityMatches(caller, canonical os.FileInfo) bool {
+	return caller != nil && canonical != nil && caller.IsDir() && canonical.IsDir() && os.SameFile(caller, canonical)
 }
