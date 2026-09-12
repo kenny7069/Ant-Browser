@@ -61,27 +61,41 @@ func (draft SuiteClientConfigDraft) validate(bootstrap BootstrapConfig, roots Su
 }
 
 func LoadSuiteClientConfigDraft(roots SuiteUserRoots, bootstrap BootstrapConfig) (*SuiteClientConfigDraft, error) {
+	return loadSuiteClientConfigDraftWithDependencies(roots, bootstrap, suiteConfigDraftLoadDependencies{ReadFile: readSuiteConfigDraftFile})
+}
+
+type suiteConfigDraftLoadDependencies struct {
+	ReadFile     func(string, os.FileInfo) ([]byte, error)
+	AfterMissing func() error
+}
+
+func loadSuiteClientConfigDraftWithDependencies(roots SuiteUserRoots, bootstrap BootstrapConfig, dependencies suiteConfigDraftLoadDependencies) (*SuiteClientConfigDraft, error) {
 	if err := validateSuiteSetupInputs(&bootstrap, roots); err != nil {
 		return nil, ErrSuiteConfigDraft
 	}
-	rootInfo, err := os.Lstat(roots.Config)
-	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() || validateSuiteSetupPathSecurity(roots.Config, true) != nil {
+	if dependencies.ReadFile == nil {
 		return nil, ErrSuiteConfigDraft
 	}
-	_, resolvedRootInfo, err := suitePrecheckResolvedPath(roots.Config)
-	if err != nil || resolvedRootInfo == nil || !os.SameFile(rootInfo, resolvedRootInfo) {
-		return nil, ErrSuiteConfigDraft
+	rootInfo, err := captureSuiteConfigDraftRoot(roots.Config)
+	if err != nil {
+		return nil, err
 	}
 	path := filepath.Join(roots.Config, SuiteClientConfigDraftName)
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
+		if dependencies.AfterMissing != nil && dependencies.AfterMissing() != nil {
+			return nil, ErrSuiteConfigDraft
+		}
+		if revalidateSuiteConfigDraftRoot(roots.Config, rootInfo) != nil {
+			return nil, ErrSuiteConfigDraft
+		}
 		return nil, nil
 	}
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > suiteConfigDraftMaxBytes || validateSuiteSetupPathSecurity(path, false) != nil {
 		return nil, ErrSuiteConfigDraft
 	}
-	raw, err := readSuiteConfigDraftFile(path, info)
-	if err != nil || rejectSuiteReleaseDuplicateJSONKeys(raw) != nil {
+	raw, err := dependencies.ReadFile(path, info)
+	if err != nil || revalidateSuiteConfigDraftRoot(roots.Config, rootInfo) != nil || rejectSuiteReleaseDuplicateJSONKeys(raw) != nil {
 		return nil, ErrSuiteConfigDraft
 	}
 	keys := []string{"schema_version", "request_uid", "setup_stage_id", "bootstrap_sha256", "manifest_sha256", "target", "version", "suite_binary_root", "server_origin", "node_name", "client_config_path", "agent_state_root", "application_root", "ant_config_path", "log_path"}
@@ -95,10 +109,30 @@ func LoadSuiteClientConfigDraft(roots SuiteUserRoots, bootstrap BootstrapConfig)
 	var draft SuiteClientConfigDraft
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&draft) != nil || requireJSONEOF(decoder) != nil || draft.validate(bootstrap, roots) != nil {
+	if decoder.Decode(&draft) != nil || requireJSONEOF(decoder) != nil || draft.validate(bootstrap, roots) != nil || revalidateSuiteConfigDraftRoot(roots.Config, rootInfo) != nil {
 		return nil, ErrSuiteConfigDraft
 	}
 	return &draft, nil
+}
+
+func captureSuiteConfigDraftRoot(root string) (os.FileInfo, error) {
+	rootInfo, err := os.Lstat(root)
+	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() || validateSuiteSetupPathSecurity(root, true) != nil {
+		return nil, ErrSuiteConfigDraft
+	}
+	_, resolvedRootInfo, err := suitePrecheckResolvedPath(root)
+	if err != nil || resolvedRootInfo == nil || !os.SameFile(rootInfo, resolvedRootInfo) {
+		return nil, ErrSuiteConfigDraft
+	}
+	return rootInfo, nil
+}
+
+func revalidateSuiteConfigDraftRoot(root string, initial os.FileInfo) error {
+	current, err := captureSuiteConfigDraftRoot(root)
+	if err != nil || current == nil || initial == nil || !os.SameFile(initial, current) {
+		return ErrSuiteConfigDraft
+	}
+	return nil
 }
 
 func readSuiteConfigDraftFile(path string, initial os.FileInfo) (raw []byte, resultErr error) {
