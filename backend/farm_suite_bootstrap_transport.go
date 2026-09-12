@@ -346,7 +346,7 @@ func validateSuiteBootstrapUpdate(update SuiteBootstrapUpdate) (string, error) {
 		return "", ErrSuiteBootstrapResponse
 	}
 	parsed, err := url.Parse(update.ManifestURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" || parsed.RawPath != "" || parsed.ForceQuery {
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" || parsed.RawPath != "" || parsed.ForceQuery || (parsed.Path != "" && strings.HasSuffix(parsed.Path, "/")) {
 		return "", ErrSuiteBootstrapResponse
 	}
 	origin, err := canonicalSuiteBootstrapOrigin("https://"+parsed.Host, "https")

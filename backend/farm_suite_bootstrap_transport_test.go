@@ -294,6 +294,12 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 		"update empty query": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = origin + "/m?"
 		},
+		"update root path": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/"
+		},
+		"update directory path": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/releases/"
+		},
 		"update URL too long": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = maximumUpdateURL + "a"
 		},
