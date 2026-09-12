@@ -27,6 +27,7 @@ const (
 	suiteBootstrapDiscoveryPath       = "/.well-known/ant-farm/bootstrap.json"
 	maxSuiteBootstrapBodyBytes        = 64 << 10
 	maxSuiteBootstrapHeaderBytes      = 32 << 10
+	maxSuiteBootstrapURLBytes         = 2048
 	maxSuiteBootstrapCapabilities     = 64
 	maxSuiteBootstrapCapabilityBytes  = 80
 	maxSuiteBootstrapAllowlist        = 16
@@ -82,7 +83,7 @@ func FetchSuiteBootstrapDiscovery(ctx context.Context, bootstrap BootstrapConfig
 // fetchSuiteBootstrapDiscoveryWithClient is a test seam for a pinned local CA.
 // Production callers cannot provide a transport or disable certificate checks.
 func fetchSuiteBootstrapDiscoveryWithClient(ctx context.Context, bootstrap BootstrapConfig, currentSuiteVersion, currentProtocolVersion string, supplied *http.Client) (SuiteBootstrapDiscovery, error) {
-	if supplied == nil || bootstrap.Validate() != nil || ctx == nil {
+	if supplied == nil || ctx == nil || len(bootstrap.ServerURL) == 0 || len(bootstrap.ServerURL) > maxSuiteBootstrapURLBytes || bootstrap.Validate() != nil {
 		return SuiteBootstrapDiscovery{}, ErrSuiteBootstrapConfig
 	}
 	origin, err := canonicalSuiteBootstrapOrigin(bootstrap.ServerURL, "https")
@@ -249,7 +250,7 @@ func suiteBootstrapHeaderSize(header http.Header) int {
 }
 
 func canonicalSuiteBootstrapOrigin(raw, scheme string) (string, error) {
-	if raw == "" || containsUnsafeSuiteBootstrapURLRune(raw) {
+	if raw == "" || len(raw) > maxSuiteBootstrapURLBytes || containsUnsafeSuiteBootstrapURLRune(raw) {
 		return "", ErrSuiteBootstrapResponse
 	}
 	parsed, err := url.Parse(raw)
@@ -320,7 +321,7 @@ func validSuiteBootstrapDNSName(hostname string) bool {
 }
 
 func validateSuiteBootstrapEndpoint(raw, scheme, exactPath string) (string, error) {
-	if containsUnsafeSuiteBootstrapURLRune(raw) {
+	if len(raw) == 0 || len(raw) > maxSuiteBootstrapURLBytes || containsUnsafeSuiteBootstrapURLRune(raw) {
 		return "", ErrSuiteBootstrapResponse
 	}
 	parsed, err := url.Parse(raw)
@@ -338,7 +339,7 @@ func validateSuiteBootstrapEndpoint(raw, scheme, exactPath string) (string, erro
 }
 
 func validateSuiteBootstrapUpdate(update SuiteBootstrapUpdate) (string, error) {
-	if containsUnsafeSuiteBootstrapURLRune(update.ManifestURL) || strings.Contains(update.ManifestURL, "%") {
+	if len(update.ManifestURL) == 0 || len(update.ManifestURL) > maxSuiteBootstrapURLBytes || containsUnsafeSuiteBootstrapURLRune(update.ManifestURL) || strings.Contains(update.ManifestURL, "%") {
 		return "", ErrSuiteBootstrapResponse
 	}
 	parsed, err := url.Parse(update.ManifestURL)

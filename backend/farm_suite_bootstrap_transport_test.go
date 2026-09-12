@@ -197,6 +197,18 @@ func TestFetchSuiteBootstrapDiscoveryRejectsOversizedHeadersFromSuppliedTranspor
 	}
 }
 
+func TestFetchSuiteBootstrapDiscoveryRejectsOversizedRequestOriginBeforeTransport(t *testing.T) {
+	client := &http.Client{Transport: suiteBootstrapRoundTripper(func(*http.Request) (*http.Response, error) {
+		t.Fatal("transport called for oversized request origin")
+		return nil, nil
+	})}
+	config := suiteBootstrapConfig(t, "https://"+strings.Repeat("a", maxSuiteBootstrapURLBytes))
+	_, err := fetchSuiteBootstrapDiscoveryWithClient(context.Background(), config, "3.0.0", "3.0.0", client)
+	if !errors.Is(err, ErrSuiteBootstrapConfig) {
+		t.Fatalf("oversized request origin error=%v", err)
+	}
+}
+
 func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T) {
 	origin := "https://farm.example.test"
 	valid := suiteBootstrapFixture(origin)
@@ -211,6 +223,16 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 	originOnlyRaw, _ := json.Marshal(originOnlyUpdate)
 	if _, err := parseSuiteBootstrapDiscovery(originOnlyRaw, origin, "3.0.0", "3.0.0"); err != nil {
 		t.Fatalf("origin-only update URL rejected: %v", err)
+	}
+	maximumUpdate := suiteBootstrapFixture(origin)
+	maximumUpdateURL := origin + "/" + strings.Repeat("a", maxSuiteBootstrapURLBytes-len(origin)-1)
+	maximumUpdate["update"] = map[string]any{"manifest_url": maximumUpdateURL, "public_key_ed25519_b64": key, "channel": "stable"}
+	maximumUpdateRaw, _ := json.Marshal(maximumUpdate)
+	if len(maximumUpdateURL) != maxSuiteBootstrapURLBytes {
+		t.Fatalf("maximum update URL size=%d", len(maximumUpdateURL))
+	}
+	if _, err := parseSuiteBootstrapDiscovery(maximumUpdateRaw, origin, "3.0.0", "3.0.0"); err != nil {
+		t.Fatalf("maximum update URL rejected: %v", err)
 	}
 	maxCapability := suiteBootstrapFixture(origin)
 	maxCapability["supported_capabilities"] = []string{"a" + strings.Repeat("b", 79)}
@@ -271,6 +293,18 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 		},
 		"update empty query": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = origin + "/m?"
+		},
+		"update URL too long": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = maximumUpdateURL + "a"
+		},
+		"enrollment URL too long": func(v map[string]any) {
+			v["enrollment_endpoint"] = origin + "/" + strings.Repeat("a", maxSuiteBootstrapURLBytes)
+		},
+		"control URL too long": func(v map[string]any) {
+			v["control_endpoint"] = "wss://farm.example.test/" + strings.Repeat("a", maxSuiteBootstrapURLBytes)
+		},
+		"allowlist URL too long": func(v map[string]any) {
+			v["endpoint_allowlist"] = []string{"https://" + strings.Repeat("a", maxSuiteBootstrapURLBytes), origin}
 		},
 		"update uppercase host": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = "https://FARM.example.test/m"
@@ -352,6 +386,7 @@ func TestSuiteBootstrapOriginRejectsMalformedDNSAndPorts(t *testing.T) {
 		"https://farm.example.test#",
 		"https://192.168.001.001",
 		"https://[2001:0db8:0:0:0:0:0:1]",
+		"https://" + strings.Repeat("a", maxSuiteBootstrapURLBytes),
 	} {
 		if _, err := canonicalSuiteBootstrapOrigin(raw, "https"); err == nil {
 			t.Fatalf("origin accepted: %s", raw)
