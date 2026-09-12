@@ -455,13 +455,14 @@ func TestSuiteWindowsPackageScaffoldFailsClosedAndSeparatesRoots(t *testing.T) {
 		contents[relative] = string(raw)
 	}
 	script := strings.ToLower(contents["publish/suite/windows/publish-windows.ps1"])
+	scriptSource := contents["publish/suite/windows/publish-windows.ps1"]
 	for _, required := range []string{
 		"makensis.exe", "signtool.exe", "get-authenticodesignature", "get-filehash",
 		"release-manifest.json", "release-manifest.envelope.json", "manifest_sha256",
 		"suite verify-release", "releasekeyid", "releasepublickey", "ed25519 release envelope verification failed",
 		"antbrowser.exe", "ant-farm-client.exe", "runtime/xray.exe", "runtime/sing-box.exe", "runtime/chrome/chrome.exe",
 		"sha256 mismatch", "size mismatch", "license manifest", "suite installer signing failed",
-		"unexpected or uncovered file", "foreach ($relative in $allowed.keys)",
+		"unexpected or uncovered file", "foreach ($key in $allowed.keys)",
 		"manifest does not cover licenses.json", "signed dependency does not have one exact license artifact",
 		"license artifact does not exactly match a signed dependency", "exact signed legal entry",
 		"version-agnostic policy contract", "license policy artifact is missing from the payload",
@@ -486,6 +487,25 @@ func TestSuiteWindowsPackageScaffoldFailsClosedAndSeparatesRoots(t *testing.T) {
 	for _, required := range []string{"numeric prerelease identifier with a leading zero", "$identifier -match '^[0-9]+$'"} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("publisher SemVer validation missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`$seen[$key] = [string]$entry.path`,
+		`$allowed[$key] = [string]$seen[$key]`,
+		`$allowed[$relative.ToLowerInvariant()] = $relative`,
+		`if ($relative -cne [string]$allowed[$key])`,
+		`payload path casing differs from its signed canonical path`,
+		`foreach ($key in $allowed.Keys)`,
+		`$relative = [string]$allowed[$key]`,
+		`Join-Path $stage ($relative.Replace('/', [System.IO.Path]::DirectorySeparatorChar))`,
+	} {
+		if !strings.Contains(scriptSource, required) {
+			t.Fatalf("publisher loses signed path casing: missing %q", required)
+		}
+	}
+	for _, canonicalPath := range []string{"AntBrowser.exe", "LICENSES.json", "licenses/Ant-Browser-Suite-LICENSE.txt", "release-manifest.envelope.json"} {
+		if !strings.Contains(scriptSource, canonicalPath) && !strings.Contains(contents["publish/suite/LICENSES.json"], canonicalPath) {
+			t.Fatalf("package contract omits canonical mixed-case path %q", canonicalPath)
 		}
 	}
 	installer := strings.ToLower(contents["publish/suite/windows/installer.nsi"])

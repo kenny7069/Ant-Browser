@@ -81,7 +81,7 @@ foreach ($entry in $manifest.entries) {
   $path = Resolve-PayloadPath ([string]$entry.path)
   $key = ([string]$entry.path).ToLowerInvariant()
   if ($seen.ContainsKey($key)) { Fail "manifest contains a case-fold path collision" }
-  $seen[$key] = $true
+  $seen[$key] = [string]$entry.path
   Require-Leaf $path ([string]$entry.path)
   $item = Get-Item -LiteralPath $path
   if ($item.Length -ne [int64]$entry.size) { Fail "size mismatch: $($entry.path)" }
@@ -155,17 +155,20 @@ foreach ($allowedArtifact in $allowedArtifacts) {
   if ($matchingArtifacts.Count -ne 1) { Fail "license policy artifact is missing from the payload" }
 }
 $allowed = @{}
-foreach ($key in $seen.Keys) { $allowed[$key] = $true }
-foreach ($relative in @("release-manifest.json", "release-manifest.envelope.json")) { $allowed[$relative.ToLowerInvariant()] = $true }
+foreach ($key in $seen.Keys) { $allowed[$key] = [string]$seen[$key] }
+foreach ($relative in @("release-manifest.json", "release-manifest.envelope.json")) { $allowed[$relative.ToLowerInvariant()] = $relative }
 foreach ($file in Get-ChildItem -LiteralPath $PayloadRoot -File -Recurse) {
   $relative = $file.FullName.Substring($PayloadRoot.TrimEnd('\').Length + 1).Replace('\', '/')
-  if (-not $allowed.ContainsKey($relative.ToLowerInvariant())) { Fail "payload contains an unexpected or uncovered file: $relative" }
+  $key = $relative.ToLowerInvariant()
+  if (-not $allowed.ContainsKey($key)) { Fail "payload contains an unexpected or uncovered file: $relative" }
+  if ($relative -cne [string]$allowed[$key]) { Fail "payload path casing differs from its signed canonical path: $relative" }
 }
 
 $stage = Join-Path $PSScriptRoot ".staging\windows-$Arch-$Version"
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage, $OutputRoot -Force | Out-Null
-foreach ($relative in $allowed.Keys) {
+foreach ($key in $allowed.Keys) {
+  $relative = [string]$allowed[$key]
   $source = Resolve-PayloadPath $relative
   $destination = Join-Path $stage ($relative.Replace('/', [System.IO.Path]::DirectorySeparatorChar))
   New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
