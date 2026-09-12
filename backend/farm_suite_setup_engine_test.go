@@ -41,8 +41,15 @@ func TestSuiteSetupFreshRunWritesOwnerOnlyTypedDraft(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Classification != SuiteSetupFresh || result.Checkpoint.Stage != SetupConfigDrafted {
+	if result.Classification != SuiteSetupFresh || result.Checkpoint.Stage != SetupBootstrapDrafted {
 		t.Fatalf("result = %+v", result)
+	}
+	if _, err := os.Stat(config.StatePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preparation advanced canonical checkpoint: %v", err)
+	}
+	preparationPath := filepath.Join(roots.AgentState, suitePreparationStateName)
+	if _, err := os.Stat(preparationPath); err != nil {
+		t.Fatalf("preparation checkpoint: %v", err)
 	}
 	for _, path := range []string{roots.Config, roots.BrowserData, roots.AgentState, roots.Logs} {
 		info, statErr := os.Stat(path)
@@ -78,7 +85,7 @@ func TestSuiteSetupFreshRunWritesOwnerOnlyTypedDraft(t *testing.T) {
 }
 
 func TestSuiteSetupFailureInjectionResumesIdempotently(t *testing.T) {
-	for _, failedStage := range []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafted} {
+	for _, failedStage := range []SetupStage{SetupInputValidated, SetupUserRootsReady, SetupBootstrapDrafted} {
 		t.Run(string(failedStage), func(t *testing.T) {
 			roots, config := setupEngineFixture(t)
 			injected := errors.New("injected setup failure")
@@ -102,7 +109,7 @@ func TestSuiteSetupFailureInjectionResumesIdempotently(t *testing.T) {
 				t.Fatal(err)
 			}
 			second, err := resumed.Run()
-			if err != nil || second.Classification != SuiteSetupExisting || second.Checkpoint.Stage != SetupConfigDrafted {
+			if err != nil || second.Classification != SuiteSetupExisting || second.Checkpoint.Stage != SetupBootstrapDrafted {
 				t.Fatalf("resumed run = %+v, %v", second, err)
 			}
 			before, _ := os.ReadFile(second.BootstrapPath)
@@ -124,7 +131,7 @@ func TestSuiteSetupConcurrentRunRejectsSecondLockOwner(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	first.FailAfter = func(stage SetupStage) error {
-		if stage == SetupPrecheck {
+		if stage == SetupInputValidated {
 			close(entered)
 			<-release
 		}
@@ -198,12 +205,12 @@ func TestSuiteSetupClassifiesExistingAndCorruptState(t *testing.T) {
 		build func(t *testing.T, roots SuiteUserRoots, config BootstrapConfig)
 	}{
 		{
-			name: "invalid checkpoint",
+			name: "invalid preparation checkpoint",
 			build: func(t *testing.T, roots SuiteUserRoots, config BootstrapConfig) {
 				if err := os.MkdirAll(roots.AgentState, 0o700); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(config.StatePath, []byte("{"), 0o600); err != nil {
+				if err := os.WriteFile(filepath.Join(roots.AgentState, suitePreparationStateName), []byte("{"), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -250,5 +257,113 @@ func TestSuiteSetupRejectsSymlinkRoot(t *testing.T) {
 	}
 	if _, err := coordinator.Run(); !errors.Is(err, ErrFarmClientRoots) {
 		t.Fatalf("symlink root accepted: %v", err)
+	}
+}
+
+func TestSuiteSetupRejectsCanonicalStateOutsideAgentStateAndPreparationSymlink(t *testing.T) {
+	roots, config := setupEngineFixture(t)
+	config.StatePath = filepath.Join(t.TempDir(), "setup.json")
+	if _, err := NewSuiteSetupCoordinatorWithRoots(config, roots); !errors.Is(err, ErrFarmClientRoots) {
+		t.Fatalf("checkpoint outside agent state accepted: %v", err)
+	}
+
+	if runtime.GOOS == "windows" {
+		return
+	}
+	roots, config = setupEngineFixture(t)
+	if err := os.MkdirAll(roots.AgentState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "preparation.json")
+	if err := os.WriteFile(target, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(roots.AgentState, suitePreparationStateName)); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewSuiteSetupCoordinatorWithRoots(config, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.Run()
+	if result.Classification != SuiteSetupCorrupt || !errors.Is(err, ErrSuiteSetupCorrupt) {
+		t.Fatalf("symlink preparation checkpoint accepted: result=%+v err=%v", result, err)
+	}
+}
+
+func TestSuiteSetupRejectsCanonicalCheckpointSymlinkWithoutReadingIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires platform privileges")
+	}
+	roots, config := setupEngineFixture(t)
+	if err := os.MkdirAll(roots.AgentState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "canonical.json")
+	if err := os.WriteFile(target, []byte(`{"private_key":"must-not-be-read"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, config.StatePath); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewSuiteSetupCoordinatorWithRoots(config, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.Run()
+	if result.Classification != SuiteSetupCorrupt || !errors.Is(err, ErrSuiteSetupCorrupt) {
+		t.Fatalf("canonical checkpoint symlink accepted: result=%+v err=%v", result, err)
+	}
+}
+
+func TestSuiteSetupRejectsUnsafeBootstrapDraftBeforeRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows DACL validation is compile-checked and requires a native runner")
+	}
+	t.Run("symlink", func(t *testing.T) {
+		roots, config := setupEngineFixture(t)
+		if err := os.MkdirAll(roots.Config, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(t.TempDir(), "draft.json")
+		if err := os.WriteFile(target, []byte(`{"private_key":"must-not-be-read"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(roots.Config, suiteBootstrapDraftName)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ClassifySuiteSetup(roots, config)
+		if got != SuiteSetupCorrupt || !errors.Is(err, ErrSuiteSetupCorrupt) {
+			t.Fatalf("symlink draft classification = %q, %v", got, err)
+		}
+	})
+	t.Run("permissive mode", func(t *testing.T) {
+		roots, config := setupEngineFixture(t)
+		if err := os.MkdirAll(roots.Config, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(roots.Config, suiteBootstrapDraftName)
+		if err := os.WriteFile(path, []byte(`{"private_key":"must-not-be-read"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ClassifySuiteSetup(roots, config)
+		if got != SuiteSetupCorrupt || !errors.Is(err, ErrSuiteSetupCorrupt) {
+			t.Fatalf("permissive draft classification = %q, %v", got, err)
+		}
+	})
+}
+
+func TestSuitePreparationCheckpointRejectsCanonicalStage(t *testing.T) {
+	roots, config := setupEngineFixture(t)
+	digest, err := bootstrapConfigDigest(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := SetupPreparationCheckpoint{
+		SchemaVersion: 1, Stage: SetupPrecheck,
+		RequestUID: "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6", BootstrapSHA256: digest,
+	}
+	if err := saveSetupPreparationCheckpoint(filepath.Join(roots.AgentState, suitePreparationStateName), checkpoint); !errors.Is(err, ErrSuiteSetupCorrupt) {
+		t.Fatalf("canonical stage accepted as preparation: %v", err)
 	}
 }
