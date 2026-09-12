@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -21,11 +22,11 @@ func suiteReleaseManifestFixture() SuiteReleaseManifest {
 		ConfigSchema:  3,
 		Capabilities:  []string{"setup-plan", "signed-release"},
 		CoreVersions:  map[string]string{"chromium": "128.0.0", "xray": "25.1.1"},
-		Dependencies:  []SuiteReleaseDependency{{Name: "glibc", Version: "2.31"}},
+		Dependencies:  []SuiteReleaseDependency{{Name: "glibc", Version: "2.31", License: "LGPL-2.1-or-later"}},
 		Entries: []SuiteReleaseEntry{{
 			Path: "bin/ant-farm-agent", Role: SuiteReleaseEntryBinary, Size: 12,
 			SHA256: hex.EncodeToString(digest[:]), Executable: true,
-		}},
+		}, {Path: "LICENSE", Role: SuiteReleaseEntryLegal, Size: 0, SHA256: hex.EncodeToString(digest[:])}},
 	}
 }
 
@@ -42,17 +43,17 @@ func TestSuiteReleaseManifestDetachedSignatureUsesCallerTrust(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	verified, err := VerifySuiteReleaseManifest(manifestRaw, envelopeRaw, publicKey)
+	verified, err := VerifySuiteReleaseManifest(manifestRaw, envelopeRaw, "release-2026", publicKey)
 	if err != nil || verified.Version != "3.0.0" {
 		t.Fatalf("verified = %+v, %v", verified, err)
 	}
 	otherPublic, _, _ := ed25519.GenerateKey(rand.Reader)
-	if _, err := VerifySuiteReleaseManifest(manifestRaw, envelopeRaw, otherPublic); !errors.Is(err, ErrSuiteReleaseManifest) {
+	if _, err := VerifySuiteReleaseManifest(manifestRaw, envelopeRaw, "release-2026", otherPublic); !errors.Is(err, ErrSuiteReleaseManifest) {
 		t.Fatalf("untrusted caller key accepted: %v", err)
 	}
 	tampered := append([]byte(nil), manifestRaw...)
 	tampered[len(tampered)-2] ^= 1
-	if _, err := VerifySuiteReleaseManifest(tampered, envelopeRaw, publicKey); !errors.Is(err, ErrSuiteReleaseManifest) {
+	if _, err := VerifySuiteReleaseManifest(tampered, envelopeRaw, "release-2026", publicKey); !errors.Is(err, ErrSuiteReleaseManifest) {
 		t.Fatalf("tampered manifest accepted: %v", err)
 	}
 	var envelope map[string]any
@@ -64,8 +65,15 @@ func TestSuiteReleaseManifestDetachedSignatureUsesCallerTrust(t *testing.T) {
 	}
 	envelope["public_key"] = "attacker"
 	unknownEnvelope, _ := json.Marshal(envelope)
-	if _, err := VerifySuiteReleaseManifest(manifestRaw, unknownEnvelope, publicKey); !errors.Is(err, ErrSuiteReleaseManifest) {
+	if _, err := VerifySuiteReleaseManifest(manifestRaw, unknownEnvelope, "release-2026", publicKey); !errors.Is(err, ErrSuiteReleaseManifest) {
 		t.Fatalf("unknown envelope field accepted: %v", err)
+	}
+	if _, err := VerifySuiteReleaseManifest(manifestRaw, envelopeRaw, "different-key", publicKey); !errors.Is(err, ErrSuiteReleaseManifest) {
+		t.Fatalf("wrong expected key id accepted: %v", err)
+	}
+	duplicateEnvelope := strings.Replace(string(envelopeRaw), `"key_id":"release-2026"`, `"Key_ID":"attacker","key_id":"release-2026"`, 1)
+	if _, err := VerifySuiteReleaseManifest(manifestRaw, []byte(duplicateEnvelope), "release-2026", publicKey); !errors.Is(err, ErrSuiteReleaseManifest) {
+		t.Fatalf("duplicate envelope key accepted: %v", err)
 	}
 }
 
@@ -80,6 +88,16 @@ func TestSuiteReleaseManifestStrictJSONAndEntryRules(t *testing.T) {
 	withUnknown, _ := json.Marshal(object)
 	if _, err := ParseSuiteReleaseManifest(withUnknown); !errors.Is(err, ErrSuiteReleaseManifest) {
 		t.Fatalf("unknown manifest field accepted: %v", err)
+	}
+	for name, duplicate := range map[string]string{
+		"top level": strings.Replace(string(raw), `"version":"3.0.0"`, `"Version":"evil","version":"3.0.0"`, 1),
+		"nested":    strings.Replace(string(raw), `"os":"linux"`, `"OS":"windows","os":"linux"`, 1),
+	} {
+		t.Run("duplicate key "+name, func(t *testing.T) {
+			if _, err := ParseSuiteReleaseManifest([]byte(duplicate)); !errors.Is(err, ErrSuiteReleaseManifest) {
+				t.Fatalf("duplicate/case-fold key accepted: %v", err)
+			}
+		})
 	}
 
 	for _, badPath := range []string{"/bin/agent", "../agent", "bin/../agent", `bin\agent.exe`, "bin/agent.exe:stream", "./bin/agent"} {
@@ -108,6 +126,11 @@ func TestSuiteReleaseManifestStrictJSONAndEntryRules(t *testing.T) {
 		"duplicate capability": func(manifest *SuiteReleaseManifest) {
 			manifest.Capabilities = append(manifest.Capabilities, "SETUP-PLAN")
 		},
+		"non semver version": func(manifest *SuiteReleaseManifest) { manifest.Version = "dev" },
+		"dependency without license": func(manifest *SuiteReleaseManifest) {
+			manifest.Dependencies[0].License = ""
+		},
+		"missing legal": func(manifest *SuiteReleaseManifest) { manifest.Entries = manifest.Entries[:1] },
 	} {
 		t.Run(name, func(t *testing.T) {
 			manifest := suiteReleaseManifestFixture()
@@ -133,5 +156,37 @@ func TestSuiteReleaseManifestRequiresAllTypedSections(t *testing.T) {
 				t.Fatalf("missing %s accepted: %v", name, err)
 			}
 		})
+	}
+}
+
+func TestSuiteReleaseManifestResourceAndReleasePolicyLimits(t *testing.T) {
+	for name, mutate := range map[string]func(*SuiteReleaseManifest){
+		"generic version": func(manifest *SuiteReleaseManifest) { manifest.Version = "release" },
+		"oversize entry":  func(manifest *SuiteReleaseManifest) { manifest.Entries[0].Size = maxSuiteReleaseEntryBytes + 1 },
+		"too many entries": func(manifest *SuiteReleaseManifest) {
+			manifest.Entries = make([]SuiteReleaseEntry, maxSuiteReleaseEntries+1)
+		},
+		"too many capabilities": func(manifest *SuiteReleaseManifest) {
+			manifest.Capabilities = make([]string, maxSuiteReleaseCapabilities+1)
+		},
+		"dependency license": func(manifest *SuiteReleaseManifest) { manifest.Dependencies[0].License = "" },
+		"core case fold collision": func(manifest *SuiteReleaseManifest) {
+			manifest.CoreVersions["XRAY"] = manifest.CoreVersions["xray"]
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			manifest := suiteReleaseManifestFixture()
+			mutate(&manifest)
+			if err := manifest.Validate(); !errors.Is(err, ErrSuiteReleaseManifest) {
+				t.Fatalf("policy violation accepted: %v", err)
+			}
+		})
+	}
+	if _, err := ParseSuiteReleaseManifest(make([]byte, maxSuiteReleaseManifestBytes+1)); !errors.Is(err, ErrSuiteReleaseManifest) {
+		t.Fatalf("oversize manifest accepted: %v", err)
+	}
+	publicKey, _, _ := ed25519.GenerateKey(rand.Reader)
+	if _, err := VerifySuiteReleaseManifest([]byte("{}"), make([]byte, maxSuiteReleaseEnvelopeBytes+1), "release-2026", publicKey); !errors.Is(err, ErrSuiteReleaseManifest) {
+		t.Fatalf("oversize envelope accepted: %v", err)
 	}
 }

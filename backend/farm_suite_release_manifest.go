@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -21,10 +23,20 @@ const (
 	SuiteReleaseEntryLibrary = "library"
 	SuiteReleaseEntryConfig  = "config"
 	SuiteReleaseEntryAsset   = "asset"
+	SuiteReleaseEntryLegal   = "legal"
+
+	maxSuiteReleaseManifestBytes = 1 << 20
+	maxSuiteReleaseEnvelopeBytes = 16 << 10
+	maxSuiteReleaseEntries       = 4096
+	maxSuiteReleaseCapabilities  = 256
+	maxSuiteReleaseDependencies  = 512
+	maxSuiteReleaseCoreVersions  = 128
+	maxSuiteReleaseEntryBytes    = int64(1 << 40)
 )
 
 var suiteReleaseTokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 var suiteReleaseCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
+var suiteReleaseSemverPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 
 type SuiteReleaseTarget struct {
 	OS   string `json:"os"`
@@ -40,6 +52,7 @@ type SuiteReleaseCommits struct {
 type SuiteReleaseDependency struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
+	License string `json:"license"`
 }
 
 type SuiteReleaseEntry struct {
@@ -73,27 +86,35 @@ type SuiteReleaseManifestEnvelope struct {
 }
 
 func (m SuiteReleaseManifest) Validate() error {
-	if m.SchemaVersion != 1 || !suiteReleaseTokenPattern.MatchString(m.Version) || m.ConfigSchema < 1 {
+	if m.SchemaVersion != 1 || !suiteReleaseSemverPattern.MatchString(m.Version) || m.ConfigSchema < 1 {
 		return ErrSuiteReleaseManifest
 	}
-	if !validSuiteReleaseTarget(m.Target) || !validSuiteReleaseCommits(m.Commits) || len(m.Entries) == 0 {
+	if !validSuiteReleaseTarget(m.Target) || !validSuiteReleaseCommits(m.Commits) || len(m.Entries) == 0 || len(m.Entries) > maxSuiteReleaseEntries {
 		return ErrSuiteReleaseManifest
+	}
+	if m.Capabilities == nil || len(m.Capabilities) > maxSuiteReleaseCapabilities || m.Dependencies == nil ||
+		len(m.Dependencies) > maxSuiteReleaseDependencies || len(m.CoreVersions) == 0 || len(m.CoreVersions) > maxSuiteReleaseCoreVersions {
+		return fmt.Errorf("%w: core versions are required", ErrSuiteReleaseManifest)
 	}
 	if err := validateSuiteReleaseTokens(m.Capabilities); err != nil {
 		return err
 	}
-	if m.Capabilities == nil || m.Dependencies == nil || len(m.CoreVersions) == 0 {
-		return fmt.Errorf("%w: core versions are required", ErrSuiteReleaseManifest)
-	}
+	seenCoreVersions := map[string]struct{}{}
 	for name, version := range m.CoreVersions {
 		if !suiteReleaseTokenPattern.MatchString(name) || !suiteReleaseTokenPattern.MatchString(version) {
 			return fmt.Errorf("%w: invalid core version", ErrSuiteReleaseManifest)
 		}
+		folded := strings.ToLower(name)
+		if _, exists := seenCoreVersions[folded]; exists {
+			return fmt.Errorf("%w: case-folded core version collision", ErrSuiteReleaseManifest)
+		}
+		seenCoreVersions[folded] = struct{}{}
 	}
 	seenDependencies := map[string]struct{}{}
 	for _, dependency := range m.Dependencies {
 		key := strings.ToLower(dependency.Name)
-		if !suiteReleaseTokenPattern.MatchString(dependency.Name) || !suiteReleaseTokenPattern.MatchString(dependency.Version) {
+		if !suiteReleaseTokenPattern.MatchString(dependency.Name) || !suiteReleaseTokenPattern.MatchString(dependency.Version) ||
+			!suiteReleaseTokenPattern.MatchString(dependency.License) {
 			return fmt.Errorf("%w: invalid dependency", ErrSuiteReleaseManifest)
 		}
 		if _, exists := seenDependencies[key]; exists {
@@ -102,6 +123,7 @@ func (m SuiteReleaseManifest) Validate() error {
 		seenDependencies[key] = struct{}{}
 	}
 	seenPaths := map[string]struct{}{}
+	hasBinary, hasLegal := false, false
 	for _, entry := range m.Entries {
 		normalized, err := normalizeSuiteReleasePath(entry.Path)
 		if err != nil || normalized != entry.Path {
@@ -112,12 +134,22 @@ func (m SuiteReleaseManifest) Validate() error {
 			return fmt.Errorf("%w: duplicate or case-folded entry path", ErrSuiteReleaseManifest)
 		}
 		seenPaths[folded] = struct{}{}
-		if entry.Size < 0 || !validLowerSHA256(entry.SHA256) || !validSuiteReleaseEntryRole(entry.Role) {
+		if entry.Size < 0 || entry.Size > maxSuiteReleaseEntryBytes || !validLowerSHA256(entry.SHA256) || !validSuiteReleaseEntryRole(entry.Role) {
 			return fmt.Errorf("%w: invalid entry metadata", ErrSuiteReleaseManifest)
 		}
 		if (entry.Role == SuiteReleaseEntryBinary) != entry.Executable {
 			return fmt.Errorf("%w: executable flag does not match role", ErrSuiteReleaseManifest)
 		}
+		if entry.Role == SuiteReleaseEntryBinary {
+			hasBinary = true
+			if entry.Size == 0 {
+				return fmt.Errorf("%w: binary entry cannot be empty", ErrSuiteReleaseManifest)
+			}
+		}
+		hasLegal = hasLegal || entry.Role == SuiteReleaseEntryLegal
+	}
+	if !hasBinary || !hasLegal {
+		return fmt.Errorf("%w: binary and legal entries are required", ErrSuiteReleaseManifest)
 	}
 	return nil
 }
@@ -130,12 +162,19 @@ func MarshalSuiteReleaseManifest(manifest SuiteReleaseManifest) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	return append(raw, '\n'), nil
+	raw = append(raw, '\n')
+	if len(raw) > maxSuiteReleaseManifestBytes {
+		return nil, fmt.Errorf("%w: manifest exceeds size limit", ErrSuiteReleaseManifest)
+	}
+	return raw, nil
 }
 
 func ParseSuiteReleaseManifest(raw []byte) (SuiteReleaseManifest, error) {
+	if len(raw) == 0 || len(raw) > maxSuiteReleaseManifestBytes {
+		return SuiteReleaseManifest{}, fmt.Errorf("%w: manifest size", ErrSuiteReleaseManifest)
+	}
 	var manifest SuiteReleaseManifest
-	if err := decodeStrictJSON(raw, &manifest); err != nil {
+	if err := decodeSuiteReleaseStrictJSON(raw, &manifest); err != nil {
 		return SuiteReleaseManifest{}, fmt.Errorf("%w: decode", ErrSuiteReleaseManifest)
 	}
 	if err := manifest.Validate(); err != nil {
@@ -164,13 +203,15 @@ func SignSuiteReleaseManifest(manifestRaw []byte, keyID string, privateKey ed255
 	return append(raw, '\n'), nil
 }
 
-func VerifySuiteReleaseManifest(manifestRaw, envelopeRaw []byte, trustedPublicKey ed25519.PublicKey) (SuiteReleaseManifest, error) {
-	if len(trustedPublicKey) != ed25519.PublicKeySize {
+func VerifySuiteReleaseManifest(manifestRaw, envelopeRaw []byte, expectedKeyID string, trustedPublicKey ed25519.PublicKey) (SuiteReleaseManifest, error) {
+	if len(trustedPublicKey) != ed25519.PublicKeySize || !suiteReleaseTokenPattern.MatchString(expectedKeyID) ||
+		len(envelopeRaw) == 0 || len(envelopeRaw) > maxSuiteReleaseEnvelopeBytes ||
+		len(manifestRaw) == 0 || len(manifestRaw) > maxSuiteReleaseManifestBytes {
 		return SuiteReleaseManifest{}, fmt.Errorf("%w: caller trust key is invalid", ErrSuiteReleaseManifest)
 	}
 	var envelope SuiteReleaseManifestEnvelope
-	if err := decodeStrictJSON(envelopeRaw, &envelope); err != nil || envelope.SchemaVersion != 1 ||
-		envelope.Algorithm != "Ed25519" || !suiteReleaseTokenPattern.MatchString(envelope.KeyID) || !validLowerSHA256(envelope.ManifestSHA256) {
+	if err := decodeSuiteReleaseStrictJSON(envelopeRaw, &envelope); err != nil || envelope.SchemaVersion != 1 ||
+		envelope.Algorithm != "Ed25519" || envelope.KeyID != expectedKeyID || !validLowerSHA256(envelope.ManifestSHA256) {
 		return SuiteReleaseManifest{}, fmt.Errorf("%w: invalid detached envelope", ErrSuiteReleaseManifest)
 	}
 	digest := sha256.Sum256(manifestRaw)
@@ -237,7 +278,7 @@ func validateSuiteReleaseTokens(values []string) error {
 
 func validSuiteReleaseEntryRole(role string) bool {
 	switch role {
-	case SuiteReleaseEntryBinary, SuiteReleaseEntryLibrary, SuiteReleaseEntryConfig, SuiteReleaseEntryAsset:
+	case SuiteReleaseEntryBinary, SuiteReleaseEntryLibrary, SuiteReleaseEntryConfig, SuiteReleaseEntryAsset, SuiteReleaseEntryLegal:
 		return true
 	default:
 		return false
@@ -247,4 +288,73 @@ func validSuiteReleaseEntryRole(role string) bool {
 func validLowerSHA256(value string) bool {
 	decoded, err := hex.DecodeString(value)
 	return err == nil && len(decoded) == sha256.Size && hex.EncodeToString(decoded) == value
+}
+
+func decodeSuiteReleaseStrictJSON(raw []byte, destination any) error {
+	if err := rejectSuiteReleaseDuplicateJSONKeys(raw); err != nil {
+		return err
+	}
+	return decodeStrictJSON(raw, destination)
+}
+
+func rejectSuiteReleaseDuplicateJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := walkSuiteReleaseJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: trailing JSON", ErrSuiteReleaseManifest)
+	}
+	return nil
+}
+
+func walkSuiteReleaseJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := map[string]struct{}{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return ErrSuiteReleaseManifest
+			}
+			folded := strings.ToLower(key)
+			if _, exists := seen[folded]; exists {
+				return fmt.Errorf("%w: duplicate or case-folded JSON key", ErrSuiteReleaseManifest)
+			}
+			seen[folded] = struct{}{}
+			if err := walkSuiteReleaseJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return ErrSuiteReleaseManifest
+		}
+	case '[':
+		for decoder.More() {
+			if err := walkSuiteReleaseJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return ErrSuiteReleaseManifest
+		}
+	default:
+		return ErrSuiteReleaseManifest
+	}
+	return nil
 }
