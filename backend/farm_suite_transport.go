@@ -203,7 +203,14 @@ func inspectSuiteTransportFootprint(roots SuiteUserRoots, bootstrap BootstrapCon
 			}
 			path := filepath.Join(root, entry.Name())
 			info, err := os.Lstat(path)
-			if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || validateSuiteSetupPathSecurity(path, false) != nil {
+			if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return ErrSuiteCanonicalTransport
+			}
+			if root == roots.AgentState && entry.Name() == SuiteTransportReceiptName && checkpoint.Stage == SetupConfigDrafted {
+				if validateSuiteTransportRecoveryCandidate(path, info) != nil {
+					return ErrSuiteCanonicalTransport
+				}
+			} else if validateSuiteSetupPathSecurity(path, false) != nil {
 				return ErrSuiteCanonicalTransport
 			}
 		}

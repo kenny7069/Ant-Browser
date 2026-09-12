@@ -259,8 +259,10 @@ func TestSuiteCanonicalTransportFaultsAndCommitUnknown(t *testing.T) {
 		deps := suiteTransportTestDependencies(fixture.discovery)
 		deps.SaveReceipt = func(r SuiteUserRoots, b BootstrapConfig, receipt SuiteTransportReceipt) error {
 			return saveSuiteTransportReceiptWithDependencies(r, b, receipt, suiteTransportReceiptSaveDependencies{
-				Open:  openSuiteTransportReceiptHandle,
-				Write: func(*os.File, os.FileInfo, []byte) error { return errors.New("injected handle security failure") },
+				Open: openSuiteTransportReceiptHandle,
+				Write: func(*os.File, os.FileInfo, []byte, *suiteTransportReceiptRecoveryEvidence) error {
+					return errors.New("injected handle security failure")
+				},
 			})
 		}
 		if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
@@ -488,6 +490,22 @@ func TestSuiteTransportFinalJournalRecoveryIsClosed(t *testing.T) {
 			t.Fatalf("receipt=%+v err=%v", receipt, err)
 		}
 	}
+	if runtime.GOOS != "windows" {
+		fixture := newSuiteTransportFixture(t)
+		path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o400); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err != nil {
+			t.Fatalf("restrictive birth mode recovery: %v", err)
+		}
+		if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("birth mode not normalized: info=%v err=%v", info, err)
+		}
+	}
 	for _, raw := range [][]byte{[]byte(`{"unknown":true}`), []byte(`{"secret":"keep"}`), []byte(`[]`)} {
 		fixture := newSuiteTransportFixture(t)
 		path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
@@ -514,6 +532,64 @@ func TestSuiteTransportFinalJournalRecoveryIsClosed(t *testing.T) {
 	}
 	if raw, err := os.ReadFile(path); err != nil || string(raw) != `{"schema_version":` {
 		t.Fatalf("completed corrupt receipt mutated=%q err=%v", raw, err)
+	}
+}
+
+func TestSuiteTransportReceiptCreateBirthIsOwnerOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), SuiteTransportReceiptName)
+	file, err := openSuiteTransportReceiptHandle(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSuiteSetupPathSecurity(path, false); err != nil {
+		t.Fatalf("receipt birth was not owner-only: %v", err)
+	}
+}
+
+func TestSuiteTransportRecoveryRechecksSameInodeBytesBeforeSecurityMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows handle/DACL evidence not run")
+	}
+	for _, changed := range [][]byte{[]byte(`{"secret":"keep"}`), []byte(`{"y":`), []byte(`[`)} {
+		fixture := newSuiteTransportFixture(t)
+		path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+		initial := []byte(`{"x":`)
+		if err := os.WriteFile(path, initial, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		draft, _ := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap)
+		receipt, err := newSuiteTransportReceipt(fixture.preparation, fixture.plan, *draft, fixture.bootstrap, fixture.roots, fixture.release.manifest.Version, fixture.discovery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dependencies := suiteTransportReceiptSaveDependencies{
+			Open: openSuiteTransportReceiptHandle, Write: writeSuiteTransportReceiptHandle,
+			AfterOpen: func(_ string, file *os.File) error {
+				if err := file.Truncate(0); err != nil {
+					return err
+				}
+				if _, err := file.Seek(0, 0); err != nil {
+					return err
+				}
+				if _, err := file.Write(changed); err != nil {
+					return err
+				}
+				return file.Chmod(0o400)
+			},
+		}
+		if err := saveSuiteTransportReceiptWithDependencies(fixture.roots, fixture.bootstrap, receipt, dependencies); err == nil {
+			t.Fatalf("same-inode drift %q accepted", changed)
+		}
+		if raw, err := os.ReadFile(path); err != nil || string(raw) != string(changed) {
+			t.Fatalf("same-inode drift mutated=%q err=%v", raw, err)
+		}
+		if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0o400 {
+			t.Fatalf("security mutation preceded byte recheck: info=%v err=%v", info, err)
+		}
+		assertSuiteTransportCheckpoint(t, fixture, SetupConfigDrafted)
 	}
 }
 

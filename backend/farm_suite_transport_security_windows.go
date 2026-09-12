@@ -17,13 +17,21 @@ func openSuiteTransportReceiptHandle(path string, create bool) (*os.File, error)
 		return nil, ErrSuiteTransportReceipt
 	}
 	disposition := uint32(windows.OPEN_EXISTING)
+	var security *windows.SecurityAttributes
+	var descriptor *windows.SECURITY_DESCRIPTOR
 	if create {
 		disposition = windows.CREATE_NEW
+		descriptor, err = suiteSetupWindowsSecurityDescriptor(false)
+		if err != nil {
+			return nil, ErrSuiteTransportReceipt
+		}
+		security = &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: descriptor}
 	}
 	handle, err := windows.CreateFile(pathPointer,
 		windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, disposition,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, security, disposition,
 		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	runtime.KeepAlive(descriptor)
 	if err != nil {
 		return nil, ErrSuiteTransportReceipt
 	}
@@ -35,7 +43,14 @@ func openSuiteTransportReceiptHandle(path string, create bool) (*os.File, error)
 	return file, nil
 }
 
-func writeSuiteTransportReceiptHandle(file *os.File, expected os.FileInfo, raw []byte) error {
+func validateSuiteTransportRecoveryCandidate(path string, info os.FileInfo) error {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || validateSuiteSetupPathSecurity(path, false) != nil {
+		return ErrSuiteTransportReceipt
+	}
+	return nil
+}
+
+func writeSuiteTransportReceiptHandle(file *os.File, expected os.FileInfo, raw []byte, recovery *suiteTransportReceiptRecoveryEvidence) error {
 	if file == nil || expected == nil || len(raw) == 0 || len(raw) > suiteTransportReceiptMaxBytes {
 		return ErrSuiteTransportReceipt
 	}
@@ -43,6 +58,9 @@ func writeSuiteTransportReceiptHandle(file *os.File, expected os.FileInfo, raw [
 	var information windows.ByHandleFileInformation
 	opened, err := file.Stat()
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(expected, opened) || windows.GetFileInformationByHandle(handle, &information) != nil || information.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 {
+		return ErrSuiteTransportReceipt
+	}
+	if verifySuiteTransportReceiptRecoveryBytes(file, opened, recovery) != nil {
 		return ErrSuiteTransportReceipt
 	}
 	descriptor, err := suiteSetupWindowsSecurityDescriptor(false)

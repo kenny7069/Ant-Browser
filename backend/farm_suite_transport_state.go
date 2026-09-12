@@ -226,7 +226,30 @@ func saveSuiteTransportReceipt(roots SuiteUserRoots, bootstrap BootstrapConfig, 
 type suiteTransportReceiptState struct {
 	Receipt     *SuiteTransportReceipt
 	Recoverable bool
-	Info        os.FileInfo
+	Recovery    *suiteTransportReceiptRecoveryEvidence
+}
+
+type suiteTransportReceiptRecoveryEvidence struct {
+	Info   os.FileInfo
+	Size   int64
+	Digest [sha256.Size]byte
+}
+
+func verifySuiteTransportReceiptRecoveryBytes(file *os.File, opened os.FileInfo, recovery *suiteTransportReceiptRecoveryEvidence) error {
+	if recovery == nil {
+		return nil
+	}
+	if recovery.Info == nil || !os.SameFile(recovery.Info, opened) || opened.Size() != recovery.Size || recovery.Size < 0 || recovery.Size > suiteTransportReceiptMaxBytes {
+		return ErrSuiteTransportReceipt
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return ErrSuiteTransportReceipt
+	}
+	current, err := io.ReadAll(io.LimitReader(file, suiteTransportReceiptMaxBytes+1))
+	if err != nil || int64(len(current)) != recovery.Size || sha256.Sum256(current) != recovery.Digest || json.Valid(current) {
+		return ErrSuiteTransportReceipt
+	}
+	return nil
 }
 
 func inspectSuiteTransportReceiptState(roots SuiteUserRoots, bootstrap BootstrapConfig, checkpointStage SetupStage) (suiteTransportReceiptState, error) {
@@ -242,14 +265,16 @@ func inspectSuiteTransportReceiptState(roots SuiteUserRoots, bootstrap Bootstrap
 	if err != nil || json.Valid(raw) {
 		return suiteTransportReceiptState{}, ErrSuiteTransportReceipt
 	}
-	return suiteTransportReceiptState{Recoverable: true, Info: info}, nil
+	return suiteTransportReceiptState{Recoverable: true, Recovery: &suiteTransportReceiptRecoveryEvidence{
+		Info: info, Size: int64(len(raw)), Digest: sha256.Sum256(raw),
+	}}, nil
 }
 
 func readSuiteTransportReceiptRecoveryCandidate(roots SuiteUserRoots, path string) (os.FileInfo, []byte, error) {
 	configInfo, configErr := captureSuiteConfigDraftRoot(roots.Config)
 	stateInfo, stateErr := captureSuiteConfigDraftRoot(roots.AgentState)
 	info, statErr := os.Lstat(path)
-	if configErr != nil || stateErr != nil || statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > suiteTransportReceiptMaxBytes || validateSuiteSetupPathSecurity(path, false) != nil {
+	if configErr != nil || stateErr != nil || statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > suiteTransportReceiptMaxBytes || validateSuiteTransportRecoveryCandidate(path, info) != nil {
 		return nil, nil, ErrSuiteTransportReceipt
 	}
 	file, err := os.Open(path)
@@ -266,7 +291,7 @@ func readSuiteTransportReceiptRecoveryCandidate(roots SuiteUserRoots, path strin
 		return nil, nil, ErrSuiteTransportReceipt
 	}
 	finalInfo, err := os.Lstat(path)
-	if err != nil || !os.SameFile(handleInfo, finalInfo) || validateSuiteSetupPathSecurity(path, false) != nil {
+	if err != nil || !os.SameFile(handleInfo, finalInfo) || validateSuiteTransportRecoveryCandidate(path, finalInfo) != nil {
 		return nil, nil, ErrSuiteTransportReceipt
 	}
 	return handleInfo, raw, nil
@@ -274,7 +299,7 @@ func readSuiteTransportReceiptRecoveryCandidate(roots SuiteUserRoots, path strin
 
 type suiteTransportReceiptSaveDependencies struct {
 	Open      func(string, bool) (*os.File, error)
-	Write     func(*os.File, os.FileInfo, []byte) error
+	Write     func(*os.File, os.FileInfo, []byte, *suiteTransportReceiptRecoveryEvidence) error
 	AfterOpen func(string, *os.File) error
 }
 
@@ -317,13 +342,13 @@ func saveSuiteTransportReceiptWithDependencies(roots SuiteUserRoots, bootstrap B
 		}
 	}()
 	openedInfo, err := file.Stat()
-	if err != nil || !openedInfo.Mode().IsRegular() || (state.Recoverable && (state.Info == nil || !os.SameFile(state.Info, openedInfo))) || (!state.Recoverable && openedInfo.Size() != 0) {
+	if err != nil || !openedInfo.Mode().IsRegular() || (state.Recoverable && (state.Recovery == nil || state.Recovery.Info == nil || !os.SameFile(state.Recovery.Info, openedInfo))) || (!state.Recoverable && openedInfo.Size() != 0) {
 		return ErrSuiteTransportReceipt
 	}
 	if dependencies.AfterOpen != nil && dependencies.AfterOpen(path, file) != nil {
 		return ErrSuiteTransportReceipt
 	}
-	if dependencies.Write(file, openedInfo, raw) != nil {
+	if dependencies.Write(file, openedInfo, raw, state.Recovery) != nil {
 		return ErrSuiteTransportReceipt
 	}
 	handleInfo, err := file.Stat()
