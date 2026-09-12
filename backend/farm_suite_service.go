@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type suiteServicePlatform interface {
@@ -27,12 +28,19 @@ const (
 )
 
 type SuiteServiceCoordinator struct {
-	Platform      suiteServicePlatform
-	ResidentProof func(context.Context, string) error
+	Platform             suiteServicePlatform
+	ResidentProof        func(context.Context, string) error
+	StartupProofAttempts int
+	StartupProofBackoff  time.Duration
 }
 
+const (
+	suiteStartupProofAttempts = 40
+	suiteStartupProofBackoff  = 250 * time.Millisecond // 39 waits: bounded to about 10 seconds.
+)
+
 func ActivateSuiteService(ctx context.Context, roots SuiteUserRoots) error {
-	return (&SuiteServiceCoordinator{Platform: newSuiteServicePlatform(), ResidentProof: suiteResidentProof}).Activate(ctx, roots)
+	return (&SuiteServiceCoordinator{Platform: newSuiteServicePlatform(), ResidentProof: suiteResidentProof, StartupProofAttempts: suiteStartupProofAttempts, StartupProofBackoff: suiteStartupProofBackoff}).Activate(ctx, roots)
 }
 
 func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserRoots) error {
@@ -170,8 +178,7 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 			markReconcile()
 			return err
 		}
-		if err := c.ResidentProof(ctx, handoff.ClientConfigPath); err != nil {
-			markReconcile()
+		if err := c.proveResidentWithRetry(ctx, handoff.ClientConfigPath); err != nil {
 			return ErrSuiteServiceActivation
 		}
 		if err := advance(SuiteActivationResidentProved); err != nil {
@@ -183,8 +190,7 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 			markReconcile()
 			return err
 		}
-		if err := c.ResidentProof(ctx, handoff.ClientConfigPath); err != nil {
-			markReconcile()
+		if err := c.proveResidentWithRetry(ctx, handoff.ClientConfigPath); err != nil {
 			return ErrSuiteServiceActivation
 		}
 		if err := SaveSetupCheckpoint(checkpointPath, SetupCheckpoint{SchemaVersion: 1, Stage: SetupServiceStarted, RequestUID: journal.RequestUID}); err != nil {
@@ -201,12 +207,45 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 			markReconcile()
 			return err
 		}
-		if err := c.ResidentProof(ctx, handoff.ClientConfigPath); err != nil {
-			markReconcile()
+		if err := c.proveResidentWithRetry(ctx, handoff.ClientConfigPath); err != nil {
 			return ErrSuiteServiceActivation
 		}
 	}
 	return nil
+}
+
+func (c *SuiteServiceCoordinator) proveResidentWithRetry(ctx context.Context, configPath string) error {
+	attempts := c.StartupProofAttempts
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := c.ResidentProof(ctx, configPath); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if attempt+1 == attempts || c.StartupProofBackoff <= 0 {
+			continue
+		}
+		timer := time.NewTimer(c.StartupProofBackoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }
 
 func suiteResidentProof(ctx context.Context, configPath string) error {

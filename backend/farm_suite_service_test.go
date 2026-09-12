@@ -250,7 +250,7 @@ func TestSuiteServiceRecoveryRequiresEnabledEvidenceAtEveryPostEnableStage(t *te
 	}
 }
 
-func TestSuiteServiceCompletedRecoveryRequiresResidentProof(t *testing.T) {
+func TestSuiteServiceCompletedOutageDoesNotRewriteJournal(t *testing.T) {
 	roots, _ := enrolledSuiteFixture(t)
 	platform := &fakeSuiteServicePlatform{}
 	coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error { return nil }}
@@ -262,12 +262,12 @@ func TestSuiteServiceCompletedRecoveryRequiresResidentProof(t *testing.T) {
 		t.Fatalf("completed recovery=%v", err)
 	}
 	journal, err := LoadSuiteActivationJournal(roots)
-	if err != nil || journal == nil || journal.Stage != SuiteActivationReconcileRequired {
+	if err != nil || journal == nil || journal.Stage != SuiteActivationCheckpointWritten {
 		t.Fatalf("journal=%+v err=%v", journal, err)
 	}
 }
 
-func TestSuiteServiceResidentProvedRecoveryRechecksResidentBeforeCheckpoint(t *testing.T) {
+func TestSuiteServiceResidentProvedOutagePreservesRetryStage(t *testing.T) {
 	roots, preparation := enrolledSuiteFixture(t)
 	advanceActivationJournalForTest(t, roots, preparation, SuiteActivationResidentProved)
 	platform := &fakeSuiteServicePlatform{registration: suiteServiceRegistrationExactEnabled}
@@ -280,7 +280,67 @@ func TestSuiteServiceResidentProvedRecoveryRechecksResidentBeforeCheckpoint(t *t
 		t.Fatalf("checkpoint=%+v err=%v", checkpoint, err)
 	}
 	journal, err := LoadSuiteActivationJournal(roots)
-	if err != nil || journal == nil || journal.Stage != SuiteActivationReconcileRequired {
+	if err != nil || journal == nil || journal.Stage != SuiteActivationResidentProved {
+		t.Fatalf("journal=%+v err=%v", journal, err)
+	}
+}
+
+func TestSuiteServiceStartupProofRetriesThenSucceeds(t *testing.T) {
+	roots, _ := enrolledSuiteFixture(t)
+	platform := &fakeSuiteServicePlatform{}
+	proofCalls := 0
+	coordinator := &SuiteServiceCoordinator{
+		Platform:             platform,
+		StartupProofAttempts: 3,
+		ResidentProof: func(context.Context, string) error {
+			proofCalls++
+			if proofCalls <= 2 {
+				return errors.New("temporarily unavailable")
+			}
+			return nil
+		},
+	}
+	if err := coordinator.Activate(context.Background(), roots); err != nil {
+		t.Fatal(err)
+	}
+	if proofCalls != 5 {
+		t.Fatalf("proof calls=%d", proofCalls)
+	}
+	journal, err := LoadSuiteActivationJournal(roots)
+	if err != nil || journal == nil || journal.Stage != SuiteActivationCheckpointWritten {
+		t.Fatalf("journal=%+v err=%v", journal, err)
+	}
+}
+
+func TestSuiteServiceStartupProofExhaustionRecoversOnNextCall(t *testing.T) {
+	roots, _ := enrolledSuiteFixture(t)
+	platform := &fakeSuiteServicePlatform{}
+	unavailable := true
+	proofCalls := 0
+	coordinator := &SuiteServiceCoordinator{
+		Platform:             platform,
+		StartupProofAttempts: 2,
+		ResidentProof: func(context.Context, string) error {
+			proofCalls++
+			if unavailable {
+				return errors.New("temporarily unavailable")
+			}
+			return nil
+		},
+	}
+	if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+		t.Fatalf("first activation=%v", err)
+	}
+	journal, err := LoadSuiteActivationJournal(roots)
+	if err != nil || journal == nil || journal.Stage != SuiteActivationStartRequested || proofCalls != 2 {
+		t.Fatalf("journal=%+v proofCalls=%d err=%v", journal, proofCalls, err)
+	}
+	unavailable = false
+	if err := coordinator.Activate(context.Background(), roots); err != nil {
+		t.Fatalf("recovery=%v", err)
+	}
+	journal, err = LoadSuiteActivationJournal(roots)
+	if err != nil || journal == nil || journal.Stage != SuiteActivationCheckpointWritten {
 		t.Fatalf("journal=%+v err=%v", journal, err)
 	}
 }
