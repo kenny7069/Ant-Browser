@@ -22,6 +22,12 @@ path plus the exact first-party product license; release payloads add the exact
 third-party versions bound by their signed manifest. The product license notice
 must also be an exact signed `legal` entry.
 
+`ant-farm-client.exe` must be built with the same release key ID and Ed25519
+public key supplied below. Publishing verifies the detached envelope twice:
+once with these external release-worker values and once with the trust anchor
+embedded in the binary. A missing, mismatched, or development binary therefore
+stops packaging.
+
 Run from a Windows release worker with `makensis.exe` and `signtool.exe` on
 `PATH`:
 
@@ -36,24 +42,26 @@ its existing filesystem version policy and accepts release SemVer without a
 `+build` suffix; numeric prerelease identifiers with leading zeroes are rejected
 by both paths.
 
-The installer does not start the Agent. Setup must first create the canonical
-owner-only `%LocalAppData%\AntSuite\config\client.yaml`, finish the durable
-preparation checkpoint, and run:
+The installer does not start the Agent. From the installed immutable version
+directory, the unelevated target user runs canonical setup. The only setup
+options are `--server`, optional `--node-name`, and optional `--json`; the
+release root, manifest, envelope, key ID, and public key are bound by the
+running executable and cannot be overridden:
 
 ```powershell
-ant-farm-client.exe suite finalize-handoff `
-  -request-uid 00000000-0000-4000-8000-000000000000 `
-  -suite-root "C:\Program Files\Ant Browser Suite\versions\1.2.3" `
-  -gui "C:\Program Files\Ant Browser Suite\versions\1.2.3\AntBrowser.exe"
+& "C:\Program Files\Ant Browser Suite\versions\1.2.3\ant-farm-client.exe" setup `
+  --server https://farm.example.com --node-name "Packing Node"
 ```
 
-The handoff is necessary ownership evidence, but `INTENT_DURABLE` does not mean
-the Suite is `READY` and does not authorize service activation by itself. A
-later workflow must finish the canonical setup stages. GUI launching and
+Setup resumes from the last durable canonical stage, prompts once for the
+one-time enrollment code only when `IDENTITY_READY` has no durable
+acknowledgment, and finishes at `ENROLLED`. The next action is `service`.
+The durable handoff created during finalization is ownership evidence, but
+`ENROLLED` does not authorize service activation by itself. GUI launching and
 desktop shortcuts remain deferred until T08 provides a strict GUI mode that
 consumes the verified handoff. T07 owns safe activation, repair rotation,
 canonical Program Files resolution and DACL validation, immediate pre-spawn
 release revalidation, rollback, and a signed uninstaller, so this scaffold
-deliberately does not register or emit an uninstaller. This slice does not claim
-service activation, enrollment, Control connectivity, or a native installed
-browser smoke test.
+deliberately does not register or emit an uninstaller. This package does not
+claim service activation, Control connectivity, or a native installed browser
+smoke test.

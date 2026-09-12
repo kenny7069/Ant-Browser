@@ -19,6 +19,13 @@ import (
 
 var ErrSuiteCanonicalEnrollmentACK = errors.New("suite canonical enrollment acknowledgment failed")
 
+type SuiteCanonicalEnrollmentACKState string
+
+const (
+	SuiteCanonicalEnrollmentACKCodeRequired SuiteCanonicalEnrollmentACKState = "CODE_REQUIRED"
+	SuiteCanonicalEnrollmentACKDurable      SuiteCanonicalEnrollmentACKState = "ACKNOWLEDGED"
+)
+
 type suiteCanonicalEnrollmentACKDependencies struct {
 	CurrentSuiteVersion string
 	Fetch               func(context.Context, BootstrapConfig) (SuiteBootstrapDiscovery, error)
@@ -58,6 +65,80 @@ func RunSuiteCanonicalEnrollmentACK(ctx context.Context, bootstrap BootstrapConf
 		defer transport.CloseIdleConnections()
 	}
 	return runSuiteCanonicalEnrollmentACKWithDependencies(ctx, bootstrap, roots, release, installedSuiteRoot, enrollmentCode, deps)
+}
+
+// ProbeSuiteCanonicalEnrollmentACKState validates the complete local
+// IDENTITY_READY proof chain and reports whether its enrollment acknowledgment
+// is already durable. It performs no discovery fetch, enrollment request,
+// lock acquisition, repair, or state write.
+func ProbeSuiteCanonicalEnrollmentACKState(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, installedSuiteRoot string) (SuiteCanonicalEnrollmentACKState, error) {
+	return probeSuiteCanonicalEnrollmentACKStateWithDependencies(ctx, bootstrap, roots, release, installedSuiteRoot, suiteCanonicalEnrollmentACKProductionDependencies())
+}
+
+func probeSuiteCanonicalEnrollmentACKStateWithDependencies(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, installedSuiteRoot string, deps suiteCanonicalEnrollmentACKDependencies) (SuiteCanonicalEnrollmentACKState, error) {
+	if ctx == nil || deps.NewStore == nil || deps.ValidateInstall == nil || deps.EnsureApplication == nil ||
+		!validSuiteReleaseSemver(deps.CurrentSuiteVersion) || deps.CurrentSuiteVersion != release.manifest.Version {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	if validateSuiteSetupInputs(&bootstrap, roots) != nil || bootstrap.StatePath != filepath.Join(roots.AgentState, "setup.json") ||
+		installedSuiteRoot == "" || strings.TrimSpace(installedSuiteRoot) != installedSuiteRoot || !filepath.IsAbs(installedSuiteRoot) || filepath.Clean(installedSuiteRoot) != installedSuiteRoot {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	if err := ctx.Err(); err != nil {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	layout, err := captureSuitePrecheckRootLayout(roots, installedSuiteRoot)
+	if err != nil {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	evidence, err := loadSuiteCanonicalEnrollmentEvidence(ctx, bootstrap, roots, release, installedSuiteRoot, deps)
+	if err != nil || layout.revalidate(roots, installedSuiteRoot) != nil || inspectSuiteCanonicalEnrollmentFootprint(roots, bootstrap, evidence.preparation.RequestUID, evidence.ref) != nil {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	store, err := deps.NewStore(roots.AgentState)
+	if err != nil || store == nil || verifySuiteCanonicalEnrollmentKey(store, evidence.ref, evidence.identity.PublicKeySHA256) != nil {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	attempt, err := loadSuiteBootstrapEnrollmentAttempt(roots)
+	if err != nil || !suiteCanonicalEnrollmentAttemptMatchesKnownEvidence(attempt, evidence, bootstrap.NodeName, release.manifest.Version) {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	if err := revalidateSuiteCanonicalEnrollmentEvidence(ctx, bootstrap, roots, release, installedSuiteRoot, layout, evidence, store, deps); err != nil {
+		return "", err
+	}
+	confirmed, err := loadSuiteBootstrapEnrollmentAttempt(roots)
+	if err != nil || !sameOptionalSuiteBootstrapEnrollmentAttempt(attempt, confirmed) {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	if attempt == nil || attempt.Stage != SuiteBootstrapAcknowledged {
+		return SuiteCanonicalEnrollmentACKCodeRequired, nil
+	}
+	result := suiteBootstrapEnrollmentResultFromAttempt(*attempt)
+	if !validateSuiteCanonicalEnrollmentAttempt(roots, evidence, evidence.transport.discovery(), bootstrap.NodeName, release.manifest.Version, "", store, attempt, result) {
+		return "", ErrSuiteCanonicalEnrollmentACK
+	}
+	return SuiteCanonicalEnrollmentACKDurable, nil
+}
+
+func suiteCanonicalEnrollmentAttemptMatchesKnownEvidence(attempt *SuiteBootstrapEnrollmentAttempt, evidence suiteCanonicalEnrollmentEvidence, nodeName, suiteVersion string) bool {
+	if attempt == nil {
+		return true
+	}
+	discovery := evidence.transport.discovery()
+	discoveryRaw, discoveryErr := json.Marshal(discovery)
+	metadataRaw, metadataErr := json.Marshal(suiteBootstrapEnrollmentMetadata{NodeName: strings.TrimSpace(nodeName), SuiteVersion: suiteVersion})
+	return discoveryErr == nil && metadataErr == nil &&
+		attempt.PreparationRequestUID == evidence.preparation.RequestUID && attempt.DeploymentUID == discovery.DeploymentUID &&
+		attempt.DiscoverySHA256 == suiteBootstrapSHA256(discoveryRaw) && attempt.MetadataSHA256 == suiteBootstrapSHA256(metadataRaw) &&
+		attempt.IdentityRef == string(evidence.ref) && attempt.PublicKeySHA256 == evidence.identity.PublicKeySHA256 &&
+		attempt.IdempotencySHA256 == suiteBootstrapSHA256([]byte(suiteBootstrapEnrollmentIdempotencyKey(evidence.preparation.RequestUID)))
+}
+
+func sameOptionalSuiteBootstrapEnrollmentAttempt(left, right *SuiteBootstrapEnrollmentAttempt) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 type suiteCanonicalEnrollmentEvidence struct {

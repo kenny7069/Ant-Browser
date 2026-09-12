@@ -303,3 +303,94 @@ func TestSuiteCanonicalEnrollmentACKFinalReadbackRejectsReplacement(t *testing.T
 		t.Fatal("replaced final attempt accepted")
 	}
 }
+
+func TestSuiteCanonicalEnrollmentACKProbeIsReadOnlyAndRequiresCodeWithoutAttempt(t *testing.T) {
+	fixture := newSuiteEnrollmentACKFixture(t)
+	deps := suiteEnrollmentACKDependencies(fixture, suiteEnrollmentRoundTripper(func(*http.Request) (*http.Response, error) {
+		t.Fatal("probe made enrollment request")
+		return nil, nil
+	}))
+	deps.Fetch = func(context.Context, BootstrapConfig) (SuiteBootstrapDiscovery, error) {
+		t.Fatal("probe fetched discovery")
+		return SuiteBootstrapDiscovery{}, nil
+	}
+	before := snapshotSuiteEnrollmentProbeFiles(t, fixture.roots)
+	state, err := probeSuiteCanonicalEnrollmentACKStateWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps)
+	after := snapshotSuiteEnrollmentProbeFiles(t, fixture.roots)
+	if err != nil || state != SuiteCanonicalEnrollmentACKCodeRequired {
+		t.Fatalf("state=%q err=%v", state, err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("read-only probe changed files\nbefore=%v\nafter=%v", before, after)
+	}
+}
+
+func TestSuiteCanonicalEnrollmentACKProbeRecognizesDurableACKWithoutNetwork(t *testing.T) {
+	fixture := newSuiteEnrollmentACKFixture(t)
+	deps := suiteEnrollmentACKDependencies(fixture, func(*http.Request) (*http.Response, error) {
+		return suiteEnrollmentACKSuccessResponse(fixture.discovery, "ENROLLED"), nil
+	})
+	if _, err := runSuiteCanonicalEnrollmentACKWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteEnrollmentCode(0x62), deps); err != nil {
+		t.Fatal(err)
+	}
+	deps.Fetch = func(context.Context, BootstrapConfig) (SuiteBootstrapDiscovery, error) {
+		t.Fatal("probe fetched discovery")
+		return SuiteBootstrapDiscovery{}, nil
+	}
+	deps.Client = &http.Client{Transport: suiteEnrollmentRoundTripper(func(*http.Request) (*http.Response, error) {
+		t.Fatal("probe made enrollment request")
+		return nil, nil
+	})}
+	before := snapshotSuiteEnrollmentProbeFiles(t, fixture.roots)
+	state, err := probeSuiteCanonicalEnrollmentACKStateWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps)
+	after := snapshotSuiteEnrollmentProbeFiles(t, fixture.roots)
+	if err != nil || state != SuiteCanonicalEnrollmentACKDurable {
+		t.Fatalf("state=%q err=%v", state, err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("read-only probe changed files\nbefore=%v\nafter=%v", before, after)
+	}
+}
+
+func TestSuiteCanonicalEnrollmentACKProbeTreatsRequestReadyAsCodeRequired(t *testing.T) {
+	fixture := newSuiteEnrollmentACKFixture(t)
+	deps := suiteEnrollmentACKDependencies(fixture, func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("ack lost")
+	})
+	if _, err := runSuiteCanonicalEnrollmentACKWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteEnrollmentCode(0x63), deps); !errors.Is(err, ErrSuiteBootstrapEnrollmentTransport) {
+		t.Fatalf("first enrollment err=%v", err)
+	}
+	attempt, err := loadSuiteBootstrapEnrollmentAttempt(fixture.roots)
+	if err != nil || attempt == nil || attempt.Stage != SuiteBootstrapRequestReady {
+		t.Fatalf("attempt=%+v err=%v", attempt, err)
+	}
+	state, err := probeSuiteCanonicalEnrollmentACKStateWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps)
+	if err != nil || state != SuiteCanonicalEnrollmentACKCodeRequired {
+		t.Fatalf("state=%q err=%v", state, err)
+	}
+}
+
+func snapshotSuiteEnrollmentProbeFiles(t *testing.T, roots SuiteUserRoots) map[string]string {
+	t.Helper()
+	files := make(map[string]string)
+	for _, root := range []string{roots.Config, roots.BrowserData, roots.AgentState, roots.Logs} {
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			files[path] = string(raw)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return files
+}

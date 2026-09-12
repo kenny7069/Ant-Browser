@@ -96,6 +96,9 @@ if (-not $seen.ContainsKey("licenses.json")) { Fail "manifest does not cover LIC
 & (Resolve-PayloadPath "ant-farm-client.exe") suite verify-release `
   -manifest $manifestPath -envelope $envelopePath -key-id $ReleaseKeyID -public-key $ReleasePublicKey | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "Ed25519 release envelope verification failed" }
+& (Resolve-PayloadPath "ant-farm-client.exe") suite verify-release-embedded `
+  -manifest $manifestPath -envelope $envelopePath | Out-Null
+if ($LASTEXITCODE -ne 0) { Fail "embedded Farm Client release trust anchor verification failed" }
 
 $licenses = Get-Content -LiteralPath (Resolve-PayloadPath "LICENSES.json") -Raw | ConvertFrom-Json
 $dependencies = @($manifest.dependencies)

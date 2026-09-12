@@ -47,7 +47,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// v3 subcommands own their FlagSet. Dispatch before the legacy global
 	// parser, which intentionally stops at the first positional argument.
 	if len(args) > 0 && args[0] == "setup" {
-		return runSetupCommand(args[1:], stdout, stderr)
+		return runSetupCommand(args[1:], stdin, stdout, stderr)
 	}
 	if len(args) > 0 && args[0] == "suite" {
 		roots, err := backend.ResolveSuiteUserRoots()
@@ -246,45 +246,66 @@ func runSuiteCommand(roots backend.SuiteUserRoots, args []string, stdout, stderr
 		fmt.Fprintln(stdout, string(encoded))
 		return 0
 	case "verify-release":
-		flags := flag.NewFlagSet("suite verify-release", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		manifestPath := flags.String("manifest", "", "absolute Suite release manifest path")
-		envelopePath := flags.String("envelope", "", "absolute detached envelope path")
-		keyID := flags.String("key-id", "", "caller-pinned release key ID")
-		publicKeyValue := flags.String("public-key", "", "caller-pinned Ed25519 public key")
-		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || !filepath.IsAbs(*manifestPath) || !filepath.IsAbs(*envelopePath) {
-			fmt.Fprintln(stderr, "ant-farm-client: invalid Suite release verification arguments")
-			return 2
-		}
-		manifest, err := readSuiteReleaseVerificationFile(filepath.Clean(*manifestPath), 1<<20)
-		if err != nil {
-			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
-			return 1
-		}
-		envelope, err := readSuiteReleaseVerificationFile(filepath.Clean(*envelopePath), 16<<10)
-		if err != nil {
-			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
-			return 1
-		}
-		publicKey, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(*publicKeyValue))
-		if err != nil || len(publicKey) != ed25519.PublicKeySize {
-			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
-			return 1
-		}
-		_, err = backend.VerifySuiteReleaseManifest(manifest, envelope, backend.SuiteReleaseTrustAnchor{KeyID: strings.TrimSpace(*keyID), PublicKey: ed25519.PublicKey(publicKey)})
-		for index := range publicKey {
-			publicKey[index] = 0
-		}
-		if err != nil {
-			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
-			return 1
-		}
-		fmt.Fprintln(stdout, `{"verified":true}`)
-		return 0
+		return runSuiteReleaseVerification(args[1:], false, stdout, stderr)
+	case "verify-release-embedded":
+		return runSuiteReleaseVerification(args[1:], true, stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite command")
 		return 2
 	}
+}
+
+func runSuiteReleaseVerification(args []string, embedded bool, stdout, stderr io.Writer) int {
+	name := "suite verify-release"
+	if embedded {
+		name = "suite verify-release-embedded"
+	}
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	manifestPath := flags.String("manifest", "", "absolute Suite release manifest path")
+	envelopePath := flags.String("envelope", "", "absolute detached envelope path")
+	var keyID, publicKeyValue *string
+	if !embedded {
+		keyID = flags.String("key-id", "", "caller-pinned release key ID")
+		publicKeyValue = flags.String("public-key", "", "caller-pinned Ed25519 public key")
+	}
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || !filepath.IsAbs(*manifestPath) || !filepath.IsAbs(*envelopePath) {
+		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite release verification arguments")
+		return 2
+	}
+	manifest, err := readSuiteReleaseVerificationFile(filepath.Clean(*manifestPath), 1<<20)
+	if err != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
+		return 1
+	}
+	envelope, err := readSuiteReleaseVerificationFile(filepath.Clean(*envelopePath), 16<<10)
+	if err != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
+		return 1
+	}
+	var release backend.VerifiedSuiteRelease
+	if embedded {
+		release, err = verifyEmbeddedSuiteRelease(manifest, envelope)
+		if err == nil && release.Manifest().Version != backend.FarmClientVersion {
+			err = backend.ErrSuiteReleaseManifest
+		}
+	} else {
+		publicKey, decodeErr := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(*publicKeyValue))
+		if decodeErr != nil || len(publicKey) != ed25519.PublicKeySize {
+			clearSetupBytes(publicKey)
+			fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
+			return 1
+		}
+		release, err = backend.VerifySuiteReleaseManifest(manifest, envelope, backend.SuiteReleaseTrustAnchor{KeyID: strings.TrimSpace(*keyID), PublicKey: ed25519.PublicKey(publicKey)})
+		clearSetupBytes(publicKey)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: Suite release verification failed")
+		return 1
+	}
+	_ = release
+	fmt.Fprintln(stdout, `{"verified":true}`)
+	return 0
 }
 
 func readSuiteReleaseVerificationFile(path string, maximum int64) ([]byte, error) {

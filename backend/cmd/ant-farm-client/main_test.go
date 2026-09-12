@@ -219,6 +219,44 @@ func TestSuiteReleaseVerificationUsesCallerPinnedTrustAnchor(t *testing.T) {
 	}
 }
 
+func TestSuiteReleaseVerificationUsesBinaryEmbeddedTrustAnchor(t *testing.T) {
+	manifest := []byte(`{"schema_version":1,"version":"1.2.3","target":{"os":"windows","arch":"amd64"},"commits":{"ant_browser":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","farm_agent":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","farm_control":"cccccccccccccccccccccccccccccccccccccccc"},"config_schema":1,"capabilities":["setup-plan"],"core_versions":{"chromium":"120.0.0"},"dependencies":[{"name":"Ant-Suite","version":"1.2.3","license_ref":"LICENSE"}],"entries":[{"path":"Ant.exe","role":"binary","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","executable":true},{"path":"LICENSE","role":"legal","size":1,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","executable":false}]}`)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := backend.SignSuiteReleaseManifest(manifest, "suite-key-embedded", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	manifestPath, envelopePath := filepath.Join(root, "release.json"), filepath.Join(root, "release-envelope.json")
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envelopePath, envelope, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousKeyID, previousPublicKey, previousVersion := suiteReleaseKeyID, suiteReleasePublicKeyBase64, backend.FarmClientVersion
+	suiteReleaseKeyID = "suite-key-embedded"
+	suiteReleasePublicKeyBase64 = base64.StdEncoding.EncodeToString(publicKey)
+	backend.FarmClientVersion = "1.2.3"
+	t.Cleanup(func() {
+		suiteReleaseKeyID, suiteReleasePublicKeyBase64, backend.FarmClientVersion = previousKeyID, previousPublicKey, previousVersion
+	})
+	args := []string{"verify-release-embedded", "-manifest", manifestPath, "-envelope", envelopePath}
+	var stdout, stderr bytes.Buffer
+	if code := runSuiteCommand(backend.SuiteUserRoots{}, args, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != `{"verified":true}` {
+		t.Fatalf("verify exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	args = append(args, "-key-id", "runtime-override")
+	if code := runSuiteCommand(backend.SuiteUserRoots{}, args, &stdout, &stderr); code != 2 || strings.Contains(stderr.String(), "suite-key-embedded") {
+		t.Fatalf("override exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestSuiteReleaseVerificationRejectsSymlinkAndOversize(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target.json")

@@ -1,6 +1,8 @@
 param(
   [Parameter(Mandatory = $true)][ValidateSet("amd64")][string]$Arch,
   [string]$Version = "1.5.0",
+  [Parameter(Mandatory = $true)][string]$ReleaseKeyID,
+  [Parameter(Mandatory = $true)][string]$ReleasePublicKey,
   [switch]$SkipBuild,
   [switch]$SkipRuntimeVerify,
   [switch]$KeepStaging
@@ -12,6 +14,9 @@ $Stage = Join-Path $PSScriptRoot ".staging\windows-$Arch"
 $Binary = Join-Path $Stage "ant-farm-client.exe"
 
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$') { throw "Invalid package version" }
+if ($ReleaseKeyID -notmatch '^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$') { throw "Invalid Suite release key ID" }
+try { $ReleasePublicKeyBytes = [Convert]::FromBase64String($ReleasePublicKey) } catch { throw "Invalid Suite release public key" }
+if ($ReleasePublicKeyBytes.Length -ne 32 -or [Convert]::ToBase64String($ReleasePublicKeyBytes) -cne $ReleasePublicKey) { throw "Invalid Suite release public key" }
 if (-not $SkipRuntimeVerify) {
   & bash (Join-Path $Root "tools/runtime/verify-runtime.sh") "windows-$Arch"
   if ($LASTEXITCODE -ne 0) { throw "Runtime verification failed" }
@@ -23,7 +28,8 @@ if (-not $SkipBuild) {
   Push-Location $Root
   try {
     $env:GOOS = "windows"; $env:GOARCH = $Arch; $env:CGO_ENABLED = "0"
-    & go build -trimpath -ldflags "-s -w -X ant-chrome/backend.FarmClientVersion=$Version" -o $Binary ./backend/cmd/ant-farm-client
+    $LinkerFlags = "-s -w -X 'ant-chrome/backend.FarmClientVersion=$Version' -X 'ant-chrome/backend/cmd/ant-farm-client.suiteReleaseKeyID=$ReleaseKeyID' -X 'ant-chrome/backend/cmd/ant-farm-client.suiteReleasePublicKeyBase64=$ReleasePublicKey'"
+    & go build -trimpath -ldflags $LinkerFlags -o $Binary ./backend/cmd/ant-farm-client
     if ($LASTEXITCODE -ne 0) { throw "Go build failed" }
   } finally { Pop-Location }
 }
