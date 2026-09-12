@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -71,48 +70,21 @@ type suiteBootstrapEnrollmentResponse struct {
 }
 
 type suiteBootstrapEnrollmentDependencies struct {
-	IdentityStore          FarmClientIdentityStore
-	Client                 *http.Client
-	Random                 io.Reader
-	AfterIdentityPersisted func() error
-	AfterStageSaved        func(SuiteBootstrapEnrollmentStage) error
-	AfterResponse          func() error
+	IdentityStore           FarmClientIdentityStore
+	Client                  *http.Client
+	Random                  io.Reader
+	AfterIdentityPersisted  func() error
+	AfterStageSaved         func(SuiteBootstrapEnrollmentStage) error
+	AfterResponse           func() error
+	RequireExistingIdentity bool
+	RevalidateIdentity      func() error
 }
 
-// EnrollSuiteBootstrap performs trusted discovery before touching the device
-// identity or sending the one-time code. A non-empty code must be supplied on
-// every retry until ACKNOWLEDGED has been durably recorded.
+// EnrollSuiteBootstrap is retained only as a fail-closed compatibility surface.
+// Canonical Suite enrollment must use RunSuiteCanonicalEnrollmentACK so the
+// signed release, installed tree, durable identity and setup stage are bound.
 func EnrollSuiteBootstrap(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, enrollmentCode string) (SuiteBootstrapEnrollmentResult, error) {
-	if ctx == nil || validateSuiteSetupInputs(&bootstrap, roots) != nil {
-		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentConfig
-	}
-	ctx, cancel := context.WithTimeout(ctx, suiteBootstrapEnrollmentTimeout)
-	defer cancel()
-	preparation, err := loadSuiteBootstrapEnrollmentPreparation(bootstrap, roots)
-	if err != nil {
-		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentConfig
-	}
-	discovery, err := FetchSuiteBootstrapDiscovery(ctx, bootstrap)
-	if err != nil {
-		return SuiteBootstrapEnrollmentResult{}, err
-	}
-	store, err := NewFarmClientIdentityStore(roots.AgentState)
-	if err != nil {
-		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentIdentity
-	}
-	transport := &http.Transport{
-		Proxy:                  http.ProxyFromEnvironment,
-		TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12},
-		MaxResponseHeaderBytes: maxSuiteBootstrapHeaderBytes,
-		ResponseHeaderTimeout:  10 * time.Second,
-		DisableCompression:     true,
-	}
-	defer transport.CloseIdleConnections()
-	return enrollSuiteBootstrapWithDependencies(ctx, roots, preparation.RequestUID, bootstrap.NodeName, FarmClientVersion, enrollmentCode, discovery, suiteBootstrapEnrollmentDependencies{
-		IdentityStore: store,
-		Client:        &http.Client{Transport: transport},
-		Random:        rand.Reader,
-	})
+	return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentConfig
 }
 
 func loadSuiteBootstrapEnrollmentPreparation(bootstrap BootstrapConfig, roots SuiteUserRoots) (*SetupPreparationCheckpoint, error) {
@@ -135,7 +107,7 @@ func filepathJoinAgentState(roots SuiteUserRoots, name string) string {
 }
 
 func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRoots, preparationRequestUID, nodeName, suiteVersion, enrollmentCode string, discovery SuiteBootstrapDiscovery, deps suiteBootstrapEnrollmentDependencies) (SuiteBootstrapEnrollmentResult, error) {
-	if ctx == nil || deps.IdentityStore == nil || deps.Client == nil || deps.Random == nil || validateSuiteSetupRoots(roots) != nil || !validSuiteBootstrapEnrollmentNodeName(nodeName) || !validSuiteReleaseSemver(suiteVersion) {
+	if ctx == nil || deps.IdentityStore == nil || deps.Client == nil || (!deps.RequireExistingIdentity && deps.Random == nil) || validateSuiteSetupRoots(roots) != nil || !validSuiteBootstrapEnrollmentNodeName(nodeName) || !validSuiteReleaseSemver(suiteVersion) {
 		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentConfig
 	}
 	if err := ensureOwnerDirectory(roots.AgentState); err != nil {
@@ -186,7 +158,7 @@ func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRo
 			return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentState
 		}
 	}
-	key, err := loadOrCreateSuiteBootstrapIdentity(deps, identityRef, attempt == nil)
+	key, err := loadOrCreateSuiteBootstrapIdentity(deps, identityRef, attempt == nil && !deps.RequireExistingIdentity)
 	if err != nil {
 		return SuiteBootstrapEnrollmentResult{}, err
 	}
@@ -194,6 +166,9 @@ func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRo
 	publicKey := farmClientIdentityPublicKey(key)
 	publicKeyDigest := suiteBootstrapSHA256(publicKey)
 	defer clearBytes(publicKey)
+	if deps.RevalidateIdentity != nil && deps.RevalidateIdentity() != nil {
+		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentIdentity
+	}
 
 	if attempt != nil && attempt.Stage == SuiteBootstrapAcknowledged {
 		if !matchesSuiteBootstrapAcknowledgedBinding(*attempt, preparationRequestUID, discovery, discoveryDigest, metadataDigest, identityRef, publicKeyDigest, enrollmentCode) {
@@ -248,6 +223,9 @@ func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRo
 			}
 		}
 	}
+	if deps.RevalidateIdentity != nil && deps.RevalidateIdentity() != nil {
+		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentIdentity
+	}
 	response, err := postSuiteBootstrapEnrollment(ctx, deps.Client, discovery.EnrollmentEndpoint, idempotencyKey, requestRaw)
 	if err != nil {
 		return SuiteBootstrapEnrollmentResult{}, err
@@ -260,6 +238,9 @@ func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRo
 			return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentTransport
 		}
 	}
+	if deps.RevalidateIdentity != nil && deps.RevalidateIdentity() != nil {
+		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentIdentity
+	}
 	ack := baseAttempt
 	ack.Stage = SuiteBootstrapAcknowledged
 	ack.NodeUID = response.NodeUID
@@ -267,6 +248,9 @@ func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRo
 	ack.ControlEndpoint = response.ControlEndpoint
 	if err := saveSuiteBootstrapEnrollmentAttempt(roots, ack); err != nil {
 		return SuiteBootstrapEnrollmentResult{}, err
+	}
+	if deps.RevalidateIdentity != nil && deps.RevalidateIdentity() != nil {
+		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentIdentity
 	}
 	return suiteBootstrapEnrollmentResultFromAttempt(ack), nil
 }

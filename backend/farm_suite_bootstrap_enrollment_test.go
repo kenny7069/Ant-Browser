@@ -101,6 +101,37 @@ func suiteEnrollmentTestDependencies(store FarmClientIdentityStore, roundTrip su
 	}
 }
 
+func TestEnrollSuiteBootstrapLegacyEntryPointFailsClosedWithoutSideEffects(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "must-not-exist")
+	roots := SuiteUserRoots{Config: filepath.Join(base, "config"), BrowserData: filepath.Join(base, "browser"), AgentState: filepath.Join(base, "state"), Logs: filepath.Join(base, "logs")}
+	bootstrap := BootstrapConfig{ServerURL: "https://farm.example.test", StatePath: filepath.Join(roots.AgentState, "setup.json"), NodeName: "Node One"}
+	for _, code := range []string{"", suiteEnrollmentCode(0x31), "invalid"} {
+		if _, err := EnrollSuiteBootstrap(context.Background(), bootstrap, roots, code); !errors.Is(err, ErrSuiteBootstrapEnrollmentConfig) {
+			t.Fatalf("code length=%d err=%v", len(code), err)
+		}
+	}
+	if _, err := os.Lstat(base); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy entry point touched roots: %v", err)
+	}
+}
+
+func TestEnrollSuiteBootstrapRequireExistingIdentityNeverCreates(t *testing.T) {
+	roots := suiteBootstrapEnrollmentTestRoots(t)
+	store := newSuiteEnrollmentMemoryStore()
+	deps := suiteEnrollmentTestDependencies(store, func(*http.Request) (*http.Response, error) {
+		t.Fatal("POST with missing identity")
+		return nil, nil
+	})
+	deps.Random = nil
+	deps.RequireExistingIdentity = true
+	if _, err := enrollSuiteBootstrapWithDependencies(context.Background(), roots, "123e4567-e89b-12d3-a456-426614174001", "Node One", "0.1.0-dev", suiteEnrollmentCode(0x31), suiteEnrollmentDiscoveryFixture(), deps); !errors.Is(err, ErrSuiteBootstrapEnrollmentIdentity) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(store.seeds) != 0 {
+		t.Fatal("require-existing identity was created")
+	}
+}
+
 func TestLoadSuiteBootstrapEnrollmentPreparationRequiresDraftedExactBootstrap(t *testing.T) {
 	roots := suiteBootstrapEnrollmentTestRoots(t)
 	bootstrap := BootstrapConfig{ServerURL: "https://farm.example.test", StatePath: filepath.Join(roots.AgentState, "setup.json"), NodeName: "Node One"}
