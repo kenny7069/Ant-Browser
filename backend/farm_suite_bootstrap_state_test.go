@@ -26,8 +26,9 @@ func suiteBootstrapEnrollmentAttemptFixture(stage SuiteBootstrapEnrollmentStage)
 		DeploymentUID:         "123e4567-e89b-12d3-a456-426614174000",
 		DiscoverySHA256:       strings.Repeat("1", 64), MetadataSHA256: strings.Repeat("2", 64),
 		IdentityRef: "suite-v3-" + strings.Repeat("3", 64), PublicKeySHA256: strings.Repeat("4", 64),
-		EnrollmentCodeSHA256: strings.Repeat("5", 64), RequestSHA256: strings.Repeat("6", 64), IdempotencySHA256: strings.Repeat("7", 64),
+		EnrollmentCodeSHA256: strings.Repeat("5", 64), RequestSHA256: strings.Repeat("6", 64),
 	}
+	attempt.IdempotencySHA256 = suiteBootstrapSHA256([]byte(suiteBootstrapEnrollmentIdempotencyKey(attempt.PreparationRequestUID)))
 	if stage == SuiteBootstrapAcknowledged {
 		attempt.NodeUID = "node-1"
 		attempt.EnrollmentState = "ENROLLED"
@@ -161,6 +162,81 @@ func TestSuiteBootstrapEnrollmentAttemptRejectsSecretBackupEvenWithValidPrimary(
 	if _, err := loadSuiteBootstrapEnrollmentAttempt(roots); !errors.Is(err, errSuiteBootstrapEnrollmentUnsafe) {
 		t.Fatalf("secret backup error=%v", err)
 	}
+}
+
+func TestSuiteBootstrapEnrollmentAttemptSecretDetectorChecksKeysNotValues(t *testing.T) {
+	roots := suiteBootstrapEnrollmentTestRoots(t)
+	attempt := suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapIdentityReady)
+	raw, _ := json.Marshal(attempt)
+	withSafeValue := strings.Replace(string(raw), `"identity_ref":"`, `"identity_ref":"token-password-`, 1)
+	if err := writeOwnerAtomic(filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName), []byte(withSafeValue)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSuiteBootstrapEnrollmentAttempt(roots); err != nil {
+		t.Fatalf("safe value rejected: %v", err)
+	}
+	validNestedSecret := strings.Replace(string(raw), `"stage":"IDENTITY_READY"`, `"stage":"IDENTITY_READY","diagnostic":{"nested":{"password":"secret"}}`, 1)
+	if err := writeOwnerAtomic(filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName), []byte(validNestedSecret)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadSuiteBootstrapEnrollmentAttempt(roots); !errors.Is(err, errSuiteBootstrapEnrollmentUnsafe) {
+		t.Fatalf("nested secret key error=%v", err)
+	}
+}
+
+func TestSuiteBootstrapEnrollmentAttemptACKRequiresRequestBackupAndStableIdempotency(t *testing.T) {
+	ack := suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapAcknowledged)
+	request := suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapRequestReady)
+	for _, test := range []struct {
+		name    string
+		primary *SuiteBootstrapEnrollmentAttempt
+		backup  *SuiteBootstrapEnrollmentAttempt
+	}{
+		{"isolated ACK primary", &ack, nil},
+		{"isolated ACK backup", nil, &ack},
+		{"modified hash in both", func() *SuiteBootstrapEnrollmentAttempt {
+			value := ack
+			value.IdempotencySHA256 = strings.Repeat("8", 64)
+			return &value
+		}(), func() *SuiteBootstrapEnrollmentAttempt {
+			value := request
+			value.IdempotencySHA256 = strings.Repeat("8", 64)
+			return &value
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			roots := suiteBootstrapEnrollmentTestRoots(t)
+			path := filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName)
+			if test.primary != nil {
+				if err := writeSuiteBootstrapEnrollmentAttemptFile(path, *test.primary); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.backup != nil {
+				if err := writeSuiteBootstrapEnrollmentAttemptFile(path+".bak", *test.backup); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := loadSuiteBootstrapEnrollmentAttempt(roots); !errors.Is(err, ErrSuiteBootstrapEnrollmentState) {
+				t.Fatalf("invalid ACK evidence accepted: %v", err)
+			}
+		})
+	}
+
+	t.Run("corrupt primary recovers request backup", func(t *testing.T) {
+		roots := suiteBootstrapEnrollmentTestRoots(t)
+		path := filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName)
+		if err := writeOwnerAtomic(path, []byte("{")); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeSuiteBootstrapEnrollmentAttemptFile(path+".bak", request); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := loadSuiteBootstrapEnrollmentAttempt(roots)
+		if err != nil || loaded == nil || loaded.Stage != SuiteBootstrapRequestReady {
+			t.Fatalf("recovered=%+v err=%v", loaded, err)
+		}
+	})
 }
 
 func TestSuiteBootstrapEnrollmentAttemptRejectsConflictingOrFutureBackup(t *testing.T) {

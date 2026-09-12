@@ -94,6 +94,9 @@ func (attempt SuiteBootstrapEnrollmentAttempt) validate() error {
 			return ErrSuiteBootstrapEnrollmentState
 		}
 	}
+	if attempt.IdempotencySHA256 != suiteBootstrapSHA256([]byte(suiteBootstrapEnrollmentIdempotencyKey(attempt.PreparationRequestUID))) {
+		return ErrSuiteBootstrapEnrollmentState
+	}
 	if attempt.Stage == SuiteBootstrapAcknowledged {
 		if !validSuiteBootstrapEnrollmentNodeUID(attempt.NodeUID) || (attempt.EnrollmentState != "ENROLLED" && attempt.EnrollmentState != "ALREADY_ENROLLED") {
 			return ErrSuiteBootstrapEnrollmentState
@@ -125,6 +128,12 @@ func loadSuiteBootstrapEnrollmentAttempt(roots SuiteUserRoots) (*SuiteBootstrapE
 		if errors.Is(candidateErr, errSuiteBootstrapEnrollmentUnsafe) || errors.Is(candidateErr, errSuiteBootstrapEnrollmentUnknown) || errors.Is(candidateErr, errSuiteBootstrapEnrollmentDuplicate) {
 			return nil, candidateErr
 		}
+	}
+	if backup != nil && backup.Stage == SuiteBootstrapAcknowledged {
+		return nil, ErrSuiteBootstrapEnrollmentState
+	}
+	if primary != nil && primary.Stage == SuiteBootstrapAcknowledged && (backup == nil || backup.Stage != SuiteBootstrapRequestReady || !sameSuiteBootstrapEnrollmentBinding(*primary, *backup)) {
+		return nil, ErrSuiteBootstrapEnrollmentState
 	}
 	if primary != nil && backup != nil {
 		primaryStage := suiteBootstrapEnrollmentStageIndex(primary.Stage)
@@ -159,11 +168,11 @@ func readSuiteBootstrapEnrollmentAttemptFile(path string) (*SuiteBootstrapEnroll
 	if err != nil || !exists {
 		return nil, err
 	}
-	if suiteBootstrapEnrollmentRawContainsSecret(raw) {
-		return nil, fmt.Errorf("%w: %w", ErrSuiteBootstrapEnrollmentState, errSuiteBootstrapEnrollmentUnsafe)
-	}
 	if duplicateErr := rejectSuiteReleaseDuplicateJSONKeys(raw); duplicateErr != nil && strings.Contains(duplicateErr.Error(), "duplicate or case-folded JSON key") {
 		return nil, fmt.Errorf("%w: %w", ErrSuiteBootstrapEnrollmentState, errSuiteBootstrapEnrollmentDuplicate)
+	}
+	if suiteBootstrapEnrollmentJSONContainsSecretKey(raw) {
+		return nil, fmt.Errorf("%w: %w", ErrSuiteBootstrapEnrollmentState, errSuiteBootstrapEnrollmentUnsafe)
 	}
 	var keys map[string]json.RawMessage
 	if json.Unmarshal(raw, &keys) != nil {
@@ -212,14 +221,49 @@ func readSuiteBootstrapEnrollmentOwnerFile(path string) ([]byte, bool, error) {
 	return raw, true, nil
 }
 
-func suiteBootstrapEnrollmentRawContainsSecret(raw []byte) bool {
+func suiteBootstrapEnrollmentJSONContainsSecretKey(raw []byte) bool {
+	if json.Valid(raw) {
+		var value any
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		if decoder.Decode(&value) != nil {
+			return true
+		}
+		return suiteBootstrapEnrollmentValueContainsSecretKey(value)
+	}
 	lower := strings.ToLower(string(raw))
-	for _, field := range []string{`"enrollment_code"`, `"private_key"`, `"device_public_key_ed25519_b64"`, `"public_key"`, `"password"`, `"cookie"`, `"token"`, `"access_token"`, `"refresh_token"`} {
-		if strings.Contains(lower, field) {
+	for key := range suiteBootstrapEnrollmentSecretKeys() {
+		if strings.Contains(lower, `"`+key+`"`) {
 			return true
 		}
 	}
 	return false
+}
+
+func suiteBootstrapEnrollmentValueContainsSecretKey(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		secretKeys := suiteBootstrapEnrollmentSecretKeys()
+		for key, child := range typed {
+			if _, forbidden := secretKeys[strings.ToLower(key)]; forbidden || suiteBootstrapEnrollmentValueContainsSecretKey(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if suiteBootstrapEnrollmentValueContainsSecretKey(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func suiteBootstrapEnrollmentSecretKeys() map[string]struct{} {
+	return map[string]struct{}{
+		"enrollment_code": {}, "private_key": {}, "device_public_key_ed25519_b64": {}, "public_key": {},
+		"password": {}, "cookie": {}, "token": {}, "access_token": {}, "refresh_token": {},
+	}
 }
 
 func validSuiteBootstrapEnrollmentNodeUID(value string) bool {
@@ -286,4 +330,8 @@ func writeSuiteBootstrapEnrollmentAttemptFile(path string, attempt SuiteBootstra
 func suiteBootstrapSHA256(raw []byte) string {
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:])
+}
+
+func suiteBootstrapEnrollmentIdempotencyKey(requestUID string) string {
+	return "ant-suite-enrollment-v3-" + requestUID
 }

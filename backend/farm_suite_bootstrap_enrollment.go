@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -134,7 +135,7 @@ func filepathJoinAgentState(roots SuiteUserRoots, name string) string {
 }
 
 func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRoots, preparationRequestUID, nodeName, suiteVersion, enrollmentCode string, discovery SuiteBootstrapDiscovery, deps suiteBootstrapEnrollmentDependencies) (SuiteBootstrapEnrollmentResult, error) {
-	if ctx == nil || deps.IdentityStore == nil || deps.Client == nil || deps.Random == nil || validateSuiteSetupRoots(roots) != nil || validateFarmClientNodeName(nodeName) != nil || !validSuiteReleaseSemver(suiteVersion) {
+	if ctx == nil || deps.IdentityStore == nil || deps.Client == nil || deps.Random == nil || validateSuiteSetupRoots(roots) != nil || !validSuiteBootstrapEnrollmentNodeName(nodeName) || !validSuiteReleaseSemver(suiteVersion) {
 		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentConfig
 	}
 	if err := ensureOwnerDirectory(roots.AgentState); err != nil {
@@ -204,7 +205,7 @@ func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRo
 	if err != nil {
 		return SuiteBootstrapEnrollmentResult{}, ErrSuiteBootstrapEnrollmentConfig
 	}
-	idempotencyKey := "ant-suite-enrollment-v3-" + requestUID
+	idempotencyKey := suiteBootstrapEnrollmentIdempotencyKey(requestUID)
 	request := suiteBootstrapEnrollmentRequest{
 		RequestUID: requestUID, EnrollmentCode: enrollmentCode,
 		DevicePublicKeyEd25519Base64: base64.StdEncoding.EncodeToString(publicKey), Metadata: metadata,
@@ -268,6 +269,18 @@ func enrollSuiteBootstrapWithDependencies(ctx context.Context, roots SuiteUserRo
 		return SuiteBootstrapEnrollmentResult{}, err
 	}
 	return suiteBootstrapEnrollmentResultFromAttempt(ack), nil
+}
+
+func validSuiteBootstrapEnrollmentNodeName(value string) bool {
+	if !utf8.ValidString(value) || strings.TrimSpace(value) != value || utf8.RuneCountInString(value) == 0 || utf8.RuneCountInString(value) > 100 {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func suiteBootstrapEnrollmentIdentityRef(deploymentUID, requestUID string) (FarmClientIdentityKeyRef, error) {

@@ -145,6 +145,46 @@ func TestSuiteBootstrapEnrollmentNodeUIDWireContract(t *testing.T) {
 	}
 }
 
+func TestSuiteBootstrapEnrollmentNodeNameWireContract(t *testing.T) {
+	for _, value := range []string{strings.Repeat("é", 100), "Node One"} {
+		if !validSuiteBootstrapEnrollmentNodeName(value) {
+			t.Fatalf("valid node name rejected: rune_count=%d", utf8.RuneCountInString(value))
+		}
+	}
+	for _, value := range []string{strings.Repeat("é", 101), " Node", "Node ", "node\x00name", string([]byte{0xff})} {
+		if validSuiteBootstrapEnrollmentNodeName(value) {
+			t.Fatalf("invalid node name accepted: %q", value)
+		}
+	}
+}
+
+func TestEnrollSuiteBootstrapACKNodeUIDSecretWordsAreSafeValues(t *testing.T) {
+	for _, nodeUID := range []string{"token", "password"} {
+		t.Run(nodeUID, func(t *testing.T) {
+			roots := suiteBootstrapEnrollmentTestRoots(t)
+			store := newSuiteEnrollmentMemoryStore()
+			calls := 0
+			deps := suiteEnrollmentTestDependencies(store, func(*http.Request) (*http.Response, error) {
+				calls++
+				raw, _ := json.Marshal(suiteBootstrapEnrollmentResponse{NodeUID: nodeUID, EnrollmentState: "ENROLLED", ControlEndpoint: suiteEnrollmentDiscoveryFixture().ControlEndpoint})
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(bytes.NewReader(raw))}, nil
+			})
+			result, err := enrollSuiteBootstrapWithDependencies(context.Background(), roots, "123e4567-e89b-12d3-a456-426614174001", "Node One", "0.1.0-dev", suiteEnrollmentCode(0x61), suiteEnrollmentDiscoveryFixture(), deps)
+			if err != nil || result.NodeUID != nodeUID {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			loaded, err := loadSuiteBootstrapEnrollmentAttempt(roots)
+			if err != nil || loaded.NodeUID != nodeUID {
+				t.Fatalf("loaded=%+v err=%v", loaded, err)
+			}
+			result, err = enrollSuiteBootstrapWithDependencies(context.Background(), roots, "123e4567-e89b-12d3-a456-426614174001", "Node One", "0.1.0-dev", "", suiteEnrollmentDiscoveryFixture(), deps)
+			if err != nil || result.NodeUID != nodeUID || calls != 1 {
+				t.Fatalf("empty-code resume=%+v calls=%d err=%v", result, calls, err)
+			}
+		})
+	}
+}
+
 func TestEnrollSuiteBootstrapFreshPersistsBeforePOSTAndKeepsJournalSecretFree(t *testing.T) {
 	roots := suiteBootstrapEnrollmentTestRoots(t)
 	store := newSuiteEnrollmentMemoryStore()
