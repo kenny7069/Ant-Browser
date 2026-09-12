@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -108,22 +109,42 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ant-farm-client: startup failed: %v\n", err)
 		return 1
 	}
+	ipcServer, err := backend.StartFarmClientIPCServer(host)
+	if err != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: local IPC startup failed")
+		_ = host.Shutdown()
+		return 1
+	}
+	hostCtx, cancelHost := context.WithCancel(context.Background())
+	defer cancelHost()
+	var residentStop sync.Once
+	stopResident := func(preserve bool) {
+		residentStop.Do(func() {
+			_ = ipcServer.Close()
+			if preserve {
+				_ = host.PrepareForUpdate()
+			}
+			cancelHost()
+		})
+	}
+	go func() {
+		<-ctx.Done()
+		stopResident(false)
+	}()
 	// The immutable launcher owns the write end of this anonymous pipe. A
 	// deliberate service stop sends 'S'. Update rollback sends 'P', while EOF
 	// means the parent died. Both preserve live Browser runtimes for recovery.
 	go func() {
-		if farmAgentControlPreservesRuntimes(stdin) {
-			_ = host.PrepareForUpdate()
-		}
-		stop()
+		stopResident(farmAgentControlPreservesRuntimes(stdin))
 	}()
-	go backend.RunFarmClientUpdateSupervisor(ctx, host, path, filepath.Clean(executable))
+	go backend.RunFarmClientUpdateSupervisor(hostCtx, host, path, filepath.Clean(executable))
 	var runErr error
 	if *updateHealthFile != "" {
-		runErr = host.RunWithUpdateHealth(ctx, filepath.Clean(*updateHealthFile), os.Getenv("ANT_FARM_CLIENT_UPDATE_HEALTH_NONCE"))
+		runErr = host.RunWithUpdateHealth(hostCtx, filepath.Clean(*updateHealthFile), os.Getenv("ANT_FARM_CLIENT_UPDATE_HEALTH_NONCE"))
 	} else {
-		runErr = host.Run(ctx)
+		runErr = host.Run(hostCtx)
 	}
+	stopResident(false)
 	if runErr != nil && ctx.Err() == nil {
 		fmt.Fprintf(stderr, "ant-farm-client: stopped: %v\n", runErr)
 		_ = host.Shutdown()
@@ -222,12 +243,12 @@ func runAutostartCommand(configPath string, args []string, stdout, stderr io.Wri
 }
 
 func runProfileCommand(configPath string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	host, err := backend.NewFarmClientHost(configPath)
+	client, err := backend.NewFarmClientIPCClient(configPath)
 	if err != nil {
 		fmt.Fprintln(stderr, "ant-farm-client: profile command unavailable")
 		return 1
 	}
-	defer host.Shutdown()
+	ctx := context.Background()
 	write := func(value any) int {
 		encoded, err := json.Marshal(value)
 		if err != nil {
@@ -238,25 +259,33 @@ func runProfileCommand(configPath string, args []string, stdin io.Reader, stdout
 		return 0
 	}
 	if len(args) == 2 && args[0] == "profiles" && args[1] == "list" {
-		profiles, err := host.ProfileList()
+		profiles, err := client.ProfileList(ctx)
 		if err != nil {
 			fmt.Fprintln(stderr, "ant-farm-client: profile list failed")
 			return 1
 		}
 		return write(profiles)
 	}
-	if len(args) == 3 && args[0] == "profiles" && args[1] == "create" {
-		profile, err := host.ProfileCreate(args[2])
+	if len(args) == 3 && args[0] == "profiles" && args[1] == "open" {
+		profile, err := client.ProfileOpen(ctx, args[2])
 		if err != nil {
-			fmt.Fprintln(stderr, "ant-farm-client: profile create failed")
+			fmt.Fprintln(stderr, "ant-farm-client: profile open failed")
 			return 1
 		}
 		return write(profile)
 	}
-	if len(args) == 3 && args[0] == "profiles" && args[1] == "open" {
-		profile, err := host.ProfileOpen(args[2])
+	if len(args) == 3 && args[0] == "profiles" && args[1] == "stop" {
+		profile, err := client.ProfileStop(ctx, args[2])
 		if err != nil {
-			fmt.Fprintln(stderr, "ant-farm-client: profile open failed")
+			fmt.Fprintln(stderr, "ant-farm-client: profile stop failed")
+			return 1
+		}
+		return write(profile)
+	}
+	if len(args) == 3 && args[0] == "profiles" && args[1] == "status" {
+		profile, err := client.ProfileStatus(ctx, args[2])
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: profile status failed")
 			return 1
 		}
 		return write(profile)
@@ -267,7 +296,7 @@ func runProfileCommand(configPath string, args []string, stdin io.Reader, stdout
 			fmt.Fprintln(stderr, "ant-farm-client: pairing code is required")
 			return 1
 		}
-		result, err := host.PairProfile(context.Background(), args[1], pairingCode, nil)
+		result, err := client.PairProfile(ctx, args[1], pairingCode)
 		pairingCode = ""
 		if err != nil {
 			fmt.Fprintln(stderr, "ant-farm-client: pairing failed")
@@ -276,7 +305,7 @@ func runProfileCommand(configPath string, args []string, stdin io.Reader, stdout
 		return write(result)
 	}
 	if len(args) == 2 && args[0] == "unpair" {
-		result, err := host.UnpairProfile(context.Background(), args[1], nil)
+		result, err := client.UnpairProfile(ctx, args[1])
 		if err != nil {
 			fmt.Fprintln(stderr, "ant-farm-client: unpair failed")
 			return 1
