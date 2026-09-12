@@ -93,6 +93,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ant-farm-client: -config must be an absolute path")
 		return 2
 	}
+	suiteRoots, suiteRootsErr := backend.ResolveSuiteUserRoots()
+	isCanonicalSuiteConfig := suiteRootsErr == nil && filepath.Clean(path) == filepath.Join(suiteRoots.Config, backend.SuiteClientConfigName)
+	if isCanonicalSuiteConfig && !*farmAgent && !*diagnostics && !*enroll && flags.NArg() == 0 {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		executable, _ := os.Executable()
+		if err := backend.RunSuiteFarmClientLauncher(ctx, suiteRoots, path, filepath.Clean(executable), stdout, stderr); err != nil && ctx.Err() == nil {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite launcher unavailable")
+			return 1
+		}
+		return 0
+	}
 	if *diagnostics {
 		config, err := backend.LoadFarmClientConfig(path)
 		if err != nil {
