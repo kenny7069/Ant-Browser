@@ -57,6 +57,21 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return runSuiteCommand(roots, args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "doctor" {
+		return runTopLevelDoctor(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "service" {
+		if len(args) != 2 || args[1] != "status" {
+			fmt.Fprintln(stderr, "ant-farm-client: invalid service command")
+			return 2
+		}
+		roots, err := backend.ResolveSuiteUserRoots()
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: Suite roots unavailable")
+			return 5
+		}
+		return runSuiteCommand(roots, []string{"service", "status"}, stdout, stderr)
+	}
 	flags := flag.NewFlagSet("ant-farm-client", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "absolute path to the strict Ant Farm client YAML/JSON config")
@@ -167,12 +182,57 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func runTopLevelDoctor(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "", "absolute canonical Suite client config")
+	jsonOutput := flags.Bool("json", false, "emit JSON")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || !*jsonOutput || !filepath.IsAbs(*configPath) {
+		fmt.Fprintln(stderr, "ant-farm-client: invalid doctor arguments")
+		return 2
+	}
+	roots, err := backend.ResolveSuiteUserRoots()
+	if err != nil || filepath.Clean(*configPath) != filepath.Join(roots.Config, backend.SuiteClientConfigName) {
+		fmt.Fprintln(stderr, "ant-farm-client: doctor config is not canonical")
+		return 2
+	}
+	return runSuiteCommand(roots, []string{"doctor"}, stdout, stderr)
+}
+
 func runSuiteCommand(roots backend.SuiteUserRoots, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite command")
 		return 2
 	}
 	switch args[0] {
+	case "doctor":
+		if len(args) != 1 {
+			fmt.Fprintln(stderr, "ant-farm-client: invalid Suite doctor arguments")
+			return 2
+		}
+		report := backend.DoctorSuite(context.Background(), roots)
+		encoded, _ := json.Marshal(report)
+		fmt.Fprintln(stdout, string(encoded))
+		if report.Overall != "READY" {
+			return 5
+		}
+		return 0
+	case "service":
+		if len(args) != 2 {
+			fmt.Fprintln(stderr, "ant-farm-client: invalid Suite service arguments")
+			return 2
+		}
+		if args[1] == "status" {
+			report := backend.DoctorSuite(context.Background(), roots)
+			encoded, _ := json.Marshal(report)
+			fmt.Fprintln(stdout, string(encoded))
+			if report.Overall != "READY" {
+				return 5
+			}
+			return 0
+		}
+		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite service command")
+		return 2
 	case "finalize-handoff":
 		flags := flag.NewFlagSet("suite finalize-handoff", flag.ContinueOnError)
 		flags.SetOutput(stderr)

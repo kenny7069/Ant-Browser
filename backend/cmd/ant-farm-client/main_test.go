@@ -149,6 +149,45 @@ func TestSuiteGUILaunchSurfaceIsDeferred(t *testing.T) {
 	}
 }
 
+func TestSuiteDoctorAndServiceFailClosedWithoutEvidence(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		code int
+	}{
+		{[]string{"doctor"}, 5}, {[]string{"service", "status"}, 5}, {[]string{"service", "start"}, 2}, {[]string{"service", "stop"}, 2},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := runSuiteCommand(backend.SuiteUserRoots{}, test.args, &stdout, &stderr); code != test.code {
+			t.Fatalf("args=%v exit=%d want=%d stdout=%q stderr=%q", test.args, code, test.code, stdout.String(), stderr.String())
+		}
+		if strings.Contains(strings.ToLower(stdout.String()+stderr.String()), "private_key") {
+			t.Fatalf("args=%v leaked secret field", test.args)
+		}
+	}
+}
+
+func TestTopLevelDoctorAndServiceClosedParser(t *testing.T) {
+	roots, err := backend.ResolveSuiteUserRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := filepath.Join(roots.Config, backend.SuiteClientConfigName)
+	for _, test := range []struct {
+		args []string
+		code int
+	}{
+		{[]string{"doctor", "--config", canonical, "--json"}, 5},
+		{[]string{"doctor", "--config", filepath.Join(t.TempDir(), "client.yaml"), "--json"}, 2},
+		{[]string{"doctor", "--config", canonical}, 2},
+		{[]string{"service", "status"}, 5},
+		{[]string{"service", "start"}, 2},
+	} {
+		if code := run(test.args, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); code != test.code {
+			t.Fatalf("args=%v code=%d want=%d", test.args, code, test.code)
+		}
+	}
+}
+
 func TestSuiteReleaseVerificationUsesCallerPinnedTrustAnchor(t *testing.T) {
 	manifest := []byte(`{"schema_version":1,"version":"1.2.3","target":{"os":"windows","arch":"amd64"},"commits":{"ant_browser":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","farm_agent":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","farm_control":"cccccccccccccccccccccccccccccccccccccccc"},"config_schema":1,"capabilities":["setup-plan"],"core_versions":{"chromium":"120.0.0"},"dependencies":[{"name":"Ant-Suite","version":"1.2.3","license_ref":"LICENSE"}],"entries":[{"path":"Ant.exe","role":"binary","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","executable":true},{"path":"LICENSE","role":"legal","size":1,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","executable":false}]}`)
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)

@@ -47,7 +47,25 @@ func InstallFarmClientAutostart(executablePath, configPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := rejectRawAutostartForSuiteFootprint(configPath); err != nil {
+		return err
+	}
 	return newFarmClientAutostartManager().Install(executablePath, configPath)
+}
+
+func rejectRawAutostartForSuiteFootprint(configPath string) error {
+	roots, err := ResolveSuiteUserRoots()
+	if err != nil {
+		return nil
+	}
+	return rejectRawAutostartForSuiteFootprintAtRoots(configPath, roots)
+}
+
+func rejectRawAutostartForSuiteFootprintAtRoots(configPath string, roots SuiteUserRoots) error {
+	if !sameSuiteHandoffPath(configPath, filepath.Join(roots.Config, SuiteClientConfigName)) {
+		return nil
+	}
+	return fmt.Errorf("%w: Suite activation requires the durable coordinator", ErrFarmClientAutostart)
 }
 
 func RemoveFarmClientAutostart() error {
