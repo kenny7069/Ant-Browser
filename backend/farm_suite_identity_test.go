@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ type suiteIdentityTestStore struct {
 	missingAfterSave     bool
 	saves                int
 	deletes              int
+	loads                int
 }
 
 func newSuiteIdentityTestStore() *suiteIdentityTestStore {
@@ -31,6 +33,7 @@ func newSuiteIdentityTestStore() *suiteIdentityTestStore {
 func (store *suiteIdentityTestStore) Load(ref FarmClientIdentityKeyRef) (ed25519.PrivateKey, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	store.loads++
 	if store.loadErr != nil {
 		return nil, store.loadErr
 	}
@@ -193,6 +196,35 @@ func TestSuiteCanonicalIdentityRecoversPersistedSaveAndCheckpointFaults(t *testi
 	})
 }
 
+func TestSuiteCanonicalIdentityRejectsSaveThenKeyReplacement(t *testing.T) {
+	fixture := newSuiteIdentityFixture(t)
+	transport, err := LoadSuiteTransportReceipt(fixture.roots, fixture.bootstrap)
+	if err != nil || transport == nil {
+		t.Fatal(err)
+	}
+	ref, err := suiteBootstrapEnrollmentIdentityRef(transport.DeploymentUID, fixture.preparation.RequestUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := suiteIdentityTestDependencies(fixture.store)
+	deps.AfterIdentitySave = func() error {
+		fixture.store.mu.Lock()
+		fixture.store.keys[ref] = ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x42}, ed25519.SeedSize))
+		fixture.store.mu.Unlock()
+		return nil
+	}
+	if _, err := runSuiteCanonicalIdentityWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
+		t.Fatal("post-save key replacement accepted")
+	}
+	if fixture.store.saves != 1 || fixture.store.deletes != 0 {
+		t.Fatalf("unexpected key mutation calls: saves=%d deletes=%d", fixture.store.saves, fixture.store.deletes)
+	}
+	if receipt, _ := LoadSuiteIdentityReceipt(fixture.roots); receipt != nil {
+		t.Fatal("key replacement wrote receipt")
+	}
+	assertSuiteTransportCheckpoint(t, fixture.suiteTransportFixture, SetupTransportVerified)
+}
+
 func TestSuiteIdentityReceiptHandleRechecksCreateAndRecoveryBytes(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("native Windows handle/DACL evidence not run")
@@ -202,7 +234,11 @@ func TestSuiteIdentityReceiptHandleRechecksCreateAndRecoveryBytes(t *testing.T) 
 			fixture := newSuiteIdentityFixture(t)
 			path := filepath.Join(fixture.roots.AgentState, SuiteIdentityReceiptName)
 			if recovery {
-				if err := os.WriteFile(path, []byte(`{"x":`), 0o600); err != nil {
+				if _, err := runSuiteCanonicalIdentityWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteIdentityTestDependencies(fixture.store)); err != nil {
+					t.Fatal(err)
+				}
+				forceSuiteIdentityCheckpoint(t, fixture, SetupTransportVerified)
+				if err := writeOwnerAtomic(path, []byte(`{"schema_version":1,`)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -236,6 +272,154 @@ func TestSuiteIdentityReceiptHandleRechecksCreateAndRecoveryBytes(t *testing.T) 
 			}
 			assertSuiteTransportCheckpoint(t, fixture.suiteTransportFixture, SetupTransportVerified)
 		})
+	}
+}
+
+func TestSuiteCanonicalIdentityExistingReceiptNeverCreatesKey(t *testing.T) {
+	for _, kind := range []string{"valid", "partial", "different-invalid", "secret", "valid-trailing"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newSuiteIdentityFixture(t)
+			if _, err := runSuiteCanonicalIdentityWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteIdentityTestDependencies(fixture.store)); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(fixture.roots.AgentState, SuiteIdentityReceiptName)
+			canonical, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw := canonical
+			switch kind {
+			case "partial":
+				raw = []byte(`{"schema_version":1,`)
+			case "different-invalid":
+				raw = []byte(`{"x":`)
+			case "secret":
+				raw = []byte(`{"token":"x",`)
+			case "valid-trailing":
+				raw = append(append([]byte(nil), canonical...), 'x')
+			}
+			if kind != "valid" {
+				if err := writeOwnerAtomic(path, raw); err != nil {
+					t.Fatal(err)
+				}
+			}
+			forceSuiteIdentityCheckpoint(t, fixture, SetupTransportVerified)
+			fixture.store.mu.Lock()
+			fixture.store.keys = make(map[FarmClientIdentityKeyRef][]byte)
+			beforeSaves := fixture.store.saves
+			fixture.store.mu.Unlock()
+			deps := suiteIdentityTestDependencies(fixture.store)
+			deps.Random = panicSuiteIdentityReader{}
+			if _, err := runSuiteCanonicalIdentityWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
+				t.Fatal("receipt with missing key accepted")
+			}
+			if fixture.store.saves != beforeSaves {
+				t.Fatal("receipt artifact allowed identity creation")
+			}
+			preserved, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(preserved, raw) {
+				t.Fatalf("receipt artifact mutated=%q err=%v", preserved, err)
+			}
+		})
+	}
+}
+
+type panicSuiteIdentityReader struct{}
+
+func (panicSuiteIdentityReader) Read([]byte) (int, error) {
+	panic("random must not be read")
+}
+
+func TestSuiteIdentityReceiptOnlyCanonicalPrefixRecovers(t *testing.T) {
+	for _, kind := range []string{"canonical-prefix", "canonical-mid-string", "different-invalid", "valid-trailing"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newSuiteIdentityFixture(t)
+			if _, err := runSuiteCanonicalIdentityWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteIdentityTestDependencies(fixture.store)); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(fixture.roots.AgentState, SuiteIdentityReceiptName)
+			canonical, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw := []byte(`{"schema_version":1,`)
+			if kind == "canonical-mid-string" {
+				offset := bytes.Index(canonical, []byte(fixture.preparation.RequestUID))
+				if offset < 0 {
+					t.Fatal("canonical receipt lacks request UID")
+				}
+				raw = append([]byte(nil), canonical[:offset+5]...)
+			} else if kind == "different-invalid" {
+				raw = []byte(`{"x":`)
+			} else if kind == "valid-trailing" {
+				raw = append(append([]byte(nil), canonical...), 'x')
+			}
+			if err := writeOwnerAtomic(path, raw); err != nil {
+				t.Fatal(err)
+			}
+			forceSuiteIdentityCheckpoint(t, fixture, SetupTransportVerified)
+			_, runErr := runSuiteCanonicalIdentityWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteIdentityTestDependencies(fixture.store))
+			if kind == "canonical-prefix" || kind == "canonical-mid-string" {
+				if runErr != nil {
+					t.Fatalf("canonical prefix was not recovered: %v", runErr)
+				}
+				return
+			}
+			if runErr == nil {
+				t.Fatal("non-prefix receipt recovered")
+			}
+			preserved, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(preserved, raw) {
+				t.Fatalf("non-prefix receipt mutated=%q err=%v", preserved, err)
+			}
+		})
+	}
+}
+
+func TestSuiteCanonicalIdentityAllowsOnlyAbsentReceiptWithEmptyStoreDirectory(t *testing.T) {
+	fixture := newSuiteIdentityFixture(t)
+	storePath := filepath.Join(fixture.roots.AgentState, farmClientIdentityStoreDir)
+	if err := os.Mkdir(storePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fixture.store.saveErr = errors.New("injected save failure")
+	for attempt := 1; attempt <= 2; attempt++ {
+		deps := suiteIdentityTestDependencies(fixture.store)
+		if _, err := runSuiteCanonicalIdentityWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
+			t.Fatal("save failure reported success")
+		}
+		if fixture.store.saves != attempt {
+			t.Fatalf("empty store retry did not reach Save: saves=%d attempt=%d", fixture.store.saves, attempt)
+		}
+		entries, err := os.ReadDir(storePath)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("empty store directory mutated: entries=%v err=%v", entries, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(fixture.roots.AgentState, SuiteIdentityReceiptName), []byte(`{"schema_version":1,`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deps := suiteIdentityTestDependencies(fixture.store)
+	if _, err := runSuiteCanonicalIdentityWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
+		t.Fatal("receipt plus empty store accepted")
+	}
+	if fixture.store.saves != 2 {
+		t.Fatal("receipt plus empty store reached Save")
+	}
+}
+
+func forceSuiteIdentityCheckpoint(t *testing.T, fixture suiteIdentityFixture, stage SetupStage) {
+	t.Helper()
+	checkpoint := SetupCheckpoint{SchemaVersion: 1, Stage: stage, RequestUID: fixture.preparation.RequestUID}
+	raw, err := json.Marshal(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fixture.bootstrap.StatePath + ".bak"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if err := writeOwnerAtomic(fixture.bootstrap.StatePath, append(raw, '\n')); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -355,13 +539,13 @@ func TestSuiteIdentityStoreArtifactRequiresExactOwnerOnlyShape(t *testing.T) {
 	if err != nil || os.Mkdir(filepath.Dir(path), 0o700) != nil || os.WriteFile(path, []byte("opaque"), 0o600) != nil {
 		t.Fatalf("fixture: path=%s err=%v", path, err)
 	}
-	if err := validateSuiteIdentityStoreDirectory(filepath.Dir(path), root, ref); err != nil {
+	if err := validateSuiteIdentityStoreDirectory(filepath.Dir(path), root, ref, false); err != nil {
 		t.Fatalf("exact store artifact rejected: %v", err)
 	}
 	if err := os.Chmod(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateSuiteIdentityStoreDirectory(filepath.Dir(path), root, ref); err == nil {
+	if err := validateSuiteIdentityStoreDirectory(filepath.Dir(path), root, ref, false); err == nil {
 		t.Fatal("insecure store directory accepted")
 	}
 }

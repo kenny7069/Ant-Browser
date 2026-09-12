@@ -36,6 +36,13 @@ type SuiteIdentityReceipt struct {
 	StoreKind         string `json:"store_kind"`
 }
 
+type suiteIdentityReceiptArtifact struct {
+	Present bool
+	Receipt *SuiteIdentityReceipt
+	Info    os.FileInfo
+	Raw     []byte
+}
+
 func (receipt SuiteIdentityReceipt) validate() error {
 	if receipt.SchemaVersion != 1 || receipt.StoreKind != suiteIdentityStoreKind ||
 		!validLowerSHA256(receipt.BootstrapSHA256) || !validLowerSHA256(receipt.ManifestSHA256) ||
@@ -101,6 +108,34 @@ func LoadSuiteIdentityReceipt(roots SuiteUserRoots) (*SuiteIdentityReceipt, erro
 	return &receipt, nil
 }
 
+func inspectSuiteIdentityReceiptArtifact(roots SuiteUserRoots) (suiteIdentityReceiptArtifact, error) {
+	receipt, loadErr := LoadSuiteIdentityReceipt(roots)
+	if loadErr == nil {
+		return suiteIdentityReceiptArtifact{Present: receipt != nil, Receipt: receipt}, nil
+	}
+	path := filepath.Join(roots.AgentState, SuiteIdentityReceiptName)
+	info, raw, err := readSuiteTransportReceiptRecoveryCandidate(roots, path)
+	if err != nil || len(raw) > suiteIdentityReceiptMaxBytes {
+		return suiteIdentityReceiptArtifact{}, ErrSuiteIdentityReceipt
+	}
+	return suiteIdentityReceiptArtifact{Present: true, Info: info, Raw: raw}, nil
+}
+
+func marshalSuiteIdentityReceipt(receipt SuiteIdentityReceipt) ([]byte, error) {
+	if receipt.validate() != nil {
+		return nil, ErrSuiteIdentityReceipt
+	}
+	raw, err := json.Marshal(receipt)
+	if err != nil || len(raw)+1 > suiteIdentityReceiptMaxBytes {
+		return nil, ErrSuiteIdentityReceipt
+	}
+	return append(raw, '\n'), nil
+}
+
+func suiteIdentityReceiptRecoveryMatches(raw, canonical []byte) bool {
+	return len(raw) == 0 || (len(raw) < len(canonical) && bytes.Equal(raw, canonical[:len(raw)]))
+}
+
 type suiteIdentityReceiptSaveDependencies struct {
 	Open      func(string, bool) (*os.File, error)
 	Write     func(*os.File, os.FileInfo, []byte, *suiteTransportReceiptRecoveryEvidence) error
@@ -118,32 +153,32 @@ func saveSuiteIdentityReceiptWithDependencies(roots SuiteUserRoots, receipt Suit
 	if dependencies.Open == nil || dependencies.Write == nil {
 		return ErrSuiteIdentityReceipt
 	}
-	existing, loadErr := LoadSuiteIdentityReceipt(roots)
-	if loadErr == nil && existing != nil {
-		if *existing != receipt {
+	artifact, err := inspectSuiteIdentityReceiptArtifact(roots)
+	if err != nil {
+		return err
+	}
+	if artifact.Receipt != nil {
+		if *artifact.Receipt != receipt {
 			return ErrSuiteIdentityReceiptConflict
 		}
 		return nil
 	}
+	raw, err := marshalSuiteIdentityReceipt(receipt)
+	if err != nil {
+		return err
+	}
 	path := filepath.Join(roots.AgentState, SuiteIdentityReceiptName)
-	create := false
+	create := !artifact.Present
 	var recovery *suiteTransportReceiptRecoveryEvidence
-	if loadErr == nil {
-		create = true
-	} else {
+	if artifact.Present {
 		checkpoint, err := LoadSetupCheckpoint(filepath.Join(roots.AgentState, "setup.json"))
 		if err != nil || checkpoint == nil || checkpoint.Stage != SetupTransportVerified || checkpoint.RequestUID != receipt.RequestUID {
 			return ErrSuiteIdentityReceipt
 		}
-		info, raw, err := readSuiteTransportReceiptRecoveryCandidate(roots, path)
-		if err != nil || len(raw) > suiteIdentityReceiptMaxBytes || json.Valid(raw) {
+		if artifact.Info == nil || !suiteIdentityReceiptRecoveryMatches(artifact.Raw, raw) {
 			return ErrSuiteIdentityReceipt
 		}
-		recovery = &suiteTransportReceiptRecoveryEvidence{Info: info, Size: int64(len(raw)), Digest: sha256.Sum256(raw)}
-	}
-	raw, err := json.Marshal(receipt)
-	if err != nil || len(raw)+1 > suiteIdentityReceiptMaxBytes {
-		return ErrSuiteIdentityReceipt
+		recovery = &suiteTransportReceiptRecoveryEvidence{Info: artifact.Info, Size: int64(len(artifact.Raw)), Digest: sha256.Sum256(artifact.Raw)}
 	}
 	file, err := dependencies.Open(path, create)
 	if err != nil {
@@ -158,7 +193,7 @@ func saveSuiteIdentityReceiptWithDependencies(roots SuiteUserRoots, receipt Suit
 		_ = file.Close()
 		return ErrSuiteIdentityReceipt
 	}
-	if err := dependencies.Write(file, opened, append(raw, '\n'), recovery); err != nil {
+	if err := dependencies.Write(file, opened, raw, recovery); err != nil {
 		_ = file.Close()
 		return ErrSuiteIdentityReceipt
 	}

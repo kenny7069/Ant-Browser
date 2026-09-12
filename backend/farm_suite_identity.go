@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -113,14 +112,18 @@ func runSuiteCanonicalIdentityWithDependencies(ctx context.Context, bootstrap Bo
 		return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
 	}
 	ref, err := suiteBootstrapEnrollmentIdentityRef(transport.DeploymentUID, preparation.RequestUID)
-	if err != nil || inspectSuiteIdentityFootprint(roots, bootstrap, preparation.RequestUID, ref) != nil {
+	if err != nil {
+		return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
+	}
+	artifact, err := inspectSuiteIdentityReceiptArtifact(roots)
+	if err != nil || (checkpoint.Stage == SetupIdentityReady && !artifact.Present) || inspectSuiteIdentityFootprint(roots, bootstrap, preparation.RequestUID, ref, checkpoint.Stage == SetupTransportVerified && !artifact.Present) != nil {
 		return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
 	}
 	store, err := deps.NewStore(roots.AgentState)
 	if err != nil || store == nil {
 		return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
 	}
-	key, err := loadOrCreateSuiteCanonicalIdentity(store, ref, deps.Random, deps.AfterIdentitySave)
+	key, err := loadOrCreateSuiteCanonicalIdentity(store, ref, !artifact.Present && checkpoint.Stage == SetupTransportVerified, deps.Random, deps.AfterIdentitySave)
 	if err != nil {
 		return SuiteCanonicalIdentityResult{}, err
 	}
@@ -136,19 +139,17 @@ func runSuiteCanonicalIdentityWithDependencies(ctx context.Context, bootstrap Bo
 		return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
 	}
 	receipt := SuiteIdentityReceipt{SchemaVersion: 1, RequestUID: preparation.RequestUID, SetupStageID: plan.StageID, BootstrapSHA256: preparation.BootstrapSHA256, ManifestSHA256: plan.ManifestSHA256, ConfigDraftSHA256: draftDigest, DiscoverySHA256: transport.DiscoverySHA256, DeploymentUID: transport.DeploymentUID, IdentityRef: string(ref), PublicKeySHA256: hex.EncodeToString(publicDigest[:]), StoreKind: suiteIdentityStoreKind}
+	canonicalReceipt, err := marshalSuiteIdentityReceipt(receipt)
+	if err != nil || (artifact.Receipt != nil && *artifact.Receipt != receipt) || (artifact.Present && artifact.Receipt == nil && !suiteIdentityReceiptRecoveryMatches(artifact.Raw, canonicalReceipt)) {
+		return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
+	}
 	if receipt.validate() != nil || revalidateSuiteIdentityEvidence(ctx, bootstrap, roots, release, installedSuiteRoot, layout, installed, applicationInfo, *preparation, *plan, *checkpoint, stage, *draft, *transport, receipt, store, ref, false, deps) != nil {
 		return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
 	}
-	existing, err := LoadSuiteIdentityReceipt(roots)
-	if err != nil && checkpoint.Stage == SetupTransportVerified {
-		_, raw, recoveryErr := readSuiteTransportReceiptRecoveryCandidate(roots, filepath.Join(roots.AgentState, SuiteIdentityReceiptName))
-		if recoveryErr != nil || len(raw) > suiteIdentityReceiptMaxBytes || json.Valid(raw) {
-			return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
-		}
-		existing = nil
-		err = nil
-	}
-	if err != nil || (existing != nil && *existing != receipt) || (checkpoint.Stage == SetupIdentityReady && existing == nil) {
+	existingArtifact, err := inspectSuiteIdentityReceiptArtifact(roots)
+	if err != nil || (existingArtifact.Receipt != nil && *existingArtifact.Receipt != receipt) ||
+		(existingArtifact.Present && existingArtifact.Receipt == nil && !suiteIdentityReceiptRecoveryMatches(existingArtifact.Raw, canonicalReceipt)) ||
+		(checkpoint.Stage == SetupIdentityReady && existingArtifact.Receipt == nil) {
 		return SuiteCanonicalIdentityResult{}, ErrSuiteCanonicalIdentity
 	}
 	if err := deps.SaveReceipt(roots, receipt); err != nil {
@@ -171,23 +172,25 @@ func runSuiteCanonicalIdentityWithDependencies(ctx context.Context, bootstrap Bo
 	return SuiteCanonicalIdentityResult{Stage: SetupIdentityReady, RequestUID: preparation.RequestUID, ManifestSHA256: plan.ManifestSHA256, SetupStageID: plan.StageID, DiscoverySHA256: transport.DiscoverySHA256, IdentityRef: string(ref), PublicKeySHA256: receipt.PublicKeySHA256}, nil
 }
 
-func loadOrCreateSuiteCanonicalIdentity(store FarmClientIdentityStore, ref FarmClientIdentityKeyRef, random io.Reader, afterSave func() error) (ed25519.PrivateKey, error) {
+func loadOrCreateSuiteCanonicalIdentity(store FarmClientIdentityStore, ref FarmClientIdentityKeyRef, allowCreate bool, random io.Reader, afterSave func() error) (ed25519.PrivateKey, error) {
 	key, err := store.Load(ref)
-	if errors.Is(err, ErrFarmClientIdentityKeyNotFound) {
+	if errors.Is(err, ErrFarmClientIdentityKeyNotFound) && allowCreate {
 		seed := make([]byte, ed25519.SeedSize)
+		defer clearBytes(seed)
 		if _, err := io.ReadFull(random, seed); err != nil {
-			clearBytes(seed)
 			return nil, ErrSuiteCanonicalIdentity
 		}
 		if err := store.Save(ref, seed); err != nil {
-			clearBytes(seed)
 			return nil, ErrSuiteCanonicalIdentity
 		}
-		clearBytes(seed)
 		if afterSave != nil && afterSave() != nil {
 			return nil, ErrSuiteCanonicalIdentity
 		}
 		key, err = store.Load(ref)
+		if err == nil && (len(key) != ed25519.PrivateKeySize || !equalBytes(key[:ed25519.SeedSize], seed)) {
+			clearBytes(key)
+			return nil, ErrSuiteCanonicalIdentity
+		}
 	}
 	if err != nil || len(key) != ed25519.PrivateKeySize {
 		if key != nil {
@@ -210,7 +213,7 @@ func suiteIdentityTransportMatchesChain(receipt SuiteTransportReceipt, preparati
 }
 
 func revalidateSuiteIdentityEvidence(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, installedRoot string, layout *suitePrecheckRootLayoutSnapshot, installed suiteStageInstallEvidence, application os.FileInfo, preparation SetupPreparationCheckpoint, plan SuiteSetupPlan, checkpoint SetupCheckpoint, stage SuiteStageReceipt, draft SuiteClientConfigDraft, transport SuiteTransportReceipt, receipt SuiteIdentityReceipt, store FarmClientIdentityStore, ref FarmClientIdentityKeyRef, requireReceipt bool, deps suiteCanonicalIdentityDependencies) error {
-	if ctx.Err() != nil || layout.revalidate(roots, installedRoot) != nil || inspectSuiteIdentityFootprint(roots, bootstrap, preparation.RequestUID, ref) != nil {
+	if ctx.Err() != nil || layout.revalidate(roots, installedRoot) != nil || inspectSuiteIdentityFootprint(roots, bootstrap, preparation.RequestUID, ref, false) != nil {
 		return ErrSuiteCanonicalIdentity
 	}
 	confirmedPreparation, confirmedPlan, err := loadSuitePrecheckProofChain(bootstrap, roots, release)
@@ -243,19 +246,17 @@ func revalidateSuiteIdentityEvidence(ctx context.Context, bootstrap BootstrapCon
 	if hex.EncodeToString(digest[:]) != receipt.PublicKeySHA256 {
 		return ErrSuiteCanonicalIdentity
 	}
-	confirmedReceipt, err := LoadSuiteIdentityReceipt(roots)
-	if err != nil && !requireReceipt {
-		_, raw, recoveryErr := readSuiteTransportReceiptRecoveryCandidate(roots, filepath.Join(roots.AgentState, SuiteIdentityReceiptName))
-		if recoveryErr != nil || len(raw) > suiteIdentityReceiptMaxBytes || json.Valid(raw) {
-			return ErrSuiteCanonicalIdentity
-		}
-	} else if err != nil || (confirmedReceipt != nil && *confirmedReceipt != receipt) || (requireReceipt && confirmedReceipt == nil) {
+	confirmedArtifact, err := inspectSuiteIdentityReceiptArtifact(roots)
+	canonicalReceipt, marshalErr := marshalSuiteIdentityReceipt(receipt)
+	if err != nil || marshalErr != nil || (confirmedArtifact.Receipt != nil && *confirmedArtifact.Receipt != receipt) ||
+		(confirmedArtifact.Present && confirmedArtifact.Receipt == nil && !suiteIdentityReceiptRecoveryMatches(confirmedArtifact.Raw, canonicalReceipt)) ||
+		(requireReceipt && confirmedArtifact.Receipt == nil) {
 		return ErrSuiteCanonicalIdentity
 	}
 	return nil
 }
 
-func inspectSuiteIdentityFootprint(roots SuiteUserRoots, bootstrap BootstrapConfig, requestUID string, ref FarmClientIdentityKeyRef) error {
+func inspectSuiteIdentityFootprint(roots SuiteUserRoots, bootstrap BootstrapConfig, requestUID string, ref FarmClientIdentityKeyRef, allowEmptyStore bool) error {
 	checkpoint, err := LoadSetupCheckpoint(bootstrap.StatePath)
 	if err != nil || checkpoint == nil || checkpoint.RequestUID != requestUID || (checkpoint.Stage != SetupTransportVerified && checkpoint.Stage != SetupIdentityReady) {
 		return ErrSuiteCanonicalIdentity
@@ -283,7 +284,7 @@ func inspectSuiteIdentityFootprint(roots SuiteUserRoots, bootstrap BootstrapConf
 				return ErrSuiteCanonicalIdentity
 			}
 			if root == roots.AgentState && entry.Name() == farmClientIdentityStoreDir {
-				if !info.IsDir() || validateSuiteIdentityStoreDirectory(path, roots.AgentState, ref) != nil {
+				if !info.IsDir() || validateSuiteIdentityStoreDirectory(path, roots.AgentState, ref, allowEmptyStore) != nil {
 					return ErrSuiteCanonicalIdentity
 				}
 			} else if !info.Mode().IsRegular() {
@@ -305,7 +306,7 @@ func inspectSuiteIdentityFootprint(roots SuiteUserRoots, bootstrap BootstrapConf
 	return err
 }
 
-func validateSuiteIdentityStoreDirectory(path, root string, ref FarmClientIdentityKeyRef) error {
+func validateSuiteIdentityStoreDirectory(path, root string, ref FarmClientIdentityKeyRef, allowEmpty bool) error {
 	info, err := os.Lstat(path)
 	_, resolvedInfo, resolveErr := suitePrecheckResolvedPath(path)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || validateSuiteSetupPathSecurity(path, true) != nil || resolveErr != nil || resolvedInfo == nil || !os.SameFile(info, resolvedInfo) {
@@ -316,7 +317,18 @@ func validateSuiteIdentityStoreDirectory(path, root string, ref FarmClientIdenti
 		return ErrSuiteCanonicalIdentity
 	}
 	entries, err := os.ReadDir(path)
-	if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(expected) {
+	if err != nil {
+		return ErrSuiteCanonicalIdentity
+	}
+	if allowEmpty && len(entries) == 0 {
+		finalInfo, finalErr := os.Lstat(path)
+		finalEntries, entriesErr := os.ReadDir(path)
+		if finalErr != nil || !os.SameFile(info, finalInfo) || entriesErr != nil || len(finalEntries) != 0 || validateSuiteSetupPathSecurity(path, true) != nil {
+			return ErrSuiteCanonicalIdentity
+		}
+		return nil
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(expected) {
 		return ErrSuiteCanonicalIdentity
 	}
 	child, err := os.Lstat(expected)
