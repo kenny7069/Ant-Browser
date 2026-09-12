@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -365,5 +366,162 @@ func TestSuitePreparationCheckpointRejectsCanonicalStage(t *testing.T) {
 	}
 	if err := saveSetupPreparationCheckpoint(filepath.Join(roots.AgentState, suitePreparationStateName), checkpoint); !errors.Is(err, ErrSuiteSetupCorrupt) {
 		t.Fatalf("canonical stage accepted as preparation: %v", err)
+	}
+}
+
+func TestSuiteSetupMigratesAllLegacyPreparationStages(t *testing.T) {
+	requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+	for _, stage := range []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafted} {
+		t.Run(string(stage), func(t *testing.T) {
+			roots, config := setupEngineFixture(t)
+			for _, candidate := range []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafted} {
+				if setupStageIndex(candidate) > setupStageIndex(stage) {
+					break
+				}
+				if err := SaveSetupCheckpoint(config.StatePath, SetupCheckpoint{SchemaVersion: 1, Stage: candidate, RequestUID: requestUID}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if stage == SetupConfigDrafted {
+				if err := writeBootstrapDraft(filepath.Join(roots.Config, suiteBootstrapDraftName), config); err != nil {
+					t.Fatal(err)
+				}
+			}
+			classification, err := ClassifySuiteSetup(roots, config)
+			if err != nil || classification != SuiteSetupExisting {
+				t.Fatalf("legacy classification = %q, %v", classification, err)
+			}
+			coordinator, err := NewSuiteSetupCoordinatorWithRoots(config, roots)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := coordinator.Run()
+			if err != nil || result.Checkpoint.Stage != SetupBootstrapDrafted || result.Checkpoint.RequestUID != requestUID {
+				t.Fatalf("migration result = %+v, %v", result, err)
+			}
+			if _, err := os.Stat(config.StatePath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("legacy canonical primary remains: %v", err)
+			}
+			archive := legacyArchivePath(config.StatePath, requestUID)
+			if _, err := os.Stat(archive); err != nil {
+				t.Fatalf("legacy primary was not preserved: %v", err)
+			}
+			checkpoint, err := loadSetupPreparationCheckpoint(filepath.Join(roots.AgentState, suitePreparationStateName))
+			if err != nil || checkpoint.RequestUID != requestUID {
+				t.Fatalf("preparation checkpoint = %+v, %v", checkpoint, err)
+			}
+		})
+	}
+}
+
+func TestSuiteSetupLegacyMigrationRecoversBackupAndJournalRetry(t *testing.T) {
+	t.Run("truncated primary uses backup", func(t *testing.T) {
+		roots, config := setupEngineFixture(t)
+		if err := os.MkdirAll(roots.AgentState, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+		if err := os.WriteFile(config.StatePath, []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		backup, _ := json.Marshal(SetupCheckpoint{SchemaVersion: 1, Stage: SetupPrecheck, RequestUID: requestUID})
+		if err := os.WriteFile(config.StatePath+".bak", backup, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		coordinator, _ := NewSuiteSetupCoordinatorWithRoots(config, roots)
+		result, err := coordinator.Run()
+		if err != nil || result.Checkpoint.RequestUID != requestUID || result.Checkpoint.Stage != SetupBootstrapDrafted {
+			t.Fatalf("backup recovery = %+v, %v", result, err)
+		}
+		for _, source := range []string{config.StatePath, config.StatePath + ".bak"} {
+			if _, err := os.Stat(source); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("legacy source remains: %s: %v", source, err)
+			}
+		}
+	})
+
+	t.Run("journal resumes after partial archival", func(t *testing.T) {
+		roots, config := setupEngineFixture(t)
+		requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+		if err := SaveSetupCheckpoint(config.StatePath, SetupCheckpoint{SchemaVersion: 1, Stage: SetupPrecheck, RequestUID: requestUID}); err != nil {
+			t.Fatal(err)
+		}
+		if err := SaveSetupCheckpoint(config.StatePath, SetupCheckpoint{SchemaVersion: 1, Stage: SetupStaged, RequestUID: requestUID}); err != nil {
+			t.Fatal(err)
+		}
+		migration, err := inspectLegacySetupMigration(roots, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		marker, _ := json.Marshal(migration)
+		if err := writeOwnerAtomic(filepath.Join(roots.AgentState, suiteMigrationStateName), append(marker, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		input := SetupPreparationCheckpoint{SchemaVersion: 1, Stage: SetupInputValidated, RequestUID: requestUID, BootstrapSHA256: migration.BootstrapSHA256}
+		if err := saveSetupPreparationCheckpoint(filepath.Join(roots.AgentState, suitePreparationStateName), input); err != nil {
+			t.Fatal(err)
+		}
+		if err := archiveLegacySetupFile(config.StatePath, legacyArchivePath(config.StatePath, requestUID), migration.primaryRaw); err != nil {
+			t.Fatal(err)
+		}
+		coordinator, _ := NewSuiteSetupCoordinatorWithRoots(config, roots)
+		result, err := coordinator.Run()
+		if err != nil || result.Checkpoint.Stage != SetupBootstrapDrafted || result.Checkpoint.RequestUID != requestUID {
+			t.Fatalf("journal retry = %+v, %v", result, err)
+		}
+		if _, err := os.Stat(filepath.Join(roots.AgentState, suiteMigrationStateName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("migration marker remains: %v", err)
+		}
+	})
+}
+
+func TestSuiteSetupRejectsInvalidLegacyPreparation(t *testing.T) {
+	requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, roots SuiteUserRoots, config BootstrapConfig)
+	}{
+		{"mismatched draft", func(t *testing.T, roots SuiteUserRoots, config BootstrapConfig) {
+			for _, stage := range []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafted} {
+				if err := SaveSetupCheckpoint(config.StatePath, SetupCheckpoint{SchemaVersion: 1, Stage: stage, RequestUID: requestUID}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			other := config
+			other.NodeName = "Other Node"
+			if err := writeBootstrapDraft(filepath.Join(roots.Config, suiteBootstrapDraftName), other); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"unknown secret field", func(t *testing.T, roots SuiteUserRoots, config BootstrapConfig) {
+			if err := os.MkdirAll(roots.AgentState, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			raw := `{"schema_version":1,"stage":"PRECHECK","request_uid":"` + requestUID + `","private_key":"secret"}`
+			if err := os.WriteFile(config.StatePath, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"unsafe mode", func(t *testing.T, roots SuiteUserRoots, config BootstrapConfig) {
+			if runtime.GOOS == "windows" {
+				t.Skip("native Windows DACL test required")
+			}
+			if err := os.MkdirAll(roots.AgentState, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			raw, _ := json.Marshal(SetupCheckpoint{SchemaVersion: 1, Stage: SetupPrecheck, RequestUID: requestUID})
+			if err := os.WriteFile(config.StatePath, raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			roots, config := setupEngineFixture(t)
+			tc.build(t, roots, config)
+			classification, err := ClassifySuiteSetup(roots, config)
+			if classification != SuiteSetupCorrupt || !errors.Is(err, ErrSuiteSetupCorrupt) {
+				t.Fatalf("invalid legacy classification = %q, %v", classification, err)
+			}
+		})
 	}
 }

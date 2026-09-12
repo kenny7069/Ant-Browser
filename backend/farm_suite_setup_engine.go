@@ -18,6 +18,7 @@ import (
 const (
 	suiteSetupLockName        = "setup.lock"
 	suitePreparationStateName = "setup-preparation.json"
+	suiteMigrationStateName   = "setup-preparation-migration.json"
 	suiteBootstrapDraftName   = "bootstrap.json"
 
 	// Preparation stages are deliberately outside setupStageOrder. They record
@@ -50,6 +51,17 @@ type SetupPreparationCheckpoint struct {
 	Stage           SetupStage `json:"stage"`
 	RequestUID      string     `json:"request_uid"`
 	BootstrapSHA256 string     `json:"bootstrap_sha256"`
+}
+
+type legacySetupMigration struct {
+	SchemaVersion   int        `json:"schema_version"`
+	Stage           SetupStage `json:"stage"`
+	RequestUID      string     `json:"request_uid"`
+	BootstrapSHA256 string     `json:"bootstrap_sha256"`
+	PrimarySHA256   string     `json:"primary_sha256,omitempty"`
+	BackupSHA256    string     `json:"backup_sha256,omitempty"`
+	primaryRaw      []byte
+	backupRaw       []byte
 }
 
 func preparationStageIndex(stage SetupStage) int {
@@ -141,6 +153,15 @@ func (c *SuiteSetupCoordinator) Run() (SuiteSetupResult, error) {
 		return SuiteSetupResult{}, err
 	}
 	defer lock.release()
+	legacy, err := inspectLegacySetupMigration(c.Roots, config)
+	if err != nil {
+		return SuiteSetupResult{Classification: SuiteSetupCorrupt, BootstrapPath: c.bootstrapPath()}, err
+	}
+	if legacy != nil {
+		if err := migrateLegacySetupPreparation(c.Roots, config, legacy); err != nil {
+			return SuiteSetupResult{Classification: SuiteSetupExisting, BootstrapPath: c.bootstrapPath()}, err
+		}
+	}
 
 	classification, checkpoint, err := classifySuiteSetup(c.Roots, config)
 	result := SuiteSetupResult{Classification: classification, BootstrapPath: c.bootstrapPath()}
@@ -218,19 +239,16 @@ func ClassifySuiteSetup(roots SuiteUserRoots, config BootstrapConfig) (SuiteSetu
 }
 
 func classifySuiteSetup(roots SuiteUserRoots, config BootstrapConfig) (SuiteSetupClassification, *SetupPreparationCheckpoint, error) {
-	// The canonical checkpoint is not read or advanced here. Rejecting a
-	// redirected destination still prevents a later canonical phase from
-	// following a setup-created symlink.
-	for _, path := range []string{config.StatePath, config.StatePath + ".bak"} {
-		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-			return SuiteSetupCorrupt, nil, fmt.Errorf("%w: canonical checkpoint is a symlink", ErrSuiteSetupCorrupt)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return SuiteSetupCorrupt, nil, fmt.Errorf("%w: canonical checkpoint metadata unavailable", ErrSuiteSetupCorrupt)
-		}
-	}
 	checkpoint, checkpointErr := loadSetupPreparationCheckpoint(filepath.Join(roots.AgentState, suitePreparationStateName))
 	if checkpointErr != nil {
 		return SuiteSetupCorrupt, nil, fmt.Errorf("%w: preparation checkpoint: %v", ErrSuiteSetupCorrupt, checkpointErr)
+	}
+	legacy, legacyErr := inspectLegacySetupMigration(roots, config)
+	if legacyErr != nil {
+		return SuiteSetupCorrupt, nil, legacyErr
+	}
+	if legacy != nil {
+		return SuiteSetupExisting, checkpoint, nil
 	}
 	draft, draftExists, draftErr := loadBootstrapDraft(filepath.Join(roots.Config, suiteBootstrapDraftName))
 	if draftErr != nil {
@@ -261,6 +279,282 @@ func classifySuiteSetup(roots SuiteUserRoots, config BootstrapConfig) (SuiteSetu
 		return SuiteSetupCorrupt, nil, fmt.Errorf("%w: pending bootstrap draft does not match request", ErrSuiteSetupCorrupt)
 	}
 	return SuiteSetupExisting, checkpoint, nil
+}
+
+func inspectLegacySetupMigration(roots SuiteUserRoots, config BootstrapConfig) (*legacySetupMigration, error) {
+	markerPath := filepath.Join(roots.AgentState, suiteMigrationStateName)
+	if raw, exists, err := readOwnerFile(markerPath); err != nil {
+		return nil, fmt.Errorf("%w: migration marker: %v", ErrSuiteSetupCorrupt, err)
+	} else if exists {
+		var marker legacySetupMigration
+		if err := decodeStrictJSON(raw, &marker); err != nil || marker.validate() != nil {
+			return nil, fmt.Errorf("%w: invalid migration marker", ErrSuiteSetupCorrupt)
+		}
+		digest, _ := bootstrapConfigDigest(config)
+		if marker.BootstrapSHA256 != digest {
+			return nil, fmt.Errorf("%w: migration input mismatch", ErrSuiteSetupCorrupt)
+		}
+		if err := hydrateLegacyMigration(&marker, config); err != nil {
+			return nil, err
+		}
+		return &marker, nil
+	}
+
+	primaryRaw, primaryExists, primaryReadErr := readOwnerFile(config.StatePath)
+	backupRaw, backupExists, backupReadErr := readOwnerFile(config.StatePath + ".bak")
+	if primaryReadErr != nil || backupReadErr != nil {
+		return nil, fmt.Errorf("%w: unsafe legacy checkpoint", ErrSuiteSetupCorrupt)
+	}
+	if !primaryExists && !backupExists {
+		return nil, nil
+	}
+	for _, raw := range [][]byte{primaryRaw, backupRaw} {
+		if legacyRawContainsForbiddenField(raw) {
+			return nil, fmt.Errorf("%w: legacy checkpoint contains forbidden field", ErrSuiteSetupCorrupt)
+		}
+	}
+	primary, primaryErr := decodeLegacySetupCheckpoint(primaryRaw, primaryExists)
+	backup, backupErr := decodeLegacySetupCheckpoint(backupRaw, backupExists)
+	if backupErr != nil {
+		return nil, fmt.Errorf("%w: invalid legacy backup", ErrSuiteSetupCorrupt)
+	}
+	if primaryErr != nil && !(backup != nil && errors.Is(primaryErr, io.ErrUnexpectedEOF)) {
+		return nil, fmt.Errorf("%w: invalid legacy primary", ErrSuiteSetupCorrupt)
+	}
+	target := primary
+	if target == nil {
+		target = backup
+	}
+	if target == nil {
+		return nil, fmt.Errorf("%w: no recoverable legacy checkpoint", ErrSuiteSetupCorrupt)
+	}
+	if backup != nil && (backup.RequestUID != target.RequestUID || setupStageIndex(backup.Stage) > setupStageIndex(target.Stage)) {
+		return nil, fmt.Errorf("%w: legacy backup mismatch", ErrSuiteSetupCorrupt)
+	}
+	draft, draftExists, err := loadBootstrapDraft(filepath.Join(roots.Config, suiteBootstrapDraftName))
+	if err != nil {
+		return nil, fmt.Errorf("%w: legacy bootstrap draft: %v", ErrSuiteSetupCorrupt, err)
+	}
+	if target.Stage == SetupConfigDrafted && (!draftExists || *draft != config) {
+		return nil, fmt.Errorf("%w: legacy CONFIG_DRAFTED draft mismatch", ErrSuiteSetupCorrupt)
+	}
+	if target.Stage != SetupConfigDrafted && draftExists && *draft != config {
+		return nil, fmt.Errorf("%w: legacy pending draft mismatch", ErrSuiteSetupCorrupt)
+	}
+	digest, _ := bootstrapConfigDigest(config)
+	migration := &legacySetupMigration{
+		SchemaVersion: 1, Stage: legacyPreparationStage(target.Stage), RequestUID: target.RequestUID,
+		BootstrapSHA256: digest, primaryRaw: primaryRaw, backupRaw: backupRaw,
+	}
+	if primaryExists {
+		migration.PrimarySHA256 = bytesDigest(primaryRaw)
+	}
+	if backupExists {
+		migration.BackupSHA256 = bytesDigest(backupRaw)
+	}
+	return migration, nil
+}
+
+func (m *legacySetupMigration) validate() error {
+	checkpoint := SetupPreparationCheckpoint{
+		SchemaVersion: m.SchemaVersion, Stage: m.Stage, RequestUID: m.RequestUID, BootstrapSHA256: m.BootstrapSHA256,
+	}
+	if err := checkpoint.validate(); err != nil {
+		return err
+	}
+	for _, digest := range []string{m.PrimarySHA256, m.BackupSHA256} {
+		if digest == "" {
+			continue
+		}
+		decoded, err := hex.DecodeString(digest)
+		if err != nil || len(decoded) != sha256.Size || hex.EncodeToString(decoded) != digest {
+			return ErrSuiteSetupCorrupt
+		}
+	}
+	if m.PrimarySHA256 == "" && m.BackupSHA256 == "" {
+		return ErrSuiteSetupCorrupt
+	}
+	return nil
+}
+
+func hydrateLegacyMigration(migration *legacySetupMigration, config BootstrapConfig) error {
+	for _, item := range []struct {
+		source, archive, digest string
+		destination             *[]byte
+	}{
+		{config.StatePath, legacyArchivePath(config.StatePath, migration.RequestUID), migration.PrimarySHA256, &migration.primaryRaw},
+		{config.StatePath + ".bak", legacyArchivePath(config.StatePath+".bak", migration.RequestUID), migration.BackupSHA256, &migration.backupRaw},
+	} {
+		if item.digest == "" {
+			continue
+		}
+		raw, exists, err := readOwnerFile(item.source)
+		if err != nil {
+			return fmt.Errorf("%w: unsafe legacy source", ErrSuiteSetupCorrupt)
+		}
+		if !exists {
+			raw, exists, err = readOwnerFile(item.archive)
+		}
+		if err != nil || !exists || bytesDigest(raw) != item.digest || legacyRawContainsForbiddenField(raw) {
+			return fmt.Errorf("%w: legacy migration evidence mismatch", ErrSuiteSetupCorrupt)
+		}
+		*item.destination = raw
+	}
+	return nil
+}
+
+func migrateLegacySetupPreparation(roots SuiteUserRoots, config BootstrapConfig, migration *legacySetupMigration) error {
+	markerPath := filepath.Join(roots.AgentState, suiteMigrationStateName)
+	markerRaw, err := json.Marshal(migration)
+	if err != nil {
+		return err
+	}
+	if existing, exists, err := readOwnerFile(markerPath); err != nil {
+		return err
+	} else if !exists {
+		if err := writeOwnerAtomic(markerPath, append(markerRaw, '\n')); err != nil {
+			return err
+		}
+	} else {
+		var stored legacySetupMigration
+		if decodeStrictJSON(existing, &stored) != nil || !legacyMigrationEqual(&stored, migrationWithoutRaw(migration)) {
+			return fmt.Errorf("%w: migration marker mismatch", ErrSuiteSetupCorrupt)
+		}
+	}
+
+	preparationPath := filepath.Join(roots.AgentState, suitePreparationStateName)
+	current, err := loadSetupPreparationCheckpoint(preparationPath)
+	if err != nil {
+		return err
+	}
+	if current != nil && (current.RequestUID != migration.RequestUID || current.BootstrapSHA256 != migration.BootstrapSHA256) {
+		return fmt.Errorf("%w: preparation checkpoint conflicts with migration", ErrSuiteSetupCorrupt)
+	}
+	start := 0
+	if current != nil {
+		start = preparationStageIndex(current.Stage) + 1
+	}
+	if preparationStageIndex(migration.Stage) >= preparationStageIndex(SetupUserRootsReady) {
+		if err := ensureSuiteOwnerRoots(roots); err != nil {
+			return err
+		}
+	}
+	for index := start; index <= preparationStageIndex(migration.Stage); index++ {
+		next := SetupPreparationCheckpoint{
+			SchemaVersion: 1, Stage: setupPreparationStageOrder[index], RequestUID: migration.RequestUID,
+			BootstrapSHA256: migration.BootstrapSHA256,
+		}
+		if err := saveSetupPreparationCheckpoint(preparationPath, next); err != nil {
+			return err
+		}
+	}
+	for _, item := range []struct {
+		source, archive, digest string
+		raw                     []byte
+	}{
+		{config.StatePath, legacyArchivePath(config.StatePath, migration.RequestUID), migration.PrimarySHA256, migration.primaryRaw},
+		{config.StatePath + ".bak", legacyArchivePath(config.StatePath+".bak", migration.RequestUID), migration.BackupSHA256, migration.backupRaw},
+	} {
+		if item.digest == "" {
+			continue
+		}
+		if err := archiveLegacySetupFile(item.source, item.archive, item.raw); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncSuiteSetupDirectory(roots.AgentState)
+}
+
+func archiveLegacySetupFile(source, archive string, raw []byte) error {
+	if stored, exists, err := readOwnerFile(archive); err != nil {
+		return err
+	} else if exists && !bytes.Equal(stored, raw) {
+		return fmt.Errorf("%w: legacy archive mismatch", ErrSuiteSetupCorrupt)
+	} else if !exists {
+		if err := writeOwnerAtomic(archive, raw); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(source); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncSuiteSetupDirectory(filepath.Dir(source))
+}
+
+func decodeLegacySetupCheckpoint(raw []byte, exists bool) (*SetupCheckpoint, error) {
+	if !exists {
+		return nil, nil
+	}
+	var checkpoint SetupCheckpoint
+	if err := decodeStrictJSON(raw, &checkpoint); err != nil {
+		return nil, err
+	}
+	if err := checkpoint.validate(); err != nil {
+		return nil, err
+	}
+	switch checkpoint.Stage {
+	case SetupPrecheck, SetupStaged, SetupConfigDrafted:
+		return &checkpoint, nil
+	default:
+		return nil, ErrSuiteSetupCorrupt
+	}
+}
+
+func decodeStrictJSON(raw []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func legacyPreparationStage(stage SetupStage) SetupStage {
+	switch stage {
+	case SetupPrecheck:
+		return SetupInputValidated
+	case SetupStaged:
+		return SetupUserRootsReady
+	case SetupConfigDrafted:
+		return SetupBootstrapDrafted
+	default:
+		return ""
+	}
+}
+
+func legacyRawContainsForbiddenField(raw []byte) bool {
+	lower := strings.ToLower(string(raw))
+	for _, field := range []string{"\"private_key\"", "\"enrollment_code\"", "\"password\"", "\"cookie\""} {
+		if strings.Contains(lower, field) {
+			return true
+		}
+	}
+	return false
+}
+
+func bytesDigest(raw []byte) string {
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
+}
+
+func legacyArchivePath(path, requestUID string) string {
+	return path + ".legacy-preparation." + requestUID
+}
+
+func migrationWithoutRaw(migration *legacySetupMigration) *legacySetupMigration {
+	copy := *migration
+	copy.primaryRaw = nil
+	copy.backupRaw = nil
+	return &copy
+}
+
+func legacyMigrationEqual(left, right *legacySetupMigration) bool {
+	return left != nil && right != nil && left.SchemaVersion == right.SchemaVersion && left.Stage == right.Stage &&
+		left.RequestUID == right.RequestUID && left.BootstrapSHA256 == right.BootstrapSHA256 &&
+		left.PrimarySHA256 == right.PrimarySHA256 && left.BackupSHA256 == right.BackupSHA256
 }
 
 func validateSuiteSetupInputs(config *BootstrapConfig, roots SuiteUserRoots) error {
