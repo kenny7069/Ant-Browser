@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -27,15 +28,23 @@ func TestBootstrapConfigRejectsUntrustedShape(t *testing.T) {
 }
 
 func TestSuiteUserRoots(t *testing.T) {
+	// Use paths native to the runner. filepath.IsAbs("/users/farmer") is false
+	// on Windows, even when the case is modelling a different target OS.
+	base := t.TempDir()
+	home := filepath.Join(base, "farmer")
+	localAppData := filepath.Join(home, "AppData", "Local")
+	xdgConfig := filepath.Join(base, "xdg", "config")
+	xdgData := filepath.Join(base, "xdg", "data")
+	xdgState := filepath.Join(base, "xdg", "state")
 	env := func(key string) string {
-		return map[string]string{"LOCALAPPDATA": "/users/farmer/AppData/Local", "XDG_CONFIG_HOME": "/xdg/config", "XDG_DATA_HOME": "/xdg/data", "XDG_STATE_HOME": "/xdg/state"}[key]
+		return map[string]string{"LOCALAPPDATA": localAppData, "XDG_CONFIG_HOME": xdgConfig, "XDG_DATA_HOME": xdgData, "XDG_STATE_HOME": xdgState}[key]
 	}
 	for _, tc := range []struct{ os, expected string }{
-		{"windows", filepath.Join("/users/farmer/AppData/Local", "AntSuite", "browser-data")},
-		{"linux", filepath.Join("/xdg/data", "AntSuite", "browser-data")},
-		{"darwin", filepath.Join("/users/farmer", "Library", "Application Support", "AntSuite", "browser-data")},
+		{"windows", filepath.Join(localAppData, "AntSuite", "browser-data")},
+		{"linux", filepath.Join(xdgData, "AntSuite", "browser-data")},
+		{"darwin", filepath.Join(home, "Library", "Application Support", "AntSuite", "browser-data")},
 	} {
-		roots, err := resolveSuiteUserRoots(tc.os, "/users/farmer", env)
+		roots, err := resolveSuiteUserRoots(tc.os, home, env)
 		if err != nil || roots.BrowserData != tc.expected {
 			t.Errorf("%s roots = %#v, %v", tc.os, roots, err)
 		}
@@ -51,10 +60,10 @@ func TestSuiteUserRoots(t *testing.T) {
 		}
 		return ""
 	}
-	if _, err := resolveSuiteUserRoots("linux", "/users/farmer", badEnv); !errors.Is(err, ErrFarmClientRoots) {
+	if _, err := resolveSuiteUserRoots("linux", home, badEnv); !errors.Is(err, ErrFarmClientRoots) {
 		t.Fatalf("relative XDG data: %v", err)
 	}
-	if _, err := resolveSuiteUserRoots("windows", "/users/farmer", func(string) string { return "" }); !errors.Is(err, ErrFarmClientRoots) {
+	if _, err := resolveSuiteUserRoots("windows", home, func(string) string { return "" }); !errors.Is(err, ErrFarmClientRoots) {
 		t.Fatalf("missing LOCALAPPDATA: %v", err)
 	}
 }
@@ -79,7 +88,7 @@ func TestSetupCheckpointResumesInOrderWithoutSecrets(t *testing.T) {
 		}
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm()&0o077 != 0 {
+	if err != nil || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
 		t.Fatalf("checkpoint permission = %v, %v", info, err)
 	}
 	data, _ := os.ReadFile(path)
@@ -113,5 +122,40 @@ func TestSetupCheckpointRejectsSkippedAndUnknownState(t *testing.T) {
 	}
 	if _, err := LoadSetupCheckpoint(path); !errors.Is(err, ErrSetupCheckpoint) {
 		t.Fatalf("unknown secret field accepted: %v", err)
+	}
+}
+
+func TestSetupCheckpointRecoversInterruptedReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setup.json")
+	requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+	precheck := SetupCheckpoint{SchemaVersion: 1, Stage: SetupPrecheck, RequestUID: requestUID}
+	staged := SetupCheckpoint{SchemaVersion: 1, Stage: SetupStaged, RequestUID: requestUID}
+	if err := SaveSetupCheckpoint(path, precheck); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSetupCheckpoint(path, staged); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"schema_version":1,"stage":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadSetupCheckpoint(path)
+	if err != nil || *loaded != precheck {
+		t.Fatalf("backup recovery = %#v, %v", loaded, err)
+	}
+	if err := SaveSetupCheckpoint(path, staged); err != nil {
+		t.Fatalf("resume after recovery: %v", err)
+	}
+	loaded, err = LoadSetupCheckpoint(path)
+	if err != nil || *loaded != staged {
+		t.Fatalf("resumed checkpoint = %#v, %v", loaded, err)
+	}
+	// An unknown field indicates a schema or security mismatch, not an
+	// interrupted replacement; it must not be hidden by an older backup.
+	if err := os.WriteFile(path, []byte(`{"schema_version":1,"stage":"STAGED","request_uid":"b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6","private_key":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadSetupCheckpoint(path); !errors.Is(err, ErrSetupCheckpoint) {
+		t.Fatalf("unknown field hidden by backup: %v", err)
 	}
 }

@@ -34,6 +34,7 @@ var setupStageOrder = []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafte
 	SetupControlAuthenticated, SetupBrowserSmokePassed, SetupReadyForManagement}
 
 var ErrSetupCheckpoint = errors.New("invalid suite setup checkpoint")
+var errSetupCheckpointUnknownField = errors.New("unknown suite setup checkpoint field")
 
 // SetupCheckpoint records confirmed progress only. RequestUID is a stable,
 // non-secret idempotency token reused after an enrollment response is lost.
@@ -62,12 +63,34 @@ func (c SetupCheckpoint) validate() error {
 	return nil
 }
 
-// LoadSetupCheckpoint returns nil when no setup has begun. Unknown fields are
-// rejected so secret-bearing or newer state cannot be silently accepted.
+// LoadSetupCheckpoint returns nil when no setup has begun. A previous valid
+// checkpoint is retained beside the primary, allowing recovery if a Windows
+// replacement was interrupted. Unknown fields are never silently accepted.
 func LoadSetupCheckpoint(path string) (*SetupCheckpoint, error) {
 	if _, err := validateAbsoluteFarmClientRoot(path, "setup state path"); err != nil {
 		return nil, err
 	}
+	primary, primaryErr := readSetupCheckpointFile(path)
+	if primaryErr == nil && primary != nil {
+		return primary, nil
+	}
+	if errors.Is(primaryErr, errSetupCheckpointUnknownField) {
+		return nil, primaryErr
+	}
+	backup, backupErr := readSetupCheckpointFile(path + ".bak")
+	if backupErr == nil && backup != nil {
+		return backup, nil
+	}
+	if primaryErr != nil {
+		return nil, primaryErr
+	}
+	if backupErr != nil {
+		return nil, backupErr
+	}
+	return nil, nil
+}
+
+func readSetupCheckpointFile(path string) (*SetupCheckpoint, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -79,6 +102,9 @@ func LoadSetupCheckpoint(path string) (*SetupCheckpoint, error) {
 	decoder.DisallowUnknownFields()
 	var checkpoint SetupCheckpoint
 	if err := decoder.Decode(&checkpoint); err != nil {
+		if strings.HasPrefix(err.Error(), "json: unknown field") {
+			return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnknownField)
+		}
 		return nil, fmt.Errorf("%w: decode", ErrSetupCheckpoint)
 	}
 	var extra any
@@ -93,7 +119,9 @@ func LoadSetupCheckpoint(path string) (*SetupCheckpoint, error) {
 
 // SaveSetupCheckpoint writes a single confirmed step. Callers must serialize
 // setup invocations for the same path; this function enforces order and stable
-// request identity, then atomically replaces the on-disk checkpoint.
+// request identity, then replaces the on-disk checkpoint. The previous
+// checkpoint remains in .bak because Go does not promise atomic Rename on
+// non-Unix systems, even though Windows can replace an existing file.
 func SaveSetupCheckpoint(path string, next SetupCheckpoint) error {
 	path, err := validateAbsoluteFarmClientRoot(path, "setup state path")
 	if err != nil {
@@ -106,6 +134,7 @@ func SaveSetupCheckpoint(path string, next SetupCheckpoint) error {
 	if err != nil {
 		return err
 	}
+	sameStage := false
 	if previous == nil {
 		if next.Stage != SetupPrecheck {
 			return fmt.Errorf("%w: first stage must be PRECHECK", ErrSetupCheckpoint)
@@ -115,10 +144,28 @@ func SaveSetupCheckpoint(path string, next SetupCheckpoint) error {
 			setupStageIndex(next.Stage) > setupStageIndex(previous.Stage)+1 {
 			return fmt.Errorf("%w: invalid stage transition", ErrSetupCheckpoint)
 		}
-		if previous.Stage == next.Stage {
+		sameStage = previous.Stage == next.Stage
+	}
+	if previous != nil {
+		// If loading recovered a valid backup, restore the primary before
+		// rotating that backup. An interruption cannot then damage both copies.
+		primary, err := readSetupCheckpointFile(path)
+		if err != nil || primary == nil {
+			if err := writeSetupCheckpointFile(path, *previous); err != nil {
+				return err
+			}
+		}
+		if sameStage {
 			return nil
 		}
+		if err := writeSetupCheckpointFile(path+".bak", *previous); err != nil {
+			return err
+		}
 	}
+	return writeSetupCheckpointFile(path, next)
+}
+
+func writeSetupCheckpointFile(path string, next SetupCheckpoint) error {
 	parent := filepath.Dir(path)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return err
