@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,5 +221,42 @@ func TestFarmClientUpdateProbationRejectsExitedChild(t *testing.T) {
 	}
 	if err := waitFarmClientUpdateProbation(context.Background(), process, healthPath, strings.Repeat("b", 64), time.Second, 100*time.Millisecond); err == nil {
 		t.Fatal("exited child passed probation")
+	}
+}
+
+func TestFarmClientUpdateRevalidationFailureStopsProbationChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process fixture uses the POSIX shell")
+	}
+	controlReader, controlWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("sh", "-c", "cat >/dev/null")
+	command.Stdin = controlReader
+	if err := command.Start(); err != nil {
+		_ = controlReader.Close()
+		_ = controlWriter.Close()
+		t.Fatal(err)
+	}
+	_ = controlReader.Close()
+	process := &farmClientLauncherProcess{command: command, done: make(chan struct{}), control: controlWriter}
+	go func() {
+		process.resultMu.Lock()
+		process.result = command.Wait()
+		process.resultMu.Unlock()
+		close(process.done)
+	}()
+	t.Cleanup(func() { _ = process.command.Process.Kill() })
+	err = revalidateFarmClientLauncherProcess(process, true, "/config", "/launcher", func(string, string) error {
+		return ErrSuiteLauncherRevalidation
+	})
+	if !errors.Is(err, ErrSuiteLauncherRevalidation) {
+		t.Fatalf("revalidation error=%v", err)
+	}
+	select {
+	case <-process.done:
+	case <-time.After(time.Second):
+		t.Fatal("probation child remained live after revalidation failure")
 	}
 }

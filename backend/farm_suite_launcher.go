@@ -15,31 +15,51 @@ var ErrSuiteLauncherRevalidation = errors.New("suite launcher revalidation faile
 // suiteLauncherValidator is deliberately injectable only for focused tests.
 // Production validation always uses the durable Suite evidence and platform
 // adapter; callers cannot provide a path, digest, generation, or pass flag.
-type suiteLauncherValidator func(SuiteUserRoots, string, string) error
+type suiteLauncherValidator func(string, string) error
 
-func RunSuiteFarmClientLauncher(ctx context.Context, roots SuiteUserRoots, configPath, launcherPath string, stdout, stderr io.Writer) error {
-	return runSuiteFarmClientLauncher(ctx, roots, configPath, launcherPath, stdout, stderr, validateSuiteLauncherStart)
+type suiteLauncherPathMatcher func(string, string) bool
+
+// ClassifySuiteFarmClientLaunch decides whether the default invocation belongs
+// to the canonical Suite launcher. Alternate paths with a Suite footprint are
+// rejected before the legacy launcher can acquire a lock, mutate activation
+// state, or spawn a child.
+func ClassifySuiteFarmClientLaunch(roots SuiteUserRoots, configPath string) (bool, error) {
+	return classifySuiteFarmClientLaunch(roots, configPath, sameSuiteHandoffPath)
 }
 
-func runSuiteFarmClientLauncher(ctx context.Context, roots SuiteUserRoots, configPath, launcherPath string, stdout, stderr io.Writer, validate suiteLauncherValidator) error {
-	if validate == nil || validate(roots, configPath, launcherPath) != nil {
+func classifySuiteFarmClientLaunch(roots SuiteUserRoots, configPath string, samePath suiteLauncherPathMatcher) (bool, error) {
+	if err := validateSuiteSetupRoots(roots); err != nil || samePath == nil || !filepath.IsAbs(configPath) {
+		return false, ErrSuiteLauncherRevalidation
+	}
+	canonicalConfig := filepath.Join(roots.Config, SuiteClientConfigName)
+	if samePath(configPath, canonicalConfig) {
+		return true, nil
+	}
+	if err := rejectRawAutostartForSuiteFootprintAtRoots(configPath, roots); err != nil {
+		return false, ErrSuiteLauncherRevalidation
+	}
+	return false, nil
+}
+
+func RunSuiteFarmClientLauncher(ctx context.Context, roots SuiteUserRoots, configPath, launcherPath string, stdout, stderr io.Writer) error {
+	validate := func(configPath, launcherPath string) error {
+		return validateSuiteLauncherStart(roots, configPath, launcherPath)
+	}
+	return runSuiteFarmClientLauncher(ctx, configPath, launcherPath, stdout, stderr, validate)
+}
+
+func runSuiteFarmClientLauncher(ctx context.Context, configPath, launcherPath string, stdout, stderr io.Writer, validate suiteLauncherValidator) error {
+	if validate == nil || validate(configPath, launcherPath) != nil {
 		return ErrSuiteLauncherRevalidation
 	}
 	return runFarmClientLauncherWithValidation(ctx, configPath, launcherPath, stdout, stderr, validate)
 }
 
-func validateSuiteLauncherStartFromConfig(configPath, launcherPath string, validate suiteLauncherValidator) error {
-	roots, err := ResolveSuiteUserRoots()
-	if err != nil {
-		return ErrSuiteLauncherRevalidation
-	}
-	if err := validate(roots, configPath, launcherPath); err != nil {
-		return err
-	}
-	return nil
+func validateSuiteLauncherStart(roots SuiteUserRoots, configPath, launcherPath string) error {
+	return validateSuiteLauncherStartWithPlatform(roots, configPath, launcherPath, newSuiteServicePlatform())
 }
 
-func validateSuiteLauncherStart(roots SuiteUserRoots, configPath, launcherPath string) error {
+func validateSuiteLauncherStartWithPlatform(roots SuiteUserRoots, configPath, launcherPath string, platform suiteServicePlatform) error {
 	if err := validateSuiteSetupRoots(roots); err != nil {
 		return ErrSuiteLauncherRevalidation
 	}
@@ -66,7 +86,9 @@ func validateSuiteLauncherStart(roots SuiteUserRoots, configPath, launcherPath s
 	if journal.Stage != SuiteActivationEnabled && journal.Stage != SuiteActivationStartRequested && journal.Stage != SuiteActivationResidentProved && journal.Stage != SuiteActivationCheckpointWritten {
 		return ErrSuiteLauncherRevalidation
 	}
-	platform := newSuiteServicePlatform()
+	if platform == nil {
+		return ErrSuiteLauncherRevalidation
+	}
 	taskIdentity, err := platform.ValidateInstall(*handoff)
 	if err != nil || strings.TrimSpace(taskIdentity) == "" {
 		return ErrSuiteLauncherRevalidation

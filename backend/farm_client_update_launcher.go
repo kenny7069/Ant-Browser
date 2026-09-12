@@ -93,7 +93,7 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 		if validate != nil {
 			// This fence runs before every activation read that could lead to a
 			// rollback/commit mutation or a child spawn.
-			if err := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); err != nil {
+			if err := validate(configPath, launcherPath); err != nil {
 				return err
 			}
 		}
@@ -121,7 +121,7 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 			// committed, a later child exit is a restart boundary, not failure.
 			if runErr != nil && current.Phase == farmClientUpdatePhaseProbation && current.Pending != nil && current.Pending.SHA256 == pending.SHA256 {
 				if validate != nil {
-					if err := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); err != nil {
+					if err := validate(configPath, launcherPath); err != nil {
 						return err
 					}
 				}
@@ -147,7 +147,7 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 					activation.Phase = farmClientUpdatePhaseStable
 					executableSlot = activation.Active
 					if validate != nil {
-						if err := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); err != nil {
+						if err := validate(configPath, launcherPath); err != nil {
 							return err
 						}
 					}
@@ -158,7 +158,7 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 					activation.Active = nil
 					activation.Previous = nil
 					if validate != nil {
-						if err := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); err != nil {
+						if err := validate(configPath, launcherPath); err != nil {
 							return err
 						}
 					}
@@ -169,7 +169,7 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 			} else {
 				activation.Active = nil
 				if validate != nil {
-					if err := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); err != nil {
+					if err := validate(configPath, launcherPath); err != nil {
 						return err
 					}
 				}
@@ -179,7 +179,7 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 			}
 		}
 		if validate != nil {
-			if err := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); err != nil {
+			if err := validate(configPath, launcherPath); err != nil {
 				return err
 			}
 		}
@@ -218,7 +218,7 @@ func runFarmClientPendingActivation(ctx context.Context, config FarmClientConfig
 	}
 	healthPath := filepath.Join(updateRoot, "health-"+slot.SHA256[:16])
 	if validate != nil {
-		if err := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); err != nil {
+		if err := validate(configPath, launcherPath); err != nil {
 			return err
 		}
 	}
@@ -233,24 +233,30 @@ func runFarmClientPendingActivation(ctx context.Context, config FarmClientConfig
 		return err
 	}
 	if err := waitFarmClientUpdateProbation(ctx, process, healthPath, nonce, config.updateHealthTimeout(), config.updateProbation()); err != nil {
-		if validate != nil {
-			if validationErr := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); validationErr != nil {
-				return validationErr
-			}
+		if validationErr := revalidateFarmClientLauncherProcess(process, ctx.Err() == nil, configPath, launcherPath, validate); validationErr != nil {
+			return validationErr
 		}
 		_ = stopFarmClientAgent(process, ctx.Err() == nil)
 		return err
 	}
-	if validate != nil {
-		if err := validateSuiteLauncherStartFromConfig(configPath, launcherPath, validate); err != nil {
-			return err
-		}
+	if err := revalidateFarmClientLauncherProcess(process, true, configPath, launcherPath, validate); err != nil {
+		return err
 	}
 	if err := CommitFarmClientUpdateActivation(config); err != nil {
 		_ = stopFarmClientAgent(process, true)
 		return err
 	}
 	return waitFarmClientAgent(ctx, process)
+}
+
+func revalidateFarmClientLauncherProcess(process *farmClientLauncherProcess, preserve bool, configPath, launcherPath string, validate suiteLauncherValidator) error {
+	if validate == nil {
+		return nil
+	}
+	if err := validate(configPath, launcherPath); err != nil {
+		return errors.Join(err, stopFarmClientAgent(process, preserve))
+	}
+	return nil
 }
 
 func startFarmClientAgent(config FarmClientConfig, configPath, executablePath string, slot *FarmClientUpdateSlot, healthPath, nonce string, stdout, stderr io.Writer) (*farmClientLauncherProcess, error) {
