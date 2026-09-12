@@ -4,6 +4,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -69,6 +70,35 @@ func TestFarmClientIPCUnixCloseDoesNotDeleteReplacement(t *testing.T) {
 	_ = listener.Close()
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatalf("replacement socket was removed: %v", err)
+	}
+}
+
+func TestFarmClientIPCUnixPostBindFailureDoesNotDeleteReplacement(t *testing.T) {
+	root := newShortFarmClientIPCRoot(t)
+	path := farmClientIPCSocketPath(root)
+	var replacement *net.UnixListener
+	_, err := listenFarmClientIPCWithPostBindValidation(root, func(string) error {
+		if err := os.Rename(path, path+".original"); err != nil {
+			return err
+		}
+		var listenErr error
+		replacement, listenErr = net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+		if listenErr != nil {
+			return listenErr
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return err
+		}
+		return errors.New("forced post-bind verification failure")
+	})
+	if replacement != nil {
+		defer replacement.Close()
+	}
+	if err == nil {
+		t.Fatal("forced post-bind validation failure was accepted")
+	}
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Fatalf("replacement socket was removed on listen failure: %v", statErr)
 	}
 }
 

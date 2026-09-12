@@ -6,6 +6,8 @@ import (
 	"context"
 	"os"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
 
 func TestFarmClientIPCWindowsProtectedPipeAndSameSIDPeer(t *testing.T) {
@@ -38,5 +40,21 @@ func TestFarmClientIPCWindowsProtectedPipeAndSameSIDPeer(t *testing.T) {
 	other, _, err := farmClientIPCPipeName(root + string(os.PathSeparator) + "other")
 	if err != nil || other == name {
 		t.Fatalf("state-root isolation failed: %q %q err=%v", name, other, err)
+	}
+}
+
+func TestFarmClientIPCPendingHandleCompareAndClear(t *testing.T) {
+	listener := &farmClientIPCPipeListener{pending: windows.Handle(101)}
+	if listener.compareAndClearPending(windows.Handle(102)) {
+		t.Fatal("mismatched handle cleared pending ownership")
+	}
+	if listener.pending != windows.Handle(101) {
+		t.Fatalf("mismatched clear changed pending handle to %v", listener.pending)
+	}
+	if !listener.compareAndClearPending(windows.Handle(101)) {
+		t.Fatal("matching handle did not clear pending ownership")
+	}
+	if listener.pending != 0 {
+		t.Fatalf("matching clear left pending handle %v", listener.pending)
 	}
 }

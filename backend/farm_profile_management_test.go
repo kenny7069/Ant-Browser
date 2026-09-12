@@ -3,22 +3,27 @@ package backend
 import (
 	"errors"
 	"os/exec"
+	"sync/atomic"
 	"testing"
 
 	"ant-chrome/backend/internal/browser"
 )
 
 func TestFarmProfileManagementRejectsUnownedDetectedBrowser(t *testing.T) {
+	var startCalls atomic.Int32
 	manager := browser.NewManager(DefaultConfig(), t.TempDir())
 	manager.Profiles["manual"] = &browser.Profile{ProfileId: "manual", ProfileName: "manual", IncarnationID: "manual-inc", UserDataDir: "manual-data"}
 	runtimeService := NewBrowserRuntimeService(BrowserRuntimeServiceConfig{
 		Manager: manager,
 		Config:  DefaultConfig(),
 		Host: BrowserRuntimeHost{
-			StartProcess: func(*BrowserRuntimeLaunchPlan) (*BrowserRuntimeProcess, error) { return nil, nil },
-			StopProcess:  func(*exec.Cmd) error { return nil },
+			StartProcess: func(*BrowserRuntimeLaunchPlan) (*BrowserRuntimeProcess, error) {
+				startCalls.Add(1)
+				return nil, nil
+			},
+			StopProcess: func(*exec.Cmd) error { return nil },
 			DetectRuntime: func(string) (BrowserRuntimeDetection, bool) {
-				return BrowserRuntimeDetection{PID: 99, DebugPort: 9222, DebugReady: true}, true
+				return BrowserRuntimeDetection{PID: 99, DebugPort: 9222, DebugReady: false}, true
 			},
 		},
 	})
@@ -39,6 +44,9 @@ func TestFarmProfileManagementRejectsUnownedDetectedBrowser(t *testing.T) {
 	profile := manager.Profiles["manual"]
 	if profile.Running || profile.Pid != 0 || profile.DebugPort != 0 {
 		t.Fatalf("unowned browser mutated profile: %+v", profile)
+	}
+	if got := startCalls.Load(); got != 0 {
+		t.Fatalf("unowned browser invoked StartProcess %d times", got)
 	}
 }
 

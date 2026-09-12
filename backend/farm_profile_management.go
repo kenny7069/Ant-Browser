@@ -155,7 +155,7 @@ func (management *farmProfileManagement) rejectUnownedLocked(profileID string) e
 	if running {
 		return ErrFarmClientProfileInUseUnowned
 	}
-	if detection, ok := management.host.runtime.detectRuntime(userDataDir); ok && detection.DebugReady {
+	if _, ok := management.host.runtime.detectRuntime(userDataDir); ok {
 		return ErrFarmClientProfileInUseUnowned
 	}
 	return nil

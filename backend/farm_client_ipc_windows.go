@@ -91,20 +91,15 @@ func (listener *farmClientIPCPipeListener) Accept() (net.Conn, error) {
 		listener.pending = handle
 		listener.mu.Unlock()
 		if err := validateFarmClientIPCPipeDACL(handle, listener.sid); err != nil {
-			windows.CloseHandle(handle)
+			listener.closePendingHandle(handle)
 			return nil, err
 		}
 		connectErr := windows.ConnectNamedPipe(handle, nil)
 		if connectErr != nil && connectErr != windows.ERROR_PIPE_CONNECTED {
-			windows.CloseHandle(handle)
+			listener.closePendingHandle(handle)
 			return nil, connectErr
 		}
-		listener.mu.Lock()
-		listener.pending = 0
-		closed := listener.closed
-		listener.mu.Unlock()
-		if closed {
-			windows.CloseHandle(handle)
+		if !listener.compareAndClearPending(handle) {
 			return nil, net.ErrClosed
 		}
 		if err := validateFarmClientIPCPipePeer(handle, true, listener.sid); err != nil {
@@ -113,6 +108,22 @@ func (listener *farmClientIPCPipeListener) Accept() (net.Conn, error) {
 			continue
 		}
 		return &farmClientIPCPipeConn{File: os.NewFile(uintptr(handle), listener.name), server: true}, nil
+	}
+}
+
+func (listener *farmClientIPCPipeListener) compareAndClearPending(handle windows.Handle) bool {
+	listener.mu.Lock()
+	defer listener.mu.Unlock()
+	if listener.pending != handle {
+		return false
+	}
+	listener.pending = 0
+	return true
+}
+
+func (listener *farmClientIPCPipeListener) closePendingHandle(handle windows.Handle) {
+	if listener.compareAndClearPending(handle) {
+		_ = windows.CloseHandle(handle)
 	}
 }
 

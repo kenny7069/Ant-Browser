@@ -28,6 +28,10 @@ func farmClientIPCSocketPath(stateRoot string) string {
 }
 
 func listenFarmClientIPC(stateRoot string) (net.Listener, error) {
+	return listenFarmClientIPCWithPostBindValidation(stateRoot, nil)
+}
+
+func listenFarmClientIPCWithPostBindValidation(stateRoot string, postBindValidation func(string) error) (net.Listener, error) {
 	uid := uint32(os.Geteuid())
 	if err := validateFarmClientIPCUnixDirectory(stateRoot, uid, false); err != nil {
 		return nil, err
@@ -68,22 +72,37 @@ func listenFarmClientIPC(stateRoot string) (net.Listener, error) {
 	// net.UnixListener otherwise unlinks by pathname during Close, which can
 	// delete an attacker-replaced socket. Cleanup below is inode-fenced.
 	listener.SetUnlinkOnClose(false)
+	boundInfo, err := os.Lstat(path)
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("%w: inspect bound socket", ErrFarmClientIPCUnavailable)
+	}
+	boundDev, boundIno, boundOwner, boundOK := farmClientIPCUnixIdentity(boundInfo)
+	if !boundOK || boundOwner != uid || boundInfo.Mode()&os.ModeSocket == 0 {
+		_ = listener.Close()
+		return nil, fmt.Errorf("%w: unsafe bound socket", ErrFarmClientIPCUnavailable)
+	}
 	closeOnError := true
 	defer func() {
 		if closeOnError {
 			_ = listener.Close()
-			_ = os.Remove(path)
+			removeFarmClientIPCSocketIfIdentity(path, boundDev, boundIno)
 		}
 	}()
 	if err := os.Chmod(path, 0o600); err != nil {
 		return nil, fmt.Errorf("%w: secure socket", ErrFarmClientIPCUnavailable)
+	}
+	if postBindValidation != nil {
+		if err := postBindValidation(path); err != nil {
+			return nil, fmt.Errorf("%w: post-bind validation", ErrFarmClientIPCUnavailable)
+		}
 	}
 	info, err := os.Lstat(path)
 	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o600 {
 		return nil, fmt.Errorf("%w: verify socket", ErrFarmClientIPCUnavailable)
 	}
 	dev, ino, owner, ok := farmClientIPCUnixIdentity(info)
-	if !ok || owner != uid {
+	if !ok || owner != uid || dev != boundDev || ino != boundIno {
 		return nil, fmt.Errorf("%w: socket owner", ErrFarmClientIPCUnavailable)
 	}
 	closeOnError = false
@@ -106,13 +125,17 @@ func (listener *farmClientIPCUnixListener) Accept() (net.Conn, error) {
 
 func (listener *farmClientIPCUnixListener) Close() error {
 	err := listener.UnixListener.Close()
-	if info, statErr := os.Lstat(listener.path); statErr == nil {
+	removeFarmClientIPCSocketIfIdentity(listener.path, listener.dev, listener.ino)
+	return err
+}
+
+func removeFarmClientIPCSocketIfIdentity(path string, expectedDev, expectedIno uint64) {
+	if info, err := os.Lstat(path); err == nil {
 		dev, ino, _, ok := farmClientIPCUnixIdentity(info)
-		if ok && dev == listener.dev && ino == listener.ino {
-			_ = os.Remove(listener.path)
+		if ok && dev == expectedDev && ino == expectedIno {
+			_ = os.Remove(path)
 		}
 	}
-	return err
 }
 
 func dialFarmClientIPC(ctx context.Context, stateRoot string) (net.Conn, error) {
