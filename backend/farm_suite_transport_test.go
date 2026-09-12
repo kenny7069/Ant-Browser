@@ -505,6 +505,23 @@ func TestSuiteTransportFinalJournalRecoveryIsClosed(t *testing.T) {
 		if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0o600 {
 			t.Fatalf("birth mode not normalized: info=%v err=%v", info, err)
 		}
+		for _, mode := range []os.FileMode{0o000, 0o200} {
+			fixture := newSuiteTransportFixture(t)
+			path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runSuiteCanonicalTransportWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteTransportTestDependencies(fixture.discovery)); err == nil {
+				t.Fatalf("unreadable empty recovery mode %04o accepted", mode)
+			}
+			if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != mode {
+				t.Fatalf("unreadable recovery mode mutated: info=%v err=%v", info, err)
+			}
+			assertSuiteTransportCheckpoint(t, fixture, SetupConfigDrafted)
+		}
 	}
 	for _, raw := range [][]byte{[]byte(`{"unknown":true}`), []byte(`{"secret":"keep"}`), []byte(`[]`)} {
 		fixture := newSuiteTransportFixture(t)
@@ -588,6 +605,40 @@ func TestSuiteTransportRecoveryRechecksSameInodeBytesBeforeSecurityMutation(t *t
 		}
 		if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0o400 {
 			t.Fatalf("security mutation preceded byte recheck: info=%v err=%v", info, err)
+		}
+		assertSuiteTransportCheckpoint(t, fixture, SetupConfigDrafted)
+	}
+}
+
+func TestSuiteTransportCreateRechecksEmptyHandleBeforeSecurityMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Windows handle/DACL evidence not run")
+	}
+	for _, changed := range [][]byte{[]byte(`{"secret":"keep"}`), []byte(`{"x":`)} {
+		fixture := newSuiteTransportFixture(t)
+		draft, _ := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap)
+		receipt, err := newSuiteTransportReceipt(fixture.preparation, fixture.plan, *draft, fixture.bootstrap, fixture.roots, fixture.release.manifest.Version, fixture.discovery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(fixture.roots.AgentState, SuiteTransportReceiptName)
+		dependencies := suiteTransportReceiptSaveDependencies{
+			Open: openSuiteTransportReceiptHandle, Write: writeSuiteTransportReceiptHandle,
+			AfterOpen: func(_ string, file *os.File) error {
+				if _, err := file.Write(changed); err != nil {
+					return err
+				}
+				return file.Chmod(0o400)
+			},
+		}
+		if err := saveSuiteTransportReceiptWithDependencies(fixture.roots, fixture.bootstrap, receipt, dependencies); err == nil {
+			t.Fatalf("create handle drift %q accepted", changed)
+		}
+		if raw, err := os.ReadFile(path); err != nil || string(raw) != string(changed) {
+			t.Fatalf("create handle drift mutated=%q err=%v", raw, err)
+		}
+		if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0o400 {
+			t.Fatalf("create security mutation preceded empty recheck: info=%v err=%v", info, err)
 		}
 		assertSuiteTransportCheckpoint(t, fixture, SetupConfigDrafted)
 	}

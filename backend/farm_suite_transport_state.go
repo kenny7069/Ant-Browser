@@ -236,17 +236,23 @@ type suiteTransportReceiptRecoveryEvidence struct {
 }
 
 func verifySuiteTransportReceiptRecoveryBytes(file *os.File, opened os.FileInfo, recovery *suiteTransportReceiptRecoveryEvidence) error {
-	if recovery == nil {
-		return nil
+	expectedSize := int64(0)
+	expectedDigest := sha256.Sum256(nil)
+	if recovery != nil {
+		if recovery.Info == nil || !os.SameFile(recovery.Info, opened) {
+			return ErrSuiteTransportReceipt
+		}
+		expectedSize = recovery.Size
+		expectedDigest = recovery.Digest
 	}
-	if recovery.Info == nil || !os.SameFile(recovery.Info, opened) || opened.Size() != recovery.Size || recovery.Size < 0 || recovery.Size > suiteTransportReceiptMaxBytes {
+	if opened.Size() != expectedSize || expectedSize < 0 || expectedSize > suiteTransportReceiptMaxBytes {
 		return ErrSuiteTransportReceipt
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return ErrSuiteTransportReceipt
 	}
 	current, err := io.ReadAll(io.LimitReader(file, suiteTransportReceiptMaxBytes+1))
-	if err != nil || int64(len(current)) != recovery.Size || sha256.Sum256(current) != recovery.Digest || json.Valid(current) {
+	if err != nil || int64(len(current)) != expectedSize || sha256.Sum256(current) != expectedDigest || (recovery != nil && json.Valid(current)) {
 		return ErrSuiteTransportReceipt
 	}
 	return nil

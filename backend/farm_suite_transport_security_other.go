@@ -77,7 +77,8 @@ func validateSuiteTransportRecoveryCandidate(path string, info os.FileInfo) erro
 		return nil
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 || info.Mode().Perm()&^os.FileMode(0o600) != 0 {
+	permissions := info.Mode().Perm()
+	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 || (permissions != 0o400 && permissions != 0o600) {
 		return ErrSuiteTransportReceipt
 	}
 	return nil
