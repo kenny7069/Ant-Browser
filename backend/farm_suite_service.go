@@ -32,15 +32,17 @@ type SuiteServiceCoordinator struct {
 	ResidentProof        func(context.Context, string) error
 	StartupProofAttempts int
 	StartupProofBackoff  time.Duration
+	StartupProofTimeout  time.Duration
 }
 
 const (
 	suiteStartupProofAttempts = 40
-	suiteStartupProofBackoff  = 250 * time.Millisecond // 39 waits: bounded to about 10 seconds.
+	suiteStartupProofBackoff  = 250 * time.Millisecond
+	suiteStartupProofTimeout  = 10 * time.Second
 )
 
 func ActivateSuiteService(ctx context.Context, roots SuiteUserRoots) error {
-	return (&SuiteServiceCoordinator{Platform: newSuiteServicePlatform(), ResidentProof: suiteResidentProof, StartupProofAttempts: suiteStartupProofAttempts, StartupProofBackoff: suiteStartupProofBackoff}).Activate(ctx, roots)
+	return (&SuiteServiceCoordinator{Platform: newSuiteServicePlatform(), ResidentProof: suiteResidentProof, StartupProofAttempts: suiteStartupProofAttempts, StartupProofBackoff: suiteStartupProofBackoff, StartupProofTimeout: suiteStartupProofTimeout}).Activate(ctx, roots)
 }
 
 func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserRoots) error {
@@ -215,6 +217,11 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 }
 
 func (c *SuiteServiceCoordinator) proveResidentWithRetry(ctx context.Context, configPath string) error {
+	if c.StartupProofTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.StartupProofTimeout)
+		defer cancel()
+	}
 	attempts := c.StartupProofAttempts
 	if attempts <= 0 {
 		attempts = 1

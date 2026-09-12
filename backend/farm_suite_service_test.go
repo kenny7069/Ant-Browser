@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeSuiteServicePlatform struct {
@@ -341,6 +342,33 @@ func TestSuiteServiceStartupProofExhaustionRecoversOnNextCall(t *testing.T) {
 	}
 	journal, err = LoadSuiteActivationJournal(roots)
 	if err != nil || journal == nil || journal.Stage != SuiteActivationCheckpointWritten {
+		t.Fatalf("journal=%+v err=%v", journal, err)
+	}
+}
+
+func TestSuiteServiceStartupProofTotalDeadlineBoundsBlockingProbe(t *testing.T) {
+	roots, preparation := enrolledSuiteFixture(t)
+	advanceActivationJournalForTest(t, roots, preparation, SuiteActivationStartRequested)
+	platform := &fakeSuiteServicePlatform{registration: suiteServiceRegistrationExactEnabled}
+	coordinator := &SuiteServiceCoordinator{
+		Platform:             platform,
+		StartupProofAttempts: 40,
+		StartupProofBackoff:  time.Second,
+		StartupProofTimeout:  40 * time.Millisecond,
+		ResidentProof: func(ctx context.Context, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	started := time.Now()
+	if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+		t.Fatalf("activation=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("resident deadline exceeded: %v", elapsed)
+	}
+	journal, err := LoadSuiteActivationJournal(roots)
+	if err != nil || journal == nil || journal.Stage != SuiteActivationStartRequested {
 		t.Fatalf("journal=%+v err=%v", journal, err)
 	}
 }
