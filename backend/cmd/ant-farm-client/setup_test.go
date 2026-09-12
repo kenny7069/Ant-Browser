@@ -20,9 +20,23 @@ func setupCommandFixture(t *testing.T) backend.SuiteUserRoots {
 
 func withSetupRoots(t *testing.T, roots backend.SuiteUserRoots) {
 	t.Helper()
+	t.Setenv("FARM_V3_SETUP_ENABLED", "1")
 	previous := resolveSetupUserRoots
 	resolveSetupUserRoots = func() (backend.SuiteUserRoots, error) { return roots, nil }
 	t.Cleanup(func() { resolveSetupUserRoots = previous })
+}
+
+func TestSetupSubcommandIsDisabledByDefault(t *testing.T) {
+	t.Setenv("FARM_V3_SETUP_ENABLED", "")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"setup", "--server", "https://farm.example.test", "--json"}, strings.NewReader(""), &stdout, &stderr)
+	if code != setupExitInput || stdout.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var problem setupCommandError
+	if err := json.Unmarshal(stderr.Bytes(), &problem); err != nil || problem.Code != "SETUP_DISABLED" {
+		t.Fatalf("problem=%+v err=%v", problem, err)
+	}
 }
 
 func TestSetupSubcommandParsesFlagsAfterPositionalCommand(t *testing.T) {
@@ -37,7 +51,7 @@ func TestSetupSubcommandParsesFlagsAfterPositionalCommand(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.SetupState != backend.SetupConfigDrafted || result.Classification != backend.SuiteSetupFresh || result.RequestUID == "" || result.Connected {
+	if result.PreparationState != backend.SetupBootstrapDrafted || result.Classification != backend.SuiteSetupFresh || result.RequestUID == "" || result.Connected || result.NextAction != "run_precheck" {
 		t.Fatalf("result = %+v", result)
 	}
 	if strings.Contains(stdout.String(), "secret-must-not-be-read") {
@@ -71,6 +85,7 @@ func TestSetupSubcommandFailsClosedWithSafeJSONErrors(t *testing.T) {
 	}{
 		{"missing server", []string{"setup", "--json"}},
 		{"http server", []string{"setup", "--server", "http://farm.example.test", "--json"}},
+		{"invalid node name", []string{"setup", "--server", "https://farm.example.test", "--node-name", "bad\nname", "--json"}},
 		{"unknown flag", []string{"setup", "--server", "https://farm.example.test", "--enrollment-code", "CANARY-CODE", "--json"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,8 +97,14 @@ func TestSetupSubcommandFailsClosedWithSafeJSONErrors(t *testing.T) {
 				t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 			}
 			var problem setupCommandError
-			if err := json.Unmarshal(stderr.Bytes(), &problem); err != nil || problem.Code == "" || problem.SafeMessage == "" || problem.Stage != backend.SetupPrecheck {
+			if err := json.Unmarshal(stderr.Bytes(), &problem); err != nil || problem.Code == "" || problem.SafeMessage == "" || problem.Stage != "INPUT_VALIDATION" {
 				t.Fatalf("problem=%+v err=%v raw=%q", problem, err, stderr.String())
+			}
+			if tc.name == "http server" && problem.Field != "server" {
+				t.Fatalf("server error field = %q", problem.Field)
+			}
+			if tc.name == "invalid node name" && problem.Field != "node_name" {
+				t.Fatalf("node error field = %q", problem.Field)
 			}
 			if strings.Contains(stderr.String(), "CANARY-CODE") {
 				t.Fatal("unknown secret-like value leaked")
@@ -92,11 +113,11 @@ func TestSetupSubcommandFailsClosedWithSafeJSONErrors(t *testing.T) {
 	}
 }
 
-func TestSetupSubcommandRejectsRelativeStatePathWithoutWriting(t *testing.T) {
+func TestSetupSubcommandDoesNotExposeStatePathOverride(t *testing.T) {
 	roots := setupCommandFixture(t)
 	withSetupRoots(t, roots)
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"setup", "--server", "https://farm.example.test", "--state-path", "relative/setup.json", "--json"}, strings.NewReader(""), &stdout, &stderr)
+	code := run([]string{"setup", "--server", "https://farm.example.test", "--state-path", "/tmp/redirected.json", "--json"}, strings.NewReader(""), &stdout, &stderr)
 	if code != setupExitInput || stdout.Len() != 0 {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}

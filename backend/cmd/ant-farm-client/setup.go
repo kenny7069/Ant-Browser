@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,36 +19,43 @@ const (
 )
 
 type setupCommandResult struct {
-	SchemaVersion  int                              `json:"schema_version"`
-	SetupState     backend.SetupStage               `json:"setup_state"`
-	Classification backend.SuiteSetupClassification `json:"classification"`
-	RequestUID     string                           `json:"request_uid"`
-	Connected      bool                             `json:"connected"`
-	NextAction     string                           `json:"next_action"`
+	SchemaVersion    int                              `json:"schema_version"`
+	PreparationState backend.SetupStage               `json:"preparation_state"`
+	Classification   backend.SuiteSetupClassification `json:"classification"`
+	RequestUID       string                           `json:"request_uid"`
+	Connected        bool                             `json:"connected"`
+	NextAction       string                           `json:"next_action"`
 }
 
 type setupCommandError struct {
-	Code        string             `json:"code"`
-	Stage       backend.SetupStage `json:"stage"`
-	Field       string             `json:"field,omitempty"`
-	SafeMessage string             `json:"safe_message"`
-	Remediation string             `json:"remediation"`
-	Retryable   bool               `json:"retryable"`
+	Code        string `json:"code"`
+	Stage       string `json:"stage"`
+	Field       string `json:"field,omitempty"`
+	SafeMessage string `json:"safe_message"`
+	Remediation string `json:"remediation"`
+	Retryable   bool   `json:"retryable"`
 }
 
 var resolveSetupUserRoots = backend.ResolveSuiteUserRoots
 
 func runSetupCommand(args []string, stdout, stderr io.Writer) int {
 	jsonOutput := setupArgsWantJSON(args)
+	if !farmV3SetupEnabled() {
+		writeSetupError(stderr, jsonOutput, setupCommandError{
+			Code: "SETUP_DISABLED", Stage: "INPUT_VALIDATION",
+			SafeMessage: "Browser Farm v3 setup 尚未啟用。",
+			Remediation: "由管理員完成部署前置後設定 FARM_V3_SETUP_ENABLED=1。",
+		})
+		return setupExitInput
+	}
 	flags := flag.NewFlagSet("ant-farm-client setup", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	server := flags.String("server", "", "trusted HTTPS Server origin")
 	nodeName := flags.String("node-name", "", "display name for this node")
-	statePath := flags.String("state-path", "", "absolute setup checkpoint path")
 	flags.BoolVar(&jsonOutput, "json", jsonOutput, "write machine-readable JSON")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		writeSetupError(stderr, jsonOutput, setupCommandError{
-			Code: "SETUP_INPUT_INVALID", Stage: backend.SetupPrecheck,
+			Code: "SETUP_INPUT_INVALID", Stage: "INPUT_VALIDATION",
 			SafeMessage: "Setup 參數格式無效。",
 			Remediation: "使用 setup --server https://主機[:port] [--node-name 名稱] [--json]。",
 		})
@@ -55,9 +63,17 @@ func runSetupCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(*server) == "" {
 		writeSetupError(stderr, jsonOutput, setupCommandError{
-			Code: "SETUP_SERVER_REQUIRED", Stage: backend.SetupPrecheck, Field: "server",
+			Code: "SETUP_SERVER_REQUIRED", Stage: "INPUT_VALIDATION", Field: "server",
 			SafeMessage: "必須提供可信 HTTPS Server origin。",
 			Remediation: "加入 --server https://主機[:port]。",
+		})
+		return setupExitInput
+	}
+	if !validSetupServerOrigin(*server) {
+		writeSetupError(stderr, jsonOutput, setupCommandError{
+			Code: "SETUP_SERVER_INVALID", Stage: "INPUT_VALIDATION", Field: "server",
+			SafeMessage: "Server 必須是沒有路徑、查詢或帳密的 HTTPS origin。",
+			Remediation: "使用 https://主機[:port]，並先建立可信 TLS。",
 		})
 		return setupExitInput
 	}
@@ -67,13 +83,18 @@ func runSetupCommand(args []string, stdout, stderr io.Writer) int {
 		writeSetupError(stderr, jsonOutput, setupStorageError("SETUP_ROOTS_UNAVAILABLE", err, false))
 		return setupExitNativeStore
 	}
-	checkpointPath := strings.TrimSpace(*statePath)
-	if checkpointPath == "" {
-		checkpointPath = filepath.Join(roots.AgentState, "setup.json")
-	}
+	checkpointPath := filepath.Join(roots.AgentState, "setup.json")
 	displayName := strings.TrimSpace(*nodeName)
 	if displayName == "" {
 		displayName = defaultSetupNodeName()
+	}
+	if !validSetupNodeName(displayName) {
+		writeSetupError(stderr, jsonOutput, setupCommandError{
+			Code: "SETUP_NODE_NAME_INVALID", Stage: "INPUT_VALIDATION", Field: "node_name",
+			SafeMessage: "節點名稱格式無效。",
+			Remediation: "使用 1 至 100 字元且不含控制字元的名稱。",
+		})
+		return setupExitInput
 	}
 	config := backend.BootstrapConfig{
 		ServerURL: strings.TrimSpace(*server),
@@ -83,9 +104,9 @@ func runSetupCommand(args []string, stdout, stderr io.Writer) int {
 	coordinator, err := backend.NewSuiteSetupCoordinatorWithRoots(config, roots)
 	if err != nil {
 		writeSetupError(stderr, jsonOutput, setupCommandError{
-			Code: "SETUP_CONFIG_INVALID", Stage: backend.SetupPrecheck,
+			Code: "SETUP_CONFIG_INVALID", Stage: "LOCAL_PREPARATION",
 			SafeMessage: "Bootstrap 設定無效。",
-			Remediation: "檢查 HTTPS origin、節點名稱及絕對 state path。",
+			Remediation: "檢查目前使用者的 Suite 資料路徑。",
 		})
 		return setupExitInput
 	}
@@ -112,9 +133,9 @@ func runSetupCommand(args []string, stdout, stderr io.Writer) int {
 		return setupExitNativeStore
 	}
 	value := setupCommandResult{
-		SchemaVersion: 1, SetupState: result.Checkpoint.Stage,
+		SchemaVersion: 1, PreparationState: result.Checkpoint.Stage,
 		Classification: result.Classification, RequestUID: result.Checkpoint.RequestUID,
-		Connected: false, NextAction: "verify_transport",
+		Connected: false, NextAction: "run_precheck",
 	}
 	encoded, err := json.Marshal(value)
 	if err != nil {
@@ -123,9 +144,30 @@ func runSetupCommand(args []string, stdout, stderr io.Writer) int {
 	if jsonOutput {
 		fmt.Fprintln(stdout, string(encoded))
 	} else {
-		fmt.Fprintf(stdout, "Setup 已保存至 %s；下一步：驗證 Server transport。\n", value.SetupState)
+		fmt.Fprintf(stdout, "Setup 準備狀態已保存至 %s；下一步：執行環境 precheck。\n", value.PreparationState)
 	}
 	return 0
+}
+
+func farmV3SetupEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FARM_V3_SETUP_ENABLED"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func validSetupServerOrigin(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && parsed.Scheme == "https" && parsed.Hostname() != "" &&
+		parsed.User == nil && parsed.Path == "" && parsed.RawQuery == "" &&
+		parsed.Fragment == "" && parsed.Opaque == ""
+}
+
+func validSetupNodeName(value string) bool {
+	return value != "" && len(value) <= 100 && strings.TrimSpace(value) == value &&
+		strings.IndexFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f }) < 0
 }
 
 func setupArgsWantJSON(args []string) bool {
@@ -146,16 +188,16 @@ func defaultSetupNodeName() string {
 	return name
 }
 
-func setupErrorStage(result backend.SuiteSetupResult) backend.SetupStage {
+func setupErrorStage(result backend.SuiteSetupResult) string {
 	if result.Checkpoint.Stage != "" {
-		return result.Checkpoint.Stage
+		return string(result.Checkpoint.Stage)
 	}
-	return backend.SetupPrecheck
+	return "LOCAL_PREPARATION"
 }
 
 func setupStorageError(code string, _ error, retryable bool) setupCommandError {
 	return setupCommandError{
-		Code: code, Stage: backend.SetupPrecheck,
+		Code: code, Stage: "USER_ROOTS",
 		SafeMessage: "無法使用目前使用者的 Suite 資料目錄。",
 		Remediation: "確認使用一般登入使用者執行，並檢查資料目錄權限。",
 		Retryable:   retryable,
