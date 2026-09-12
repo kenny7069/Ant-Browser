@@ -27,6 +27,24 @@ type suiteCanonicalConfigDraftDependencies struct {
 	AfterValidate     func() error
 }
 
+type suiteConfigDraftApplicationRootOperations struct {
+	Mkdir      func(string, os.FileMode) error
+	Lstat      func(string) (os.FileInfo, error)
+	Secure     func(string, bool) error
+	SyncParent func(string) error
+	ReadDir    func(string) ([]os.DirEntry, error)
+	Remove     func(string) error
+	Resolve    func(string) (string, os.FileInfo, error)
+}
+
+func defaultSuiteConfigDraftApplicationRootOperations() suiteConfigDraftApplicationRootOperations {
+	return suiteConfigDraftApplicationRootOperations{
+		Mkdir: os.Mkdir, Lstat: os.Lstat, Secure: secureSuiteSetupPath,
+		SyncParent: syncSuiteSetupDirectory, ReadDir: os.ReadDir, Remove: os.Remove,
+		Resolve: suitePrecheckResolvedPath,
+	}
+}
+
 func RunSuiteCanonicalConfigDraft(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, installedSuiteRoot string) (SuiteCanonicalConfigDraftResult, error) {
 	return runSuiteCanonicalConfigDraftWithDependencies(ctx, bootstrap, roots, release, installedSuiteRoot, suiteCanonicalConfigDraftDependencies{
 		ValidateInstall:   validateSuiteStagePlatformInstall,
@@ -163,25 +181,66 @@ func revalidateSuiteConfigDraftEvidence(ctx context.Context, bootstrap Bootstrap
 }
 
 func ensureSuiteConfigDraftApplicationRoot(path string, allowCreate bool) (os.FileInfo, error) {
-	info, err := os.Lstat(path)
+	return ensureSuiteConfigDraftApplicationRootWithOperations(path, allowCreate, defaultSuiteConfigDraftApplicationRootOperations())
+}
+
+func ensureSuiteConfigDraftApplicationRootWithOperations(path string, allowCreate bool, operations suiteConfigDraftApplicationRootOperations) (os.FileInfo, error) {
+	if operations.Mkdir == nil || operations.Lstat == nil || operations.Secure == nil || operations.SyncParent == nil || operations.ReadDir == nil || operations.Remove == nil || operations.Resolve == nil {
+		return nil, ErrSuiteCanonicalConfigDraft
+	}
+	info, err := operations.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		if !allowCreate || os.Mkdir(path, 0o700) != nil || secureSuiteSetupPath(path, true) != nil || syncSuiteSetupDirectory(filepath.Dir(path)) != nil {
+		if !allowCreate || operations.Mkdir(path, 0o700) != nil {
 			return nil, ErrSuiteCanonicalConfigDraft
 		}
-		info, err = os.Lstat(path)
+		createdInfo, createdErr := operations.Lstat(path)
+		if createdErr != nil || createdInfo.Mode()&os.ModeSymlink != 0 || !createdInfo.IsDir() {
+			return nil, ErrSuiteCanonicalConfigDraft
+		}
+		if operations.Secure(path, true) != nil || operations.SyncParent(filepath.Dir(path)) != nil {
+			_ = cleanupNewSuiteConfigDraftApplicationRoot(path, createdInfo, operations)
+			return nil, ErrSuiteCanonicalConfigDraft
+		}
+		info, err = operations.Lstat(path)
 	}
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || validateSuiteSetupPathSecurity(path, true) != nil {
 		return nil, ErrSuiteCanonicalConfigDraft
 	}
-	_, resolvedInfo, err := suitePrecheckResolvedPath(path)
+	_, resolvedInfo, err := operations.Resolve(path)
 	if err != nil || resolvedInfo == nil || !os.SameFile(info, resolvedInfo) {
 		return nil, ErrSuiteCanonicalConfigDraft
 	}
-	entries, err := os.ReadDir(path)
+	entries, err := operations.ReadDir(path)
 	if err != nil || len(entries) != 0 {
 		return nil, ErrSuiteCanonicalConfigDraft
 	}
 	return resolvedInfo, nil
+}
+
+func cleanupNewSuiteConfigDraftApplicationRoot(path string, createdInfo os.FileInfo, operations suiteConfigDraftApplicationRootOperations) error {
+	current, err := operations.Lstat(path)
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || !os.SameFile(createdInfo, current) {
+		return ErrSuiteCanonicalConfigDraft
+	}
+	_, resolved, err := operations.Resolve(path)
+	if err != nil || resolved == nil || !os.SameFile(createdInfo, resolved) {
+		return ErrSuiteCanonicalConfigDraft
+	}
+	entries, err := operations.ReadDir(path)
+	if err != nil || len(entries) != 0 {
+		return ErrSuiteCanonicalConfigDraft
+	}
+	final, err := operations.Lstat(path)
+	if err != nil || final.Mode()&os.ModeSymlink != 0 || !final.IsDir() || !os.SameFile(createdInfo, final) {
+		return ErrSuiteCanonicalConfigDraft
+	}
+	if err := operations.Remove(path); err != nil {
+		return ErrSuiteCanonicalConfigDraft
+	}
+	if err := operations.SyncParent(filepath.Dir(path)); err != nil {
+		return ErrSuiteCanonicalConfigDraft
+	}
+	return nil
 }
 
 func inspectSuiteConfigDraftFootprint(roots SuiteUserRoots, bootstrap BootstrapConfig, requestUID, allowedTempName string) error {

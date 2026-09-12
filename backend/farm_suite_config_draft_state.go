@@ -64,6 +64,14 @@ func LoadSuiteClientConfigDraft(roots SuiteUserRoots, bootstrap BootstrapConfig)
 	if err := validateSuiteSetupInputs(&bootstrap, roots); err != nil {
 		return nil, ErrSuiteConfigDraft
 	}
+	rootInfo, err := os.Lstat(roots.Config)
+	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() || validateSuiteSetupPathSecurity(roots.Config, true) != nil {
+		return nil, ErrSuiteConfigDraft
+	}
+	_, resolvedRootInfo, err := suitePrecheckResolvedPath(roots.Config)
+	if err != nil || resolvedRootInfo == nil || !os.SameFile(rootInfo, resolvedRootInfo) {
+		return nil, ErrSuiteConfigDraft
+	}
 	path := filepath.Join(roots.Config, SuiteClientConfigDraftName)
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {

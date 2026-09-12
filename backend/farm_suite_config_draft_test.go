@@ -218,7 +218,43 @@ func TestSuiteClientConfigDraftClosedOwnerOnlyContract(t *testing.T) {
 				t.Fatal("permissive draft accepted")
 			}
 		})
+		t.Run("config root mode", func(t *testing.T) {
+			fixture := newSuiteConfigDraftFixture(t)
+			if _, err := runSuiteCanonicalConfigDraftWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteConfigDraftTestDependencies()); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(fixture.roots.Config, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap); err == nil {
+				t.Fatal("permissive config root accepted")
+			}
+		})
 	}
+	t.Run("config ancestor symlink", func(t *testing.T) {
+		fixture := newSuiteConfigDraftFixture(t)
+		if _, err := runSuiteCanonicalConfigDraftWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteConfigDraftTestDependencies()); err != nil {
+			t.Fatal(err)
+		}
+		ancestor := filepath.Dir(fixture.roots.Config)
+		moved := ancestor + "-moved"
+		if err := os.Rename(ancestor, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(moved, ancestor); err != nil {
+			_ = os.Rename(moved, ancestor)
+			t.Skip(err)
+		}
+		if _, err := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap); err == nil {
+			t.Fatal("redirected config ancestor accepted")
+		}
+		if err := os.Remove(ancestor); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(moved, ancestor); err != nil {
+			t.Fatal(err)
+		}
+	})
 	t.Run("application symlink", func(t *testing.T) {
 		fixture := newSuiteConfigDraftFixture(t)
 		target := t.TempDir()
@@ -276,6 +312,86 @@ func TestSuiteCanonicalConfigDraftRejectsExistingApplicationAndLaterArtifacts(t 
 }
 
 func TestSuiteCanonicalConfigDraftFailuresAndCommitUnknownRecover(t *testing.T) {
+	t.Run("application secure failure cleanup and retry", func(t *testing.T) {
+		fixture := newSuiteConfigDraftFixture(t)
+		applicationRoot := filepath.Join(fixture.roots.BrowserData, suiteConfigDraftApplicationDir)
+		operations := defaultSuiteConfigDraftApplicationRootOperations()
+		operations.Secure = func(string, bool) error { return errors.New("injected secure failure") }
+		deps := suiteConfigDraftTestDependencies()
+		deps.EnsureApplication = func(path string, allowCreate bool) (os.FileInfo, error) {
+			return ensureSuiteConfigDraftApplicationRootWithOperations(path, allowCreate, operations)
+		}
+		if _, err := runSuiteCanonicalConfigDraftWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
+			t.Fatal("secure failure accepted")
+		}
+		if _, err := os.Lstat(applicationRoot); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("new unsafe directory remains: %v", err)
+		}
+		assertSuiteConfigDraftCheckpoint(t, fixture, SetupStaged)
+		if draft, err := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap); err != nil || draft != nil {
+			t.Fatalf("failure wrote draft=%+v err=%v", draft, err)
+		}
+		if _, err := runSuiteCanonicalConfigDraftWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, suiteConfigDraftTestDependencies()); err != nil {
+			t.Fatalf("retry after safe cleanup: %v", err)
+		}
+	})
+	t.Run("application secure failure never deletes replacement", func(t *testing.T) {
+		fixture := newSuiteConfigDraftFixture(t)
+		applicationRoot := filepath.Join(fixture.roots.BrowserData, suiteConfigDraftApplicationDir)
+		replacement := filepath.Join(t.TempDir(), "replacement")
+		if err := os.Mkdir(replacement, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		operations := defaultSuiteConfigDraftApplicationRootOperations()
+		operations.Secure = func(path string, _ bool) error {
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+			if err := os.Rename(replacement, path); err != nil {
+				return err
+			}
+			return errors.New("injected secure failure after replacement")
+		}
+		deps := suiteConfigDraftTestDependencies()
+		deps.EnsureApplication = func(path string, allowCreate bool) (os.FileInfo, error) {
+			return ensureSuiteConfigDraftApplicationRootWithOperations(path, allowCreate, operations)
+		}
+		if _, err := runSuiteCanonicalConfigDraftWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
+			t.Fatal("secure failure accepted")
+		}
+		if info, err := os.Lstat(applicationRoot); err != nil || !info.IsDir() {
+			t.Fatalf("replacement deleted: info=%v err=%v", info, err)
+		}
+		assertSuiteConfigDraftCheckpoint(t, fixture, SetupStaged)
+		if draft, err := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap); err != nil || draft != nil {
+			t.Fatalf("failure wrote draft=%+v err=%v", draft, err)
+		}
+	})
+	t.Run("application secure failure never deletes nonempty directory", func(t *testing.T) {
+		fixture := newSuiteConfigDraftFixture(t)
+		applicationRoot := filepath.Join(fixture.roots.BrowserData, suiteConfigDraftApplicationDir)
+		operations := defaultSuiteConfigDraftApplicationRootOperations()
+		operations.Secure = func(path string, _ bool) error {
+			if err := os.WriteFile(filepath.Join(path, "foreign"), []byte("keep"), 0o600); err != nil {
+				return err
+			}
+			return errors.New("injected secure failure after foreign write")
+		}
+		deps := suiteConfigDraftTestDependencies()
+		deps.EnsureApplication = func(path string, allowCreate bool) (os.FileInfo, error) {
+			return ensureSuiteConfigDraftApplicationRootWithOperations(path, allowCreate, operations)
+		}
+		if _, err := runSuiteCanonicalConfigDraftWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps); err == nil {
+			t.Fatal("secure failure accepted")
+		}
+		if raw, err := os.ReadFile(filepath.Join(applicationRoot, "foreign")); err != nil || string(raw) != "keep" {
+			t.Fatalf("foreign content mutated: %q err=%v", raw, err)
+		}
+		assertSuiteConfigDraftCheckpoint(t, fixture, SetupStaged)
+		if draft, err := LoadSuiteClientConfigDraft(fixture.roots, fixture.bootstrap); err != nil || draft != nil {
+			t.Fatalf("failure wrote draft=%+v err=%v", draft, err)
+		}
+	})
 	t.Run("application create", func(t *testing.T) {
 		fixture := newSuiteConfigDraftFixture(t)
 		deps := suiteConfigDraftTestDependencies()
