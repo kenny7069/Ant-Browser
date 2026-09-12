@@ -16,6 +16,21 @@ type fakeSuiteServicePlatform struct {
 	fail  string
 }
 
+type fakeLegacyAutostartManager struct {
+	removeCalls int
+	statusCalls int
+}
+
+func (*fakeLegacyAutostartManager) Install(string, string) error { return nil }
+func (f *fakeLegacyAutostartManager) Remove() error {
+	f.removeCalls++
+	return nil
+}
+func (f *fakeLegacyAutostartManager) Status() (FarmClientAutostartStatus, error) {
+	f.statusCalls++
+	return FarmClientAutostartStatus{}, nil
+}
+
 func (f *fakeSuiteServicePlatform) call(name string) error {
 	f.calls = append(f.calls, name)
 	if f.fail == name {
@@ -65,7 +80,7 @@ func TestSuiteServiceCoordinatorSeparatesDurableTransitions(t *testing.T) {
 	if err := coordinator.Activate(context.Background(), roots); err != nil {
 		t.Fatal(err)
 	}
-	want := "validate,register-disabled,audit-disabled,enable,validate,audit-enabled,start"
+	want := "validate,register-disabled,audit-disabled,validate,enable,validate,audit-enabled,validate,start"
 	if strings.Join(platform.calls, ",") != want {
 		t.Fatalf("calls=%v", platform.calls)
 	}
@@ -133,12 +148,43 @@ func toJSON(value any) string { raw, _ := json.Marshal(value); return string(raw
 
 func TestRawAutostartRejectsSuiteFootprint(t *testing.T) {
 	roots, _ := enrolledSuiteFixture(t)
-	if err := rejectRawAutostartForSuiteFootprintAtRoots(filepath.Join(roots.Config, SuiteClientConfigName), roots); !errors.Is(err, ErrFarmClientAutostart) {
+	canonical := filepath.Join(roots.Config, SuiteClientConfigName)
+	if err := rejectRawAutostartForSuiteFootprintAtRoots(canonical, roots); !errors.Is(err, ErrFarmClientAutostart) {
 		t.Fatalf("bypass=%v", err)
 	}
+	raw, _ := os.ReadFile(canonical)
+	copyPath := filepath.Join(t.TempDir(), "copied.yaml")
+	if err := os.WriteFile(copyPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rejectRawAutostartForSuiteFootprintAtRoots(copyPath, roots); !errors.Is(err, ErrFarmClientAutostart) {
+		t.Fatalf("copied config bypass=%v", err)
+	}
+	manager := &fakeLegacyAutostartManager{}
+	if err := removeFarmClientAutostartForConfigAtRoots(copyPath, roots, manager); !errors.Is(err, ErrFarmClientAutostart) {
+		t.Fatalf("guarded removal=%v", err)
+	}
+	if _, err := farmClientAutostartStatusForConfigAtRoots(copyPath, roots, manager); !errors.Is(err, ErrFarmClientAutostart) {
+		t.Fatalf("guarded status=%v", err)
+	}
+	if manager.removeCalls != 0 || manager.statusCalls != 0 {
+		t.Fatalf("legacy manager invoked remove=%d status=%d", manager.removeCalls, manager.statusCalls)
+	}
+	hardlinkPath := filepath.Join(t.TempDir(), "linked.yaml")
+	if err := os.Link(canonical, hardlinkPath); err == nil {
+		if err := rejectRawAutostartForSuiteFootprintAtRoots(hardlinkPath, roots); !errors.Is(err, ErrFarmClientAutostart) {
+			t.Fatalf("hardlink bypass=%v", err)
+		}
+	}
 	_ = os.Remove(filepath.Join(roots.AgentState, SuiteOwnershipHandoffName))
-	if err := rejectRawAutostartForSuiteFootprintAtRoots(filepath.Join(roots.Config, SuiteClientConfigName), roots); !errors.Is(err, ErrFarmClientAutostart) {
+	if err := rejectRawAutostartForSuiteFootprintAtRoots(canonical, roots); !errors.Is(err, ErrFarmClientAutostart) {
 		t.Fatalf("missing handoff bypass=%v", err)
+	}
+	if err := writeOwnerAtomic(canonical, []byte("broken: [")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rejectRawAutostartForSuiteFootprintAtRoots(canonical, roots); !errors.Is(err, ErrFarmClientAutostart) {
+		t.Fatalf("corrupt config bypass=%v", err)
 	}
 }
 
@@ -192,5 +238,31 @@ func TestSuiteActivationJournalRejectsSkipRollbackAndConcurrentDoubleStart(t *te
 	}
 	if starts != 1 {
 		t.Fatalf("start calls=%d all=%v", starts, platform.calls)
+	}
+}
+
+func TestSuiteDoctorRequiresPlatformObservationAndTypedExit(t *testing.T) {
+	roots, _ := enrolledSuiteFixture(t)
+	platform := &fakeSuiteServicePlatform{}
+	coordinator := &SuiteServiceCoordinator{Platform: platform, ResidentProof: func(context.Context, string) error { return errors.New("not resident") }}
+	if err := coordinator.Activate(context.Background(), roots); !errors.Is(err, ErrSuiteServiceActivation) {
+		t.Fatalf("activation=%v", err)
+	}
+	report := doctorSuiteWithPlatform(context.Background(), roots, platform)
+	foundRegistration := false
+	for _, layer := range report.Layers {
+		if layer.Name == "registration" {
+			foundRegistration = true
+			if layer.Status != "PASS" || layer.Code != "REGISTRATION_OBSERVED" {
+				t.Fatalf("registration=%+v", layer)
+			}
+		}
+	}
+	if !foundRegistration || report.Overall == "READY" || SuiteDoctorExitCode(report) == 0 {
+		t.Fatalf("report=%+v", report)
+	}
+	deferred := doctorSuiteWithPlatform(context.Background(), roots, &fakeSuiteServicePlatform{fail: "validate"})
+	if deferred.ExitClass != "DEFERRED" || SuiteDoctorExitCode(deferred) != 5 {
+		t.Fatalf("deferred=%+v", deferred)
 	}
 }

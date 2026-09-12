@@ -213,23 +213,17 @@ func runSuiteCommand(roots backend.SuiteUserRoots, args []string, stdout, stderr
 		report := backend.DoctorSuite(context.Background(), roots)
 		encoded, _ := json.Marshal(report)
 		fmt.Fprintln(stdout, string(encoded))
-		if report.Overall != "READY" {
-			return 5
-		}
-		return 0
+		return backend.SuiteDoctorExitCode(report)
 	case "service":
 		if len(args) != 2 {
 			fmt.Fprintln(stderr, "ant-farm-client: invalid Suite service arguments")
 			return 2
 		}
 		if args[1] == "status" {
-			report := backend.DoctorSuite(context.Background(), roots)
+			report := backend.SuiteServiceStatus(context.Background(), roots)
 			encoded, _ := json.Marshal(report)
 			fmt.Fprintln(stdout, string(encoded))
-			if report.Overall != "READY" {
-				return 5
-			}
-			return 0
+			return backend.SuiteDoctorExitCode(report)
 		}
 		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite service command")
 		return 2
@@ -357,12 +351,12 @@ func runAutostartCommand(configPath string, args []string, stdout, stderr io.Wri
 			return 1
 		}
 	case "remove":
-		if backend.RemoveFarmClientAutostart() != nil {
+		if backend.RemoveFarmClientAutostartForConfig(configPath) != nil {
 			fmt.Fprintln(stderr, "ant-farm-client: autostart remove failed")
 			return 1
 		}
 	case "status":
-		status, err := backend.FarmClientAutostartStatusValue()
+		status, err := backend.FarmClientAutostartStatusForConfig(configPath)
 		if err != nil {
 			fmt.Fprintln(stderr, "ant-farm-client: autostart status unavailable")
 			return 1
@@ -374,7 +368,7 @@ func runAutostartCommand(configPath string, args []string, stdout, stderr io.Wri
 		fmt.Fprintln(stderr, "ant-farm-client: invalid autostart command")
 		return 2
 	}
-	status, err := backend.FarmClientAutostartStatusValue()
+	status, err := backend.FarmClientAutostartStatusForConfig(configPath)
 	if err != nil {
 		fmt.Fprintln(stderr, "ant-farm-client: autostart status unavailable")
 		return 1

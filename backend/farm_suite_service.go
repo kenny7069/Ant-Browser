@@ -74,6 +74,17 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		journal.Stage = SuiteActivationReconcileRequired
 		_ = saveSuiteActivationJournal(roots, journal)
 	}
+	revalidate := func() error {
+		currentHandoff, err := LoadSuiteOwnershipHandoff(roots)
+		if err != nil || currentHandoff == nil || *currentHandoff != *handoff {
+			return ErrSuiteServiceActivation
+		}
+		identity, err := c.Platform.ValidateInstall(*currentHandoff)
+		if err != nil || identity != taskIdentity {
+			return ErrSuiteServiceActivation
+		}
+		return nil
+	}
 	if journal.Stage == SuiteActivationValidated {
 		if err := c.Platform.RegisterDisabled(*handoff, taskIdentity); err != nil {
 			markReconcile()
@@ -94,6 +105,9 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		}
 	}
 	if journal.Stage == SuiteActivationTaskAudited {
+		if err := revalidate(); err != nil {
+			return err
+		}
 		if err := c.Platform.Enable(*handoff, taskIdentity); err != nil {
 			markReconcile()
 			return ErrSuiteServiceActivation
@@ -104,13 +118,17 @@ func (c *SuiteServiceCoordinator) Activate(ctx context.Context, roots SuiteUserR
 		}
 	}
 	if journal.Stage == SuiteActivationEnabled {
-		identity, err := c.Platform.ValidateInstall(*handoff)
-		if err != nil || identity != taskIdentity {
-			return ErrSuiteServiceActivation
+		if err := revalidate(); err != nil {
+			markReconcile()
+			return err
 		}
 		if err := c.Platform.Audit(*handoff, taskIdentity, true); err != nil {
 			markReconcile()
 			return ErrSuiteServiceActivation
+		}
+		if err := revalidate(); err != nil {
+			markReconcile()
+			return err
 		}
 		if err := c.Platform.Start(*handoff, taskIdentity); err != nil {
 			markReconcile()
