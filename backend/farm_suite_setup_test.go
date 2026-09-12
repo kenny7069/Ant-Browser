@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -158,4 +160,202 @@ func TestSetupCheckpointRecoversInterruptedReplacement(t *testing.T) {
 	if _, err := LoadSetupCheckpoint(path); !errors.Is(err, ErrSetupCheckpoint) {
 		t.Fatalf("unknown field hidden by backup: %v", err)
 	}
+}
+
+func TestSetupCheckpointRejectsUnsafePrimaryAndBackup(t *testing.T) {
+	requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+	checkpoint := SetupCheckpoint{SchemaVersion: 1, Stage: SetupPrecheck, RequestUID: requestUID}
+	raw, _ := json.Marshal(checkpoint)
+	for _, location := range []string{"primary", "backup"} {
+		for _, test := range []struct {
+			name  string
+			write func(*testing.T, string)
+		}{
+			{"oversize", func(t *testing.T, path string) {
+				if err := os.WriteFile(path, bytes.Repeat([]byte{'x'}, maxSetupCheckpointBytes+1), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"directory", func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"symlink", func(t *testing.T, path string) {
+				target := filepath.Join(t.TempDir(), "target.json")
+				if err := os.WriteFile(target, raw, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			}},
+		} {
+			t.Run(location+" "+test.name, func(t *testing.T) {
+				root := t.TempDir()
+				path := filepath.Join(root, "setup.json")
+				badPath, goodPath := path, path+".bak"
+				if location == "backup" {
+					badPath, goodPath = goodPath, badPath
+				}
+				if err := os.WriteFile(goodPath, append(raw, '\n'), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				test.write(t, badPath)
+				if _, err := LoadSetupCheckpoint(path); !errors.Is(err, errSetupCheckpointUnsafeFile) {
+					t.Fatalf("unsafe evidence error=%v", err)
+				}
+			})
+		}
+	}
+	if runtime.GOOS != "windows" {
+		for _, location := range []string{"primary", "backup"} {
+			t.Run(location+" wrong mode", func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "setup.json")
+				badPath, goodPath := path, path+".bak"
+				if location == "backup" {
+					badPath, goodPath = goodPath, badPath
+				}
+				if err := os.WriteFile(goodPath, raw, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(badPath, raw, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := LoadSetupCheckpoint(path); !errors.Is(err, errSetupCheckpointUnsafeFile) {
+					t.Fatalf("wrong mode error=%v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestSetupCheckpointClosedJSONCannotBeHiddenByOtherCopy(t *testing.T) {
+	requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+	checkpoint := SetupCheckpoint{SchemaVersion: 1, Stage: SetupPrecheck, RequestUID: requestUID}
+	valid, _ := json.Marshal(checkpoint)
+	bad := map[string][]byte{
+		"duplicate":         []byte(`{"schema_version":1,"stage":"PRECHECK","stage":"PRECHECK","request_uid":"b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"}`),
+		"unknown":           []byte(`{"schema_version":1,"stage":"PRECHECK","request_uid":"b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6","private_key":"secret"}`),
+		"unknown truncated": []byte(`{"schema_version":1,"private_key":"secret",`),
+		"trailing":          append(append([]byte{}, valid...), []byte(` {}`)...),
+	}
+	for _, location := range []string{"primary", "backup"} {
+		for name, malformed := range bad {
+			t.Run(location+" "+name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "setup.json")
+				badPath, goodPath := path, path+".bak"
+				if location == "backup" {
+					badPath, goodPath = goodPath, badPath
+				}
+				if err := os.WriteFile(goodPath, valid, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(badPath, malformed, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := LoadSetupCheckpoint(path); !errors.Is(err, ErrSetupCheckpoint) {
+					t.Fatalf("closed JSON error=%v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestSetupCheckpointPrimaryBackupConsistency(t *testing.T) {
+	requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+	otherUID := "64473c80-0e26-4d7d-9b17-fd9cc6c959d8"
+	for _, test := range []struct {
+		name    string
+		primary SetupCheckpoint
+		backup  SetupCheckpoint
+		valid   bool
+	}{
+		{"same stage", SetupCheckpoint{1, SetupStaged, requestUID}, SetupCheckpoint{1, SetupStaged, requestUID}, true},
+		{"previous stage", SetupCheckpoint{1, SetupStaged, requestUID}, SetupCheckpoint{1, SetupPrecheck, requestUID}, true},
+		{"future backup", SetupCheckpoint{1, SetupPrecheck, requestUID}, SetupCheckpoint{1, SetupStaged, requestUID}, false},
+		{"nonadjacent backup", SetupCheckpoint{1, SetupConfigDrafted, requestUID}, SetupCheckpoint{1, SetupPrecheck, requestUID}, false},
+		{"different request", SetupCheckpoint{1, SetupStaged, requestUID}, SetupCheckpoint{1, SetupPrecheck, otherUID}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "setup.json")
+			if err := writeSetupCheckpointFile(path, test.primary); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeSetupCheckpointFile(path+".bak", test.backup); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadSetupCheckpoint(path)
+			if test.valid {
+				if err != nil || loaded == nil || *loaded != test.primary {
+					t.Fatalf("loaded=%+v err=%v", loaded, err)
+				}
+			} else if !errors.Is(err, ErrSetupCheckpoint) {
+				t.Fatalf("inconsistent evidence accepted: %+v", loaded)
+			}
+		})
+	}
+}
+
+func TestSetupCheckpointMissingOrMalformedPrimaryRecoveryIsBounded(t *testing.T) {
+	requestUID := "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"
+	backup := SetupCheckpoint{SchemaVersion: 1, Stage: SetupPrecheck, RequestUID: requestUID}
+	for _, test := range []struct {
+		name       string
+		primaryRaw []byte
+	}{
+		{"missing", nil},
+		{"empty", []byte{}},
+		{"truncated", []byte(`{"schema_version":1,"stage":`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "setup.json")
+			if test.primaryRaw != nil {
+				if err := os.WriteFile(path, test.primaryRaw, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writeSetupCheckpointFile(path+".bak", backup); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadSetupCheckpoint(path)
+			if err != nil || loaded == nil || *loaded != backup {
+				t.Fatalf("loaded=%+v err=%v", loaded, err)
+			}
+			if err := SaveSetupCheckpoint(path, backup); err != nil {
+				t.Fatalf("restore primary: %v", err)
+			}
+			if restored, err := LoadSetupCheckpoint(path); err != nil || restored == nil || *restored != backup {
+				t.Fatalf("restored=%+v err=%v", restored, err)
+			}
+		})
+	}
+
+	t.Run("malformed backup cannot be hidden", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "setup.json")
+		if err := writeSetupCheckpointFile(path, backup); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path+".bak", []byte(`{"schema_version":`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadSetupCheckpoint(path); !errors.Is(err, ErrSetupCheckpoint) {
+			t.Fatalf("malformed backup hidden: %v", err)
+		}
+	})
+
+	t.Run("exact size limit", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "setup.json")
+		raw, _ := json.Marshal(backup)
+		raw = append(raw, bytes.Repeat([]byte{' '}, maxSetupCheckpointBytes-len(raw))...)
+		if len(raw) != maxSetupCheckpointBytes {
+			t.Fatal("bad boundary fixture")
+		}
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if loaded, err := LoadSetupCheckpoint(path); err != nil || loaded == nil || *loaded != backup {
+			t.Fatalf("boundary loaded=%+v err=%v", loaded, err)
+		}
+	})
 }

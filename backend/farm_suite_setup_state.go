@@ -7,8 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -35,6 +34,12 @@ var setupStageOrder = []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafte
 
 var ErrSetupCheckpoint = errors.New("invalid suite setup checkpoint")
 var errSetupCheckpointUnknownField = errors.New("unknown suite setup checkpoint field")
+var errSetupCheckpointUnsafeFile = errors.New("unsafe suite setup checkpoint file")
+var errSetupCheckpointDuplicateField = errors.New("duplicate suite setup checkpoint field")
+var errSetupCheckpointTrailingData = errors.New("trailing suite setup checkpoint data")
+var errSetupCheckpointSchema = errors.New("invalid suite setup checkpoint schema")
+
+const maxSetupCheckpointBytes = 16 << 10
 
 // SetupCheckpoint records confirmed progress only. RequestUID is a stable,
 // non-secret idempotency token reused after an enrollment response is lost.
@@ -71,14 +76,24 @@ func LoadSetupCheckpoint(path string) (*SetupCheckpoint, error) {
 		return nil, err
 	}
 	primary, primaryErr := readSetupCheckpointFile(path)
-	if primaryErr == nil && primary != nil {
+	backup, backupErr := readSetupCheckpointFile(path + ".bak")
+	for _, candidateErr := range []error{primaryErr, backupErr} {
+		if setupCheckpointErrorMustFailClosed(candidateErr) {
+			return nil, candidateErr
+		}
+	}
+	if primary != nil {
+		if backupErr != nil {
+			return nil, backupErr
+		}
+		if backup != nil {
+			if err := validateSetupCheckpointPair(*primary, *backup); err != nil {
+				return nil, err
+			}
+		}
 		return primary, nil
 	}
-	if errors.Is(primaryErr, errSetupCheckpointUnknownField) {
-		return nil, primaryErr
-	}
-	backup, backupErr := readSetupCheckpointFile(path + ".bak")
-	if backupErr == nil && backup != nil {
+	if backup != nil {
 		return backup, nil
 	}
 	if primaryErr != nil {
@@ -91,12 +106,16 @@ func LoadSetupCheckpoint(path string) (*SetupCheckpoint, error) {
 }
 
 func readSetupCheckpointFile(path string) (*SetupCheckpoint, error) {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
+	data, exists, err := readSetupCheckpointOwnerFile(path)
+	if err != nil || !exists {
 		return nil, err
+	}
+	duplicateErr := rejectSuiteReleaseDuplicateJSONKeys(data)
+	if keyErr := setupCheckpointClosedKeyError(data); keyErr != nil {
+		return nil, keyErr
+	}
+	if duplicateErr != nil && strings.Contains(duplicateErr.Error(), "duplicate or case-folded JSON key") {
+		return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointDuplicateField)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -107,14 +126,126 @@ func readSetupCheckpointFile(path string) (*SetupCheckpoint, error) {
 		}
 		return nil, fmt.Errorf("%w: decode", ErrSetupCheckpoint)
 	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: trailing data", ErrSetupCheckpoint)
+	if duplicateErr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointTrailingData)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointTrailingData)
+	}
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(data, &keys) != nil || len(keys) != 3 {
+		return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointSchema)
+	}
+	for _, key := range []string{"schema_version", "stage", "request_uid"} {
+		if _, ok := keys[key]; !ok {
+			return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnknownField)
+		}
 	}
 	if err := checkpoint.validate(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointSchema)
 	}
 	return &checkpoint, nil
+}
+
+func setupCheckpointClosedKeyError(raw []byte) error {
+	allowed := map[string]struct{}{"schema_version": {}, "stage": {}, "request_uid": {}}
+	seen := map[string]struct{}{}
+	for offset := 0; offset < len(raw); {
+		if raw[offset] != '"' {
+			offset++
+			continue
+		}
+		start := offset
+		offset++
+		closed := false
+		for offset < len(raw) {
+			if raw[offset] == '\\' {
+				offset += 2
+				continue
+			}
+			if raw[offset] == '"' {
+				offset++
+				closed = true
+				break
+			}
+			offset++
+		}
+		if !closed || offset > len(raw) {
+			return nil
+		}
+		decoded, err := strconv.Unquote(string(raw[start:offset]))
+		if err != nil {
+			return nil
+		}
+		next := offset
+		for next < len(raw) && (raw[next] == ' ' || raw[next] == '\t' || raw[next] == '\r' || raw[next] == '\n') {
+			next++
+		}
+		if next >= len(raw) || raw[next] != ':' {
+			continue
+		}
+		if _, ok := allowed[decoded]; !ok {
+			return fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnknownField)
+		}
+		folded := strings.ToLower(decoded)
+		if _, ok := seen[folded]; ok {
+			return fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointDuplicateField)
+		}
+		seen[folded] = struct{}{}
+	}
+	return nil
+}
+
+func readSetupCheckpointOwnerFile(path string) ([]byte, bool, error) {
+	initial, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil || initial.Mode()&os.ModeSymlink != 0 || !initial.Mode().IsRegular() || initial.Size() > maxSetupCheckpointBytes {
+		return nil, true, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnsafeFile)
+	}
+	if err := validateSuiteSetupPathSecurity(path, false); err != nil {
+		return nil, true, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnsafeFile)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, true, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnsafeFile)
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(initial, opened) || opened.Size() != initial.Size() {
+		return nil, true, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnsafeFile)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxSetupCheckpointBytes+1))
+	if err != nil || len(data) > maxSetupCheckpointBytes || int64(len(data)) != opened.Size() {
+		return nil, true, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnsafeFile)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, true, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnsafeFile)
+	}
+	confirmed, err := io.ReadAll(io.LimitReader(file, maxSetupCheckpointBytes+1))
+	if err != nil || !bytes.Equal(data, confirmed) {
+		return nil, true, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnsafeFile)
+	}
+	current, err := os.Lstat(path)
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(opened, current) || validateSuiteSetupPathSecurity(path, false) != nil {
+		return nil, true, fmt.Errorf("%w: %w", ErrSetupCheckpoint, errSetupCheckpointUnsafeFile)
+	}
+	return data, true, nil
+}
+
+func setupCheckpointErrorMustFailClosed(err error) bool {
+	return errors.Is(err, errSetupCheckpointUnsafeFile) || errors.Is(err, errSetupCheckpointUnknownField) ||
+		errors.Is(err, errSetupCheckpointDuplicateField) || errors.Is(err, errSetupCheckpointTrailingData) || errors.Is(err, errSetupCheckpointSchema)
+}
+
+func validateSetupCheckpointPair(primary, backup SetupCheckpoint) error {
+	primaryStage, backupStage := setupStageIndex(primary.Stage), setupStageIndex(backup.Stage)
+	if primary.RequestUID != backup.RequestUID || backupStage > primaryStage || primaryStage-backupStage > 1 ||
+		(backupStage == primaryStage && primary != backup) {
+		return fmt.Errorf("%w: inconsistent primary and backup", ErrSetupCheckpoint)
+	}
+	return nil
 }
 
 // SaveSetupCheckpoint writes a single confirmed step. Callers must serialize
@@ -166,44 +297,9 @@ func SaveSetupCheckpoint(path string, next SetupCheckpoint) error {
 }
 
 func writeSetupCheckpointFile(path string, next SetupCheckpoint) error {
-	parent := filepath.Dir(path)
-	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(parent, ".suite-checkpoint-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
-	if err := tmp.Chmod(0o600); err != nil {
-		return err
-	}
 	data, err := json.Marshal(next)
 	if err != nil {
 		return err
 	}
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		return err
-	}
-	dir, err := os.Open(parent)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	// Windows does not expose a portable directory fsync handle through os.Open.
-	// The checkpoint file itself was synced before the atomic rename.
-	if err := dir.Sync(); err != nil && runtime.GOOS != "windows" {
-		return err
-	}
-	return nil
+	return writeOwnerAtomic(path, append(data, '\n'))
 }
