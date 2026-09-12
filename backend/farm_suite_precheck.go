@@ -213,7 +213,9 @@ func validateSuitePrecheckRootLayout(roots SuiteUserRoots, source string) error 
 	}
 	for left := range resolved {
 		for right := left + 1; right < len(resolved); right++ {
-			if os.SameFile(identities[left], identities[right]) || suitePrecheckPathContains(resolved[left], resolved[right]) || suitePrecheckPathContains(resolved[right], resolved[left]) {
+			leftContainsRight, leftErr := suitePrecheckIdentityContains(resolved[left], identities[left], resolved[right])
+			rightContainsLeft, rightErr := suitePrecheckIdentityContains(resolved[right], identities[right], resolved[left])
+			if leftErr != nil || rightErr != nil || os.SameFile(identities[left], identities[right]) || leftContainsRight || rightContainsLeft {
 				return ErrSuiteCanonicalPrecheck
 			}
 		}
@@ -279,11 +281,28 @@ func inspectSuitePrecheckFootprint(roots SuiteUserRoots, bootstrap BootstrapConf
 }
 
 func suitePrecheckPathContains(root, candidate string) bool {
-	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
-		root, candidate = strings.ToLower(root), strings.ToLower(candidate)
-	}
 	relative, err := filepath.Rel(root, candidate)
 	return err == nil && (relative == "." || (relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator))))
+}
+
+func suitePrecheckIdentityContains(root string, rootInfo os.FileInfo, candidate string) (bool, error) {
+	if suitePrecheckPathContains(root, candidate) {
+		return true, nil
+	}
+	for current := candidate; ; {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false, nil
+		}
+		info, err := os.Stat(parent)
+		if err != nil {
+			return false, err
+		}
+		if os.SameFile(rootInfo, info) {
+			return true, nil
+		}
+		current = parent
+	}
 }
 
 func requireEmptySuiteBrowserData(path string) error {

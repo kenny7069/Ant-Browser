@@ -364,6 +364,50 @@ func TestSuiteCanonicalPrecheckRejectsResolvedPathAliases(t *testing.T) {
 	})
 }
 
+func TestSuitePrecheckContainmentUsesFilesystemIdentity(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeDirectory := func(name string) string {
+		path := filepath.Join(base, name)
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Run("case distinct siblings", func(t *testing.T) {
+		upper := makeDirectory("Data")
+		lower := makeDirectory("data")
+		upperInfo, upperErr := os.Stat(upper)
+		lowerInfo, lowerErr := os.Stat(lower)
+		if upperErr != nil || lowerErr != nil || os.SameFile(upperInfo, lowerInfo) {
+			t.Skip("filesystem is case-insensitive")
+		}
+		roots := SuiteUserRoots{Config: upper, BrowserData: lower, AgentState: makeDirectory("state"), Logs: makeDirectory("logs")}
+		if err := validateSuitePrecheckRootLayout(roots, makeDirectory("source")); err != nil {
+			t.Fatalf("case-distinct sibling directories rejected: %v", err)
+		}
+	})
+	t.Run("physical ancestor", func(t *testing.T) {
+		parent := makeDirectory("Parent")
+		child := filepath.Join(parent, "Child")
+		if err := os.MkdirAll(child, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		aliasParent := filepath.Join(base, "parent")
+		if parentInfo, parentErr := os.Stat(parent); parentErr == nil {
+			if aliasInfo, aliasErr := os.Stat(aliasParent); aliasErr != nil || !os.SameFile(parentInfo, aliasInfo) {
+				aliasParent = parent
+			}
+		}
+		roots := SuiteUserRoots{Config: parent, BrowserData: filepath.Join(aliasParent, "Child"), AgentState: makeDirectory("other-state"), Logs: makeDirectory("other-logs")}
+		if err := validateSuitePrecheckRootLayout(roots, makeDirectory("other-source")); err == nil {
+			t.Fatal("physical ancestor overlap accepted")
+		}
+	})
+}
+
 func TestSuiteCanonicalPrecheckRejectsUnrecognizedMutableFootprint(t *testing.T) {
 	for _, test := range []struct {
 		name string
