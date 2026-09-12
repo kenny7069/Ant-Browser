@@ -376,6 +376,15 @@ func TestSuitePrecheckContainmentUsesFilesystemIdentity(t *testing.T) {
 		}
 		return path
 	}
+	t.Run("distinct inode siblings", func(t *testing.T) {
+		roots := SuiteUserRoots{
+			Config: makeDirectory("sibling-config"), BrowserData: makeDirectory("sibling-browser"),
+			AgentState: makeDirectory("sibling-state"), Logs: makeDirectory("sibling-logs"),
+		}
+		if err := validateSuitePrecheckRootLayout(roots, makeDirectory("sibling-source")); err != nil {
+			t.Fatalf("distinct physical siblings rejected: %v", err)
+		}
+	})
 	t.Run("case distinct siblings", func(t *testing.T) {
 		upper := makeDirectory("Data")
 		lower := makeDirectory("data")

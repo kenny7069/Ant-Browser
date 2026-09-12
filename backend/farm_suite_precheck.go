@@ -229,21 +229,11 @@ func captureSuitePrecheckRootLayout(roots SuiteUserRoots, source string) (*suite
 	}
 	for left := range resolved {
 		for right := left + 1; right < len(resolved); right++ {
-			leftContainsRight, leftErr := suitePrecheckIdentityContains(resolved[left], identities[left], resolved[right])
-			rightContainsLeft, rightErr := suitePrecheckIdentityContains(resolved[right], identities[right], resolved[left])
+			leftContainsRight, leftErr := suitePrecheckIdentityContains(identities[left], resolved[right])
+			rightContainsLeft, rightErr := suitePrecheckIdentityContains(identities[right], resolved[left])
 			if leftErr != nil || rightErr != nil || os.SameFile(identities[left], identities[right]) || leftContainsRight || rightContainsLeft {
 				return nil, ErrSuiteCanonicalPrecheck
 			}
-		}
-	}
-	for left := range mutable {
-		for right := left + 1; right < len(mutable); right++ {
-			if suitePrecheckPathContains(mutable[left], mutable[right]) || suitePrecheckPathContains(mutable[right], mutable[left]) {
-				return nil, ErrSuiteCanonicalPrecheck
-			}
-		}
-		if suitePrecheckPathContains(mutable[left], source) || suitePrecheckPathContains(source, mutable[left]) {
-			return nil, ErrSuiteCanonicalPrecheck
 		}
 	}
 	return &suitePrecheckRootLayoutSnapshot{identities: identities}, nil
@@ -312,19 +302,11 @@ func inspectSuitePrecheckFootprint(roots SuiteUserRoots, bootstrap BootstrapConf
 	return nil
 }
 
-func suitePrecheckPathContains(root, candidate string) bool {
-	relative, err := filepath.Rel(root, candidate)
-	return err == nil && (relative == "." || (relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator))))
-}
-
 func suitePrecheckWindowsResolvedPathMatches(left, right string) bool {
 	return strings.EqualFold(left, right)
 }
 
-func suitePrecheckIdentityContains(root string, rootInfo os.FileInfo, candidate string) (bool, error) {
-	if suitePrecheckPathContains(root, candidate) {
-		return true, nil
-	}
+func suitePrecheckIdentityContains(rootInfo os.FileInfo, candidate string) (bool, error) {
 	for current := candidate; ; {
 		parent := filepath.Dir(current)
 		if parent == current {
