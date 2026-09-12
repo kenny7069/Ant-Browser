@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -222,6 +223,9 @@ func readSuiteBootstrapEnrollmentOwnerFile(path string) ([]byte, bool, error) {
 }
 
 func suiteBootstrapEnrollmentJSONContainsSecretKey(raw []byte) bool {
+	if len(raw) > maxSuiteBootstrapEnrollmentStateBytes {
+		return true
+	}
 	if json.Valid(raw) {
 		var value any
 		decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -231,13 +235,59 @@ func suiteBootstrapEnrollmentJSONContainsSecretKey(raw []byte) bool {
 		}
 		return suiteBootstrapEnrollmentValueContainsSecretKey(value)
 	}
-	lower := strings.ToLower(string(raw))
-	for key := range suiteBootstrapEnrollmentSecretKeys() {
-		if strings.Contains(lower, `"`+key+`"`) {
+	return suiteBootstrapEnrollmentMalformedJSONContainsSecretKey(raw)
+}
+
+func suiteBootstrapEnrollmentMalformedJSONContainsSecretKey(raw []byte) bool {
+	secretKeys := suiteBootstrapEnrollmentSecretKeys()
+	for offset := 0; offset < len(raw); {
+		if raw[offset] != '"' {
+			offset++
+			continue
+		}
+		start := offset
+		offset++
+		closed := false
+		for offset < len(raw) {
+			switch raw[offset] {
+			case '\\':
+				offset++
+				if offset >= len(raw) {
+					return true
+				}
+				offset++
+			case '"':
+				closed = true
+				offset++
+			default:
+				offset++
+			}
+			if closed {
+				break
+			}
+		}
+		if !closed {
 			return true
+		}
+		decoded, err := strconv.Unquote(string(raw[start:offset]))
+		if err != nil {
+			return true
+		}
+		next := offset
+		for next < len(raw) && isSuiteBootstrapJSONWhitespace(raw[next]) {
+			next++
+		}
+		if next < len(raw) && raw[next] == ':' {
+			if _, forbidden := secretKeys[strings.ToLower(decoded)]; forbidden {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func isSuiteBootstrapJSONWhitespace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
 }
 
 func suiteBootstrapEnrollmentValueContainsSecretKey(value any) bool {

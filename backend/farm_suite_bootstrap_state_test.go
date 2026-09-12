@@ -184,6 +184,98 @@ func TestSuiteBootstrapEnrollmentAttemptSecretDetectorChecksKeysNotValues(t *tes
 	}
 }
 
+func TestSuiteBootstrapEnrollmentMalformedJSONSecretScanner(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		raw    string
+		unsafe bool
+	}{
+		{"escaped secret key", `{"\u0074oken":"secret",`, true},
+		{"secret word value", `{"node_uid":"token",`, false},
+		{"escaped secret word value", `{"node_uid":"\u0074oken",`, false},
+		{"unterminated escape", `{"node_uid":"value\`, true},
+		{"invalid escape", `{"node_uid":"\q",`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := suiteBootstrapEnrollmentJSONContainsSecretKey([]byte(test.raw)); got != test.unsafe {
+				t.Fatalf("unsafe=%v want=%v", got, test.unsafe)
+			}
+		})
+	}
+}
+
+func TestSuiteBootstrapEnrollmentMalformedSecretEvidencePrimaryAndBackup(t *testing.T) {
+	valid := suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapIdentityReady)
+	for _, location := range []string{"primary", "backup"} {
+		t.Run(location+" escaped secret key", func(t *testing.T) {
+			roots := suiteBootstrapEnrollmentTestRoots(t)
+			path := filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName)
+			malformedPath := path
+			validPath := path + ".bak"
+			if location == "backup" {
+				malformedPath, validPath = validPath, malformedPath
+			}
+			if err := writeSuiteBootstrapEnrollmentAttemptFile(validPath, valid); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeOwnerAtomic(malformedPath, []byte(`{"\u0074oken":"secret",`)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadSuiteBootstrapEnrollmentAttempt(roots); !errors.Is(err, errSuiteBootstrapEnrollmentUnsafe) {
+				t.Fatalf("escaped secret key error=%v", err)
+			}
+		})
+
+		t.Run(location+" unterminated escape", func(t *testing.T) {
+			roots := suiteBootstrapEnrollmentTestRoots(t)
+			path := filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName)
+			malformedPath := path
+			validPath := path + ".bak"
+			if location == "backup" {
+				malformedPath, validPath = validPath, malformedPath
+			}
+			if err := writeSuiteBootstrapEnrollmentAttemptFile(validPath, valid); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeOwnerAtomic(malformedPath, []byte(`{"node_uid":"value\`)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadSuiteBootstrapEnrollmentAttempt(roots); !errors.Is(err, errSuiteBootstrapEnrollmentUnsafe) {
+				t.Fatalf("unterminated token error=%v", err)
+			}
+		})
+	}
+
+	t.Run("ordinary corrupt primary falls back", func(t *testing.T) {
+		roots := suiteBootstrapEnrollmentTestRoots(t)
+		path := filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName)
+		if err := writeOwnerAtomic(path, []byte(`{"node_uid":"token",`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeSuiteBootstrapEnrollmentAttemptFile(path+".bak", valid); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := loadSuiteBootstrapEnrollmentAttempt(roots)
+		if err != nil || loaded == nil || *loaded != valid {
+			t.Fatalf("loaded=%+v err=%v", loaded, err)
+		}
+	})
+
+	t.Run("ordinary corrupt backup is not classified secret", func(t *testing.T) {
+		roots := suiteBootstrapEnrollmentTestRoots(t)
+		path := filepath.Join(roots.AgentState, SuiteBootstrapEnrollmentAttemptName)
+		if err := writeSuiteBootstrapEnrollmentAttemptFile(path, valid); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeOwnerAtomic(path+".bak", []byte(`{"node_uid":"password",`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadSuiteBootstrapEnrollmentAttempt(roots); !errors.Is(err, ErrSuiteBootstrapEnrollmentState) || errors.Is(err, errSuiteBootstrapEnrollmentUnsafe) {
+			t.Fatalf("ordinary corruption classification error=%v", err)
+		}
+	})
+}
+
 func TestSuiteBootstrapEnrollmentAttemptACKRequiresRequestBackupAndStableIdempotency(t *testing.T) {
 	ack := suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapAcknowledged)
 	request := suiteBootstrapEnrollmentAttemptFixture(SuiteBootstrapRequestReady)
