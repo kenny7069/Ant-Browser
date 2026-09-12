@@ -34,15 +34,19 @@ var (
 // GUI startup. It contains paths and digests only; identity keys and enrollment
 // material remain in the protected client configuration and secret store.
 type SuiteOwnershipHandoff struct {
-	SchemaVersion      int    `json:"schema_version"`
-	HandoffState       string `json:"handoff_state"`
-	SetupRequestUID    string `json:"setup_request_uid"`
-	GUIBinaryPath      string `json:"gui_binary_path"`
-	SuiteBinaryRoot    string `json:"suite_binary_root"`
-	ClientConfigPath   string `json:"client_config_path"`
-	AgentStateRoot     string `json:"agent_state_root"`
-	ApplicationRoot    string `json:"application_root"`
-	ClientConfigSHA256 string `json:"client_config_sha256"`
+	SchemaVersion      int                `json:"schema_version"`
+	HandoffState       string             `json:"handoff_state"`
+	SetupRequestUID    string             `json:"setup_request_uid"`
+	GUIBinaryPath      string             `json:"gui_binary_path"`
+	SuiteBinaryRoot    string             `json:"suite_binary_root"`
+	ClientConfigPath   string             `json:"client_config_path"`
+	AntConfigPath      string             `json:"ant_config_path"`
+	AgentStateRoot     string             `json:"agent_state_root"`
+	ApplicationRoot    string             `json:"application_root"`
+	ClientConfigSHA256 string             `json:"client_config_sha256"`
+	ManifestSHA256     string             `json:"manifest_sha256"`
+	SetupStageID       string             `json:"setup_stage_id"`
+	ReleaseTarget      SuiteReleaseTarget `json:"release_target"`
 }
 
 type SuiteGUIInvocation struct {
@@ -66,6 +70,10 @@ func FinalizeSuiteOwnershipHandoff(roots SuiteUserRoots, setupRequestUID, suiteB
 	if err != nil || checkpoint == nil || checkpoint.Stage != SetupBootstrapDrafted || checkpoint.RequestUID != setupRequestUID {
 		return SuiteOwnershipHandoff{}, fmt.Errorf("%w: setup preparation mismatch", ErrSuiteOwnershipHandoff)
 	}
+	plan, err := LoadSuiteSetupPlan(roots)
+	if err != nil || plan == nil || plan.PreparationRequestUID != checkpoint.RequestUID || plan.BootstrapSHA256 != checkpoint.BootstrapSHA256 {
+		return SuiteOwnershipHandoff{}, fmt.Errorf("%w: immutable setup plan mismatch", ErrSuiteOwnershipHandoff)
+	}
 	configPath := filepath.Join(roots.Config, SuiteClientConfigName)
 	config, digest, err := loadSuiteHandoffClientConfig(configPath)
 	if err != nil {
@@ -74,6 +82,9 @@ func FinalizeSuiteOwnershipHandoff(roots SuiteUserRoots, setupRequestUID, suiteB
 	if !sameSuiteHandoffPath(config.StateRoot, roots.AgentState) {
 		return SuiteOwnershipHandoff{}, fmt.Errorf("%w: agent state root mismatch", ErrSuiteOwnershipHandoff)
 	}
+	if !sameSuiteHandoffPath(config.AntConfigPath, filepath.Join(config.ApplicationRoot, "config.yaml")) {
+		return SuiteOwnershipHandoff{}, fmt.Errorf("%w: Ant config path is not canonical", ErrSuiteOwnershipHandoff)
+	}
 	if err := validateSuiteMutableApplicationRoot(config.ApplicationRoot, roots.BrowserData); err != nil {
 		return SuiteOwnershipHandoff{}, err
 	}
@@ -81,11 +92,20 @@ func FinalizeSuiteOwnershipHandoff(roots SuiteUserRoots, setupRequestUID, suiteB
 	if err != nil {
 		return SuiteOwnershipHandoff{}, err
 	}
+	manifest, manifestDigest, err := validateInstalledSuiteRelease(suiteBinaryRoot, *plan)
+	if err != nil {
+		return SuiteOwnershipHandoff{}, err
+	}
+	if !sameSuiteHandoffPath(guiBinaryPath, filepath.Join(suiteBinaryRoot, "AntBrowser.exe")) || manifest.Version != filepath.Base(suiteBinaryRoot) || filepath.Base(filepath.Dir(suiteBinaryRoot)) != "versions" {
+		return SuiteOwnershipHandoff{}, fmt.Errorf("%w: unplanned Suite version root or GUI", ErrSuiteOwnershipHandoff)
+	}
 	handoff := SuiteOwnershipHandoff{
 		SchemaVersion: 1, HandoffState: suiteHandoffIntentDurable, SetupRequestUID: checkpoint.RequestUID,
 		GUIBinaryPath: guiBinaryPath, SuiteBinaryRoot: suiteBinaryRoot, ClientConfigPath: configPath,
+		AntConfigPath:  config.AntConfigPath,
 		AgentStateRoot: config.StateRoot, ApplicationRoot: config.ApplicationRoot,
 		ClientConfigSHA256: digest,
+		ManifestSHA256:     manifestDigest, SetupStageID: plan.StageID, ReleaseTarget: plan.Target,
 	}
 	if err := validateSuiteOwnershipHandoffValue(handoff, roots); err != nil {
 		return SuiteOwnershipHandoff{}, err
@@ -121,13 +141,24 @@ func LoadSuiteOwnershipHandoff(roots SuiteUserRoots) (*SuiteOwnershipHandoff, er
 	if err != nil || checkpoint == nil || checkpoint.Stage != SetupBootstrapDrafted || checkpoint.RequestUID != handoff.SetupRequestUID {
 		return nil, fmt.Errorf("%w: setup preparation mismatch", ErrSuiteOwnershipHandoff)
 	}
+	plan, err := LoadSuiteSetupPlan(roots)
+	if err != nil || plan == nil || plan.PreparationRequestUID != checkpoint.RequestUID || plan.BootstrapSHA256 != checkpoint.BootstrapSHA256 ||
+		plan.ManifestSHA256 != handoff.ManifestSHA256 || plan.StageID != handoff.SetupStageID || plan.Target != handoff.ReleaseTarget {
+		return nil, fmt.Errorf("%w: immutable setup plan mismatch", ErrSuiteOwnershipHandoff)
+	}
 	config, digest, err := loadSuiteHandoffClientConfig(handoff.ClientConfigPath)
 	if err != nil || digest != handoff.ClientConfigSHA256 || !sameSuiteHandoffPath(config.StateRoot, handoff.AgentStateRoot) ||
-		!sameSuiteHandoffPath(config.ApplicationRoot, handoff.ApplicationRoot) {
+		!sameSuiteHandoffPath(config.ApplicationRoot, handoff.ApplicationRoot) || !sameSuiteHandoffPath(config.AntConfigPath, handoff.AntConfigPath) ||
+		!sameSuiteHandoffPath(config.AntConfigPath, filepath.Join(config.ApplicationRoot, "config.yaml")) {
 		return nil, fmt.Errorf("%w: client configuration mismatch", ErrSuiteOwnershipHandoff)
 	}
 	if _, _, err := validateSuiteImmutableGUIPath(handoff.GUIBinaryPath, handoff.SuiteBinaryRoot); err != nil {
 		return nil, err
+	}
+	manifest, digest, err := validateInstalledSuiteRelease(handoff.SuiteBinaryRoot, *plan)
+	if err != nil || digest != handoff.ManifestSHA256 || manifest.Version != filepath.Base(handoff.SuiteBinaryRoot) ||
+		filepath.Base(filepath.Dir(handoff.SuiteBinaryRoot)) != "versions" || !sameSuiteHandoffPath(handoff.GUIBinaryPath, filepath.Join(handoff.SuiteBinaryRoot, "AntBrowser.exe")) {
+		return nil, fmt.Errorf("%w: installed Suite release mismatch", ErrSuiteOwnershipHandoff)
 	}
 	if err := validateSuiteMutableApplicationRoot(handoff.ApplicationRoot, roots.BrowserData); err != nil {
 		return nil, err
@@ -224,14 +255,15 @@ func loadSuiteHandoffClientConfig(path string) (FarmClientConfig, string, error)
 }
 
 func validateSuiteOwnershipHandoffValue(handoff SuiteOwnershipHandoff, roots SuiteUserRoots) error {
-	if handoff.SchemaVersion != 1 || handoff.HandoffState != suiteHandoffIntentDurable || !validLowerSHA256(handoff.ClientConfigSHA256) {
+	if handoff.SchemaVersion != 1 || handoff.HandoffState != suiteHandoffIntentDurable || !validLowerSHA256(handoff.ClientConfigSHA256) ||
+		!validLowerSHA256(handoff.ManifestSHA256) || handoff.SetupStageID != deriveSuiteSetupStageID(handoff.ManifestSHA256, handoff.ReleaseTarget) || !validSuiteReleaseTarget(handoff.ReleaseTarget) {
 		return ErrSuiteOwnershipHandoff
 	}
 	parsed, err := uuid.Parse(handoff.SetupRequestUID)
 	if err != nil || parsed.String() != handoff.SetupRequestUID {
 		return ErrSuiteOwnershipHandoff
 	}
-	for _, path := range []string{handoff.GUIBinaryPath, handoff.SuiteBinaryRoot, handoff.ClientConfigPath, handoff.AgentStateRoot, handoff.ApplicationRoot} {
+	for _, path := range []string{handoff.GUIBinaryPath, handoff.SuiteBinaryRoot, handoff.ClientConfigPath, handoff.AntConfigPath, handoff.AgentStateRoot, handoff.ApplicationRoot} {
 		if strings.TrimSpace(path) != path || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 			return ErrSuiteOwnershipHandoff
 		}
@@ -281,15 +313,116 @@ func validateSuiteMutableApplicationRoot(applicationRoot, browserDataRoot string
 	return nil
 }
 
+func validateInstalledSuiteRelease(suiteBinaryRoot string, plan SuiteSetupPlan) (SuiteReleaseManifest, string, error) {
+	if err := plan.Validate(); err != nil {
+		return SuiteReleaseManifest{}, "", fmt.Errorf("%w: setup plan", ErrSuiteOwnershipHandoff)
+	}
+	manifestPath := filepath.Join(suiteBinaryRoot, "release-manifest.json")
+	info, err := os.Lstat(manifestPath)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxSuiteReleaseManifestBytes {
+		return SuiteReleaseManifest{}, "", fmt.Errorf("%w: installed release manifest", ErrSuiteOwnershipHandoff)
+	}
+	resolved, err := filepath.EvalSymlinks(manifestPath)
+	if err != nil || !sameSuiteHandoffPath(resolved, manifestPath) {
+		return SuiteReleaseManifest{}, "", fmt.Errorf("%w: redirected release manifest", ErrSuiteOwnershipHandoff)
+	}
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return SuiteReleaseManifest{}, "", fmt.Errorf("%w: read release manifest", ErrSuiteOwnershipHandoff)
+	}
+	manifest, err := ParseSuiteReleaseManifest(raw)
+	if err != nil {
+		return SuiteReleaseManifest{}, "", fmt.Errorf("%w: parse release manifest", ErrSuiteOwnershipHandoff)
+	}
+	digestBytes := sha256.Sum256(raw)
+	digest := hex.EncodeToString(digestBytes[:])
+	if digest != plan.ManifestSHA256 || manifest.Target != plan.Target {
+		return SuiteReleaseManifest{}, "", fmt.Errorf("%w: release manifest does not match setup plan", ErrSuiteOwnershipHandoff)
+	}
+	required := map[string]bool{
+		"AntBrowser.exe": false, "ant-farm-client.exe": false, "runtime/xray.exe": false,
+		"runtime/sing-box.exe": false, "runtime/chrome/chrome.exe": false, "LICENSES.json": false,
+	}
+	for _, entry := range manifest.Entries {
+		candidate, err := safeSuiteReleaseEntryPath(suiteBinaryRoot, entry.Path)
+		if err != nil {
+			return SuiteReleaseManifest{}, "", err
+		}
+		entryInfo, err := os.Lstat(candidate)
+		if err != nil || entryInfo.Mode()&os.ModeSymlink != 0 || !entryInfo.Mode().IsRegular() || entryInfo.Size() != entry.Size {
+			return SuiteReleaseManifest{}, "", fmt.Errorf("%w: installed entry shape mismatch", ErrSuiteOwnershipHandoff)
+		}
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil || !sameSuiteHandoffPath(resolved, candidate) {
+			return SuiteReleaseManifest{}, "", fmt.Errorf("%w: redirected installed entry", ErrSuiteOwnershipHandoff)
+		}
+		entryDigest, err := streamSuiteInstalledEntryDigest(candidate, entry.Size)
+		if err != nil || entryDigest != entry.SHA256 {
+			return SuiteReleaseManifest{}, "", fmt.Errorf("%w: installed entry digest mismatch", ErrSuiteOwnershipHandoff)
+		}
+		if _, ok := required[entry.Path]; ok {
+			required[entry.Path] = true
+		}
+	}
+	for path, found := range required {
+		if !found {
+			return SuiteReleaseManifest{}, "", fmt.Errorf("%w: release manifest omits %s", ErrSuiteOwnershipHandoff, path)
+		}
+	}
+	return manifest, digest, nil
+}
+
+func streamSuiteInstalledEntryDigest(path string, expectedSize int64) (digest string, resultErr error) {
+	if expectedSize < 0 || expectedSize > maxSuiteReleaseEntryBytes {
+		return "", ErrSuiteOwnershipHandoff
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if closeErr := file.Close(); resultErr == nil && closeErr != nil {
+			resultErr = closeErr
+		}
+	}()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != expectedSize {
+		return "", ErrSuiteOwnershipHandoff
+	}
+	hasher := sha256.New()
+	written, err := io.CopyN(hasher, file, expectedSize+1)
+	if written != expectedSize || !errors.Is(err, io.EOF) {
+		return "", ErrSuiteOwnershipHandoff
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func safeSuiteReleaseEntryPath(root, entryPath string) (string, error) {
+	normalized, _, err := normalizeSuiteReleasePath(entryPath)
+	if err != nil || normalized != entryPath {
+		return "", fmt.Errorf("%w: unsafe release entry path", ErrSuiteOwnershipHandoff)
+	}
+	candidate := filepath.Clean(filepath.Join(root, filepath.FromSlash(entryPath)))
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: release entry escapes Suite root", ErrSuiteOwnershipHandoff)
+	}
+	return candidate, nil
+}
+
 func decodeSuiteOwnershipHandoff(raw []byte, destination *SuiteOwnershipHandoff) error {
 	if len(raw) == 0 || len(raw) > maxSuiteOwnershipHandoffRaw || rejectSuiteReleaseDuplicateJSONKeys(raw) != nil {
 		return ErrSuiteOwnershipHandoff
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &object); err != nil || !exactFarmClientIPCKeys(object, []string{
-		"schema_version", "handoff_state", "setup_request_uid", "gui_binary_path", "suite_binary_root", "client_config_path",
-		"agent_state_root", "application_root", "client_config_sha256",
+		"schema_version", "handoff_state", "setup_request_uid", "gui_binary_path", "suite_binary_root", "client_config_path", "ant_config_path",
+		"agent_state_root", "application_root", "client_config_sha256", "manifest_sha256", "setup_stage_id", "release_target",
 	}) {
+		return ErrSuiteOwnershipHandoff
+	}
+	var targetObject map[string]json.RawMessage
+	if err := json.Unmarshal(object["release_target"], &targetObject); err != nil || !exactFarmClientIPCKeys(targetObject, []string{"os", "arch"}) {
 		return ErrSuiteOwnershipHandoff
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))

@@ -1,8 +1,13 @@
 package backend
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,10 +34,7 @@ func suiteHandoffFixture(t *testing.T) (SuiteUserRoots, SetupPreparationCheckpoi
 	if err := os.MkdirAll(suiteBinaryRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	guiPath := filepath.Join(suiteBinaryRoot, "Ant Browser.exe")
-	if err := os.WriteFile(guiPath, []byte("signed-gui-fixture"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	guiPath := filepath.Join(suiteBinaryRoot, "AntBrowser.exe")
 	config := FarmClientConfig{
 		ApplicationRoot: filepath.Join(roots.BrowserData, "ant-application"), StateRoot: roots.AgentState,
 		ControlURL: "wss://farm.example.test/control/ws", NodeName: "Farm One",
@@ -41,6 +43,7 @@ func suiteHandoffFixture(t *testing.T) (SuiteUserRoots, SetupPreparationCheckpoi
 	if err := ensureOwnerDirectory(config.ApplicationRoot); err != nil {
 		t.Fatal(err)
 	}
+	config.AntConfigPath = filepath.Join(config.ApplicationRoot, "config.yaml")
 	raw, err := yaml.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +61,72 @@ func suiteHandoffFixture(t *testing.T) (SuiteUserRoots, SetupPreparationCheckpoi
 		if err := saveSetupPreparationCheckpoint(path, checkpoint); err != nil {
 			t.Fatal(err)
 		}
+	}
+	files := map[string][]byte{
+		"AntBrowser.exe":                []byte("signed-gui-fixture"),
+		"ant-farm-client.exe":           []byte("signed-agent-fixture"),
+		"runtime/xray.exe":              []byte("signed-xray-fixture"),
+		"runtime/sing-box.exe":          []byte("signed-sing-box-fixture"),
+		"runtime/chrome/chrome.exe":     []byte("signed-chromium-fixture"),
+		"LICENSES.json":                 []byte("license-manifest-fixture"),
+		"licenses/Ant-LICENSE.txt":      []byte("Ant license fixture"),
+		"licenses/Xray-LICENSE.txt":     []byte("Xray license fixture"),
+		"licenses/SingBox-LICENSE.txt":  []byte("Sing-box license fixture"),
+		"licenses/Chromium-LICENSE.txt": []byte("Chromium license fixture"),
+	}
+	entries := make([]SuiteReleaseEntry, 0, len(files))
+	for relative, content := range files {
+		path := filepath.Join(suiteBinaryRoot, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, content, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(content)
+		role, executable := SuiteReleaseEntryLegal, false
+		if strings.HasSuffix(relative, ".exe") {
+			role, executable = SuiteReleaseEntryBinary, true
+		}
+		entries = append(entries, SuiteReleaseEntry{Path: relative, Role: role, Size: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), Executable: executable})
+	}
+	commit := strings.Repeat("a", 40)
+	manifest := SuiteReleaseManifest{
+		SchemaVersion: 1, Version: "1.2.3", Target: SuiteReleaseTarget{OS: "windows", Arch: "amd64"},
+		Commits: SuiteReleaseCommits{AntBrowser: commit, FarmAgent: commit, FarmControl: commit}, ConfigSchema: 1,
+		Capabilities: []string{"setup-plan", "signed-release"}, CoreVersions: map[string]string{"chromium": "128.0.0"},
+		Dependencies: []SuiteReleaseDependency{
+			{Name: "Ant-Browser-Suite", Version: "1.2.3", LicenseRef: "licenses/Ant-LICENSE.txt"},
+			{Name: "Xray-core", Version: "25.1.1", LicenseRef: "licenses/Xray-LICENSE.txt"},
+			{Name: "sing-box", Version: "1.11.0", LicenseRef: "licenses/SingBox-LICENSE.txt"},
+			{Name: "Chromium", Version: "128.0.0", LicenseRef: "licenses/Chromium-LICENSE.txt"},
+		}, Entries: entries,
+	}
+	manifestRaw, err := MarshalSuiteReleaseManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(suiteBinaryRoot, "release-manifest.json"), manifestRaw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := SignSuiteReleaseManifest(manifestRaw, "suite-test-key", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := VerifySuiteReleaseManifest(manifestRaw, envelope, SuiteReleaseTrustAnchor{KeyID: "suite-test-key", PublicKey: publicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewSuiteSetupPlan(checkpoint, verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSuiteSetupPlan(roots, plan); err != nil {
+		t.Fatalf("save setup plan: %+v, %v", plan, err)
 	}
 	return roots, checkpoint, suiteBinaryRoot, guiPath
 }
@@ -112,6 +181,15 @@ func TestSuiteGUIInvocationRequiresDurableHandoff(t *testing.T) {
 }
 
 func TestSuiteOwnershipHandoffFailsClosedOnMismatchAndUnsafePaths(t *testing.T) {
+	t.Run("missing setup plan", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
+		if err := os.Remove(filepath.Join(roots.AgentState, suiteSetupPlanName)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("missing plan = %v", err)
+		}
+	})
 	t.Run("request mismatch", func(t *testing.T) {
 		roots, _, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
 		if _, err := FinalizeSuiteOwnershipHandoff(roots, "3ab595c5-768f-48f7-842a-1d53a924970e", suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
@@ -128,6 +206,26 @@ func TestSuiteOwnershipHandoffFailsClosedOnMismatchAndUnsafePaths(t *testing.T) 
 		}
 		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
 			t.Fatalf("state mismatch = %v", err)
+		}
+	})
+	t.Run("non-canonical Ant config path", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
+		configPath := filepath.Join(roots.Config, SuiteClientConfigName)
+		raw, _ := os.ReadFile(configPath)
+		var config FarmClientConfig
+		if err := yaml.Unmarshal(raw, &config); err != nil {
+			t.Fatal(err)
+		}
+		config.AntConfigPath = filepath.Join(roots.BrowserData, "escaped-config.yaml")
+		raw, err := yaml.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeOwnerAtomic(configPath, raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("non-canonical Ant config path = %v", err)
 		}
 	})
 	t.Run("redirected GUI", func(t *testing.T) {
@@ -152,6 +250,84 @@ func TestSuiteOwnershipHandoffFailsClosedOnMismatchAndUnsafePaths(t *testing.T) 
 			t.Fatalf("unsafe config = %v", err)
 		}
 	})
+}
+
+func TestSuiteOwnershipHandoffBindsInstalledReleaseBytesAndRoot(t *testing.T) {
+	t.Run("manifest mismatch", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
+		manifestPath := filepath.Join(suiteBinaryRoot, "release-manifest.json")
+		raw, _ := os.ReadFile(manifestPath)
+		raw = []byte(strings.Replace(string(raw), `"version":"1.2.3"`, `"version":"1.2.4"`, 1))
+		if err := os.WriteFile(manifestPath, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("manifest mismatch = %v", err)
+		}
+	})
+	t.Run("tampered GUI revalidated on load", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(guiPath, []byte("tampered GUI"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadSuiteOwnershipHandoff(roots); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("tampered GUI load = %v", err)
+		}
+	})
+	t.Run("tampered non-GUI entry", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
+		if err := os.WriteFile(filepath.Join(suiteBinaryRoot, "runtime", "xray.exe"), []byte("tampered runtime"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("tampered entry = %v", err)
+		}
+	})
+	t.Run("unplanned version root", func(t *testing.T) {
+		roots, checkpoint, suiteBinaryRoot, originalGUIPath := suiteHandoffFixture(t)
+		unplanned := filepath.Join(filepath.Dir(suiteBinaryRoot), "unplanned")
+		if err := os.Rename(suiteBinaryRoot, unplanned); err != nil {
+			t.Fatal(err)
+		}
+		guiPath := filepath.Join(unplanned, filepath.Base(originalGUIPath))
+		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, unplanned, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
+			t.Fatalf("unplanned root = %v", err)
+		}
+	})
+}
+
+func TestStreamSuiteInstalledEntryDigestDoesNotRequireWholeFileBuffer(t *testing.T) {
+	const size = int64(16 << 20)
+	path := filepath.Join(t.TempDir(), "sparse-runtime.bin")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	expectedHasher := sha256.New()
+	if _, err := io.CopyN(expectedHasher, zeroReader{}, size); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := streamSuiteInstalledEntryDigest(path, size)
+	if err != nil || digest != hex.EncodeToString(expectedHasher.Sum(nil)) {
+		t.Fatalf("streamed digest=%q err=%v", digest, err)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(buffer []byte) (int, error) {
+	clear(buffer)
+	return len(buffer), nil
 }
 
 func TestSuiteOwnershipHandoffRejectsCorruptExistingAndConfigDrift(t *testing.T) {
@@ -205,10 +381,13 @@ func TestSuiteWindowsPackageScaffoldFailsClosedAndSeparatesRoots(t *testing.T) {
 		"makensis.exe", "signtool.exe", "get-authenticodesignature", "get-filehash",
 		"release-manifest.json", "release-manifest.envelope.json", "manifest_sha256",
 		"suite verify-release", "releasekeyid", "releasepublickey", "ed25519 release envelope verification failed",
-		"ant browser.exe", "ant-farm-client.exe", "runtime/xray.exe", "runtime/sing-box.exe",
+		"antbrowser.exe", "ant-farm-client.exe", "runtime/xray.exe", "runtime/sing-box.exe", "runtime/chrome/chrome.exe",
 		"sha256 mismatch", "size mismatch", "license manifest", "suite installer signing failed",
 		"unexpected or uncovered file", "foreach ($relative in $allowed.keys)",
-		"manifest does not cover licenses.json",
+		"manifest does not cover licenses.json", "signed dependency does not have one exact license artifact",
+		"license artifact does not exactly match a signed dependency", "exact signed legal entry",
+		"version-agnostic policy contract", "license policy artifact is missing from the payload",
+		"product license notice is not an exact signed legal entry", "manifest does not cover the product license notice",
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("publish preflight missing %q", required)
@@ -223,33 +402,56 @@ func TestSuiteWindowsPackageScaffoldFailsClosedAndSeparatesRoots(t *testing.T) {
 	installer := strings.ToLower(contents["publish/suite/windows/installer.nsi"])
 	for _, required := range []string{
 		`$programfiles64\ant browser suite`, `\versions\${version}`,
-		`$localappdata\antsuite`, "suite launch-gui", "ownership-handoff.json", "--farm-client-config",
+		`iffileexists "${version_dir}\*.*"`, "immutable suite version is already installed",
 	} {
 		if !strings.Contains(installer, required) {
 			t.Fatalf("installer missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"taskkill", "stop-process", `rmdir /r "${user_root}`, `file "${user_root}`} {
+	for _, forbidden := range []string{
+		"taskkill", "stop-process", "$localappdata", "createdirectory", "user_root",
+		"createshortcut", "launch-gui", "writeuninstaller", `section "uninstall"`, "rmdir /r", "uninstallstring",
+	} {
 		if strings.Contains(installer, forbidden) {
 			t.Fatalf("installer contains unsafe mutable/global operation %q", forbidden)
 		}
 	}
 	var licenses struct {
-		SchemaVersion int `json:"schema_version"`
-		Artifacts     []struct {
+		SchemaVersion  int `json:"schema_version"`
+		ProductLicense struct {
 			Name              string `json:"name"`
 			LicenseExpression string `json:"license_expression"`
 			NoticeFile        string `json:"notice_file"`
-		} `json:"artifacts"`
+		} `json:"product_license"`
+		AllowedArtifacts []struct {
+			Name              string `json:"name"`
+			LicenseExpression string `json:"license_expression"`
+			NoticeFile        string `json:"notice_file"`
+		} `json:"allowed_artifacts"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(contents["publish/suite/LICENSES.json"]))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&licenses); err != nil || licenses.SchemaVersion != 1 || len(licenses.Artifacts) < 3 {
+	if err := decoder.Decode(&licenses); err != nil || licenses.SchemaVersion != 1 || len(licenses.AllowedArtifacts) != 3 {
 		t.Fatalf("license contract invalid: %+v, %v", licenses, err)
 	}
-	for _, artifact := range licenses.Artifacts {
+	if licenses.ProductLicense.Name != "Ant-Browser-Suite" || licenses.ProductLicense.NoticeFile != "licenses/Ant-Browser-Suite-LICENSE.txt" || licenses.ProductLicense.LicenseExpression == "" {
+		t.Fatalf("product license contract invalid: %+v", licenses.ProductLicense)
+	}
+	seenChromium := false
+	for _, artifact := range licenses.AllowedArtifacts {
+		if artifact.Name == "Chromium" {
+			seenChromium = true
+		}
 		if artifact.Name == "" || artifact.LicenseExpression == "" || !strings.HasPrefix(artifact.NoticeFile, "licenses/") {
 			t.Fatalf("incomplete license contract: %+v", artifact)
+		}
+	}
+	if !seenChromium {
+		t.Fatal("Chromium license artifact missing")
+	}
+	for _, forbiddenVersion := range []string{`"version"`, "1.2.3", "25.1.1", "1.11.0", "128.0.0"} {
+		if strings.Contains(contents["publish/suite/LICENSES.json"], forbiddenVersion) || strings.Contains(contents["publish/suite/windows/publish-windows.ps1"], forbiddenVersion) {
+			t.Fatalf("version-agnostic license policy is pinned to %q", forbiddenVersion)
 		}
 	}
 }

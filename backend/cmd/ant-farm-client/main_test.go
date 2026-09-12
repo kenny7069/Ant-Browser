@@ -7,7 +7,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,65 +142,10 @@ func TestFarmAgentControlDistinguishesStopFromPreserve(t *testing.T) {
 	}
 }
 
-func TestSuiteGUILaunchUsesOnlyDurableAbsoluteInvocation(t *testing.T) {
-	originalLoad, originalStart := loadSuiteGUIInvocation, startSuiteGUIProcess
-	t.Cleanup(func() {
-		loadSuiteGUIInvocation, startSuiteGUIProcess = originalLoad, originalStart
-	})
-	wantExecutable := filepath.Join(t.TempDir(), "versions", "1.2.3", "Ant Browser.exe")
-	wantConfig := filepath.Join(t.TempDir(), "config", "client.yaml")
-	loadSuiteGUIInvocation = func(backend.SuiteUserRoots) (backend.SuiteGUIInvocation, error) {
-		return backend.SuiteGUIInvocation{Executable: wantExecutable, Arguments: []string{"--farm-client-config", wantConfig}}, nil
-	}
-	var executable string
-	var arguments []string
-	startSuiteGUIProcess = func(path string, args ...string) error {
-		executable, arguments = path, append([]string(nil), args...)
-		return nil
-	}
+func TestSuiteGUILaunchSurfaceIsDeferred(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := runSuiteCommand(backend.SuiteUserRoots{}, []string{"launch-gui"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
-	}
-	if executable != wantExecutable || len(arguments) != 2 || arguments[0] != "--farm-client-config" || arguments[1] != wantConfig {
-		t.Fatalf("launch=%q %#v", executable, arguments)
-	}
-}
-
-func TestSuiteGUILaunchRejectsNonAbsoluteDurableInvocation(t *testing.T) {
-	originalLoad, originalStart := loadSuiteGUIInvocation, startSuiteGUIProcess
-	t.Cleanup(func() {
-		loadSuiteGUIInvocation, startSuiteGUIProcess = originalLoad, originalStart
-	})
-	loadSuiteGUIInvocation = func(backend.SuiteUserRoots) (backend.SuiteGUIInvocation, error) {
-		return backend.SuiteGUIInvocation{Executable: "Ant Browser.exe", Arguments: []string{"--farm-client-config", "client.yaml"}}, nil
-	}
-	called := false
-	startSuiteGUIProcess = func(string, ...string) error { called = true; return nil }
-	if code := runSuiteCommand(backend.SuiteUserRoots{}, []string{"launch-gui"}, &bytes.Buffer{}, &bytes.Buffer{}); code != 1 || called {
-		t.Fatalf("exit=%d start_called=%v", code, called)
-	}
-}
-
-func TestSuiteGUILaunchFailsClosedOnMissingHandoffAndStartError(t *testing.T) {
-	originalLoad, originalStart := loadSuiteGUIInvocation, startSuiteGUIProcess
-	t.Cleanup(func() {
-		loadSuiteGUIInvocation, startSuiteGUIProcess = originalLoad, originalStart
-	})
-	loadSuiteGUIInvocation = func(backend.SuiteUserRoots) (backend.SuiteGUIInvocation, error) {
-		return backend.SuiteGUIInvocation{}, backend.ErrSuiteOwnershipHandoff
-	}
-	if code := protectedRun(&bytes.Buffer{}, func() int {
-		return runSuiteCommand(backend.SuiteUserRoots{}, []string{"launch-gui"}, &bytes.Buffer{}, &bytes.Buffer{})
-	}); code != 1 {
-		t.Fatalf("missing handoff exit=%d", code)
-	}
-	loadSuiteGUIInvocation = func(backend.SuiteUserRoots) (backend.SuiteGUIInvocation, error) {
-		return backend.SuiteGUIInvocation{Executable: filepath.Join(t.TempDir(), "Ant Browser.exe"), Arguments: []string{"--farm-client-config", filepath.Join(t.TempDir(), "client.yaml")}}, nil
-	}
-	startSuiteGUIProcess = func(string, ...string) error { return errors.New("injected start failure") }
-	if code := runSuiteCommand(backend.SuiteUserRoots{}, []string{"launch-gui"}, &bytes.Buffer{}, &bytes.Buffer{}); code != 1 {
-		t.Fatalf("start failure exit=%d", code)
+	if code := runSuiteCommand(backend.SuiteUserRoots{}, []string{"launch-gui"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("deferred launch surface exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
 

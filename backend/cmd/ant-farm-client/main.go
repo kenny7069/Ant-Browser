@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -168,16 +167,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return 0
 }
 
-var startSuiteGUIProcess = func(executable string, arguments ...string) error {
-	command := exec.Command(executable, arguments...)
-	if err := command.Start(); err != nil {
-		return err
-	}
-	return command.Process.Release()
-}
-
-var loadSuiteGUIInvocation = backend.LoadSuiteGUIInvocation
-
 func runSuiteCommand(roots backend.SuiteUserRoots, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite command")
@@ -201,22 +190,6 @@ func runSuiteCommand(roots backend.SuiteUserRoots, args []string, stdout, stderr
 		}
 		encoded, _ := json.Marshal(map[string]string{"state": handoff.HandoffState, "request_uid": handoff.SetupRequestUID})
 		fmt.Fprintln(stdout, string(encoded))
-		return 0
-	case "launch-gui":
-		if len(args) != 1 {
-			fmt.Fprintln(stderr, "ant-farm-client: invalid Suite GUI command")
-			return 2
-		}
-		invocation, err := loadSuiteGUIInvocation(roots)
-		if err != nil || !filepath.IsAbs(invocation.Executable) || len(invocation.Arguments) != 2 ||
-			invocation.Arguments[0] != "--farm-client-config" || !filepath.IsAbs(invocation.Arguments[1]) {
-			fmt.Fprintln(stderr, "ant-farm-client: Suite GUI handoff unavailable")
-			return 1
-		}
-		if err := startSuiteGUIProcess(invocation.Executable, invocation.Arguments...); err != nil {
-			fmt.Fprintln(stderr, "ant-farm-client: Suite GUI launch failed")
-			return 1
-		}
 		return 0
 	case "verify-release":
 		flags := flag.NewFlagSet("suite verify-release", flag.ContinueOnError)

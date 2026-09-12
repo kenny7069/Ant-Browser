@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "artifacts": [
-    {
-      "name": "Ant Browser Suite",
-      "license_expression": "LicenseRef-Ant-Browser-Suite",
-      "notice_file": "licenses/Ant-Browser-Suite-LICENSE.txt"
-    },
+  "product_license": {
+    "name": "Ant-Browser-Suite",
+    "license_expression": "LicenseRef-Ant-Browser-Suite",
+    "notice_file": "licenses/Ant-Browser-Suite-LICENSE.txt"
+  },
+  "allowed_artifacts": [
     {
       "name": "Xray-core",
       "license_expression": "MPL-2.0",
@@ -15,6 +15,11 @@
       "name": "sing-box",
       "license_expression": "GPL-3.0-or-later",
       "notice_file": "licenses/sing-box-LICENSE.txt"
+    },
+    {
+      "name": "Chromium",
+      "license_expression": "BSD-3-Clause",
+      "notice_file": "licenses/Chromium-LICENSE.txt"
     }
   ]
 }

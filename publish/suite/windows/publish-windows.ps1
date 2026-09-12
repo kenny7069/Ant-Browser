@@ -45,10 +45,11 @@ $makeNSIS = Require-Tool "makensis.exe"
 $signTool = Require-Tool "signtool.exe"
 
 $required = @(
-  "Ant Browser.exe",
+  "AntBrowser.exe",
   "ant-farm-client.exe",
   "runtime/xray.exe",
   "runtime/sing-box.exe",
+  "runtime/chrome/chrome.exe",
   "release-manifest.json",
   "release-manifest.envelope.json",
   "LICENSES.json"
@@ -57,7 +58,6 @@ foreach ($relative in $required) { Require-Leaf (Resolve-PayloadPath $relative) 
 
 $manifestPath = Resolve-PayloadPath "release-manifest.json"
 $envelopePath = Resolve-PayloadPath "release-manifest.envelope.json"
-$manifestBytes = [System.IO.File]::ReadAllBytes($manifestPath)
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $envelope = Get-Content -LiteralPath $envelopePath -Raw | ConvertFrom-Json
 if ($manifest.schema_version -ne 1 -or $manifest.version -ne $Version -or $manifest.target.os -ne "windows" -or $manifest.target.arch -ne $Arch) { Fail "release manifest identity mismatch" }
@@ -79,7 +79,7 @@ foreach ($entry in $manifest.entries) {
   $digest = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($digest -cne [string]$entry.sha256) { Fail "SHA256 mismatch: $($entry.path)" }
 }
-foreach ($relative in @("Ant Browser.exe", "ant-farm-client.exe", "runtime/xray.exe", "runtime/sing-box.exe")) {
+foreach ($relative in @("AntBrowser.exe", "ant-farm-client.exe", "runtime/xray.exe", "runtime/sing-box.exe", "runtime/chrome/chrome.exe")) {
   if (-not $seen.ContainsKey($relative.ToLowerInvariant())) { Fail "manifest does not cover $relative" }
   Assert-Authenticode (Resolve-PayloadPath $relative)
 }
@@ -89,15 +89,61 @@ if (-not $seen.ContainsKey("licenses.json")) { Fail "manifest does not cover LIC
 if ($LASTEXITCODE -ne 0) { Fail "Ed25519 release envelope verification failed" }
 
 $licenses = Get-Content -LiteralPath (Resolve-PayloadPath "LICENSES.json") -Raw | ConvertFrom-Json
-if ($licenses.schema_version -ne 1 -or @($licenses.artifacts).Count -lt 3) { Fail "license manifest is invalid" }
+$dependencies = @($manifest.dependencies)
+$artifacts = @($licenses.artifacts)
+if ($licenses.schema_version -ne 1 -or $artifacts.Count -eq 0 -or $artifacts.Count -ne $dependencies.Count) { Fail "license manifest is invalid" }
+$contractPath = Join-Path (Split-Path $PSScriptRoot -Parent) "LICENSES.json"
+$contract = Get-Content -LiteralPath $contractPath -Raw | ConvertFrom-Json
+$allowedArtifacts = @($contract.allowed_artifacts)
+if ($contract.schema_version -ne 1 -or $allowedArtifacts.Count -ne $artifacts.Count) { Fail "license policy contract is invalid" }
+$productLicense = $licenses.product_license
+$productLicensePolicy = $contract.product_license
+if ([string]::IsNullOrWhiteSpace($productLicense.name) -or [string]::IsNullOrWhiteSpace($productLicense.license_expression) -or
+    [string]::IsNullOrWhiteSpace($productLicense.notice_file) -or
+    ([string]$productLicense.name) -cne ([string]$productLicensePolicy.name) -or
+    ([string]$productLicense.license_expression) -cne ([string]$productLicensePolicy.license_expression) -or
+    ([string]$productLicense.notice_file) -cne ([string]$productLicensePolicy.notice_file)) {
+  Fail "product license does not match the version-agnostic policy contract"
+}
+Require-Leaf (Resolve-PayloadPath ([string]$productLicense.notice_file)) ([string]$productLicense.notice_file)
+if (-not $seen.ContainsKey(([string]$productLicense.notice_file).ToLowerInvariant())) { Fail "manifest does not cover the product license notice" }
+$productLegalEntries = @($manifest.entries | Where-Object { ([string]$_.path) -ceq ([string]$productLicense.notice_file) -and ([string]$_.role) -ceq "legal" })
+if ($productLegalEntries.Count -ne 1) { Fail "product license notice is not an exact signed legal entry" }
 foreach ($license in $licenses.artifacts) {
-  if ([string]::IsNullOrWhiteSpace($license.name) -or [string]::IsNullOrWhiteSpace($license.license_expression)) { Fail "license entry is incomplete" }
+  if ([string]::IsNullOrWhiteSpace($license.name) -or [string]::IsNullOrWhiteSpace($license.version) -or
+      [string]::IsNullOrWhiteSpace($license.license_expression) -or [string]::IsNullOrWhiteSpace($license.notice_file)) {
+    Fail "license entry is incomplete"
+  }
   Require-Leaf (Resolve-PayloadPath ([string]$license.notice_file)) ([string]$license.notice_file)
   if (-not $seen.ContainsKey(([string]$license.notice_file).ToLowerInvariant())) { Fail "manifest does not cover license notice $($license.notice_file)" }
+  $legalEntries = @($manifest.entries | Where-Object { ([string]$_.path) -ceq ([string]$license.notice_file) -and ([string]$_.role) -ceq "legal" })
+  if ($legalEntries.Count -ne 1) { Fail "license notice is not an exact signed legal entry" }
+  $matchingDependencies = @($dependencies | Where-Object {
+    ([string]$_.name) -ceq ([string]$license.name) -and ([string]$_.version) -ceq ([string]$license.version) -and
+    ([string]$_.license_ref) -ceq ([string]$license.notice_file)
+  })
+  if ($matchingDependencies.Count -ne 1) { Fail "license artifact does not exactly match a signed dependency" }
+  $matchingPolicy = @($allowedArtifacts | Where-Object {
+    ([string]$_.name) -ceq ([string]$license.name) -and
+    ([string]$_.license_expression) -ceq ([string]$license.license_expression) -and
+    ([string]$_.notice_file) -ceq ([string]$license.notice_file)
+  })
+  if ($matchingPolicy.Count -ne 1) { Fail "license artifact is outside the version-agnostic policy contract" }
 }
-$canonicalLicenses = Join-Path (Split-Path $PSScriptRoot -Parent) "LICENSES.json"
-if ((Get-FileHash -LiteralPath $canonicalLicenses -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath (Resolve-PayloadPath "LICENSES.json") -Algorithm SHA256).Hash) {
-  Fail "payload license manifest differs from the Suite contract"
+foreach ($dependency in $dependencies) {
+  $matchingArtifacts = @($artifacts | Where-Object {
+    ([string]$_.name) -ceq ([string]$dependency.name) -and ([string]$_.version) -ceq ([string]$dependency.version) -and
+    ([string]$_.notice_file) -ceq ([string]$dependency.license_ref)
+  })
+  if ($matchingArtifacts.Count -ne 1) { Fail "signed dependency does not have one exact license artifact" }
+}
+foreach ($allowedArtifact in $allowedArtifacts) {
+  $matchingArtifacts = @($artifacts | Where-Object {
+    ([string]$_.name) -ceq ([string]$allowedArtifact.name) -and
+    ([string]$_.license_expression) -ceq ([string]$allowedArtifact.license_expression) -and
+    ([string]$_.notice_file) -ceq ([string]$allowedArtifact.notice_file)
+  })
+  if ($matchingArtifacts.Count -ne 1) { Fail "license policy artifact is missing from the payload" }
 }
 $allowed = @{}
 foreach ($key in $seen.Keys) { $allowed[$key] = $true }
