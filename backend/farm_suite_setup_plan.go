@@ -31,14 +31,17 @@ type SuiteSetupPlan struct {
 	StageID               string             `json:"stage_id"`
 }
 
-func NewSuiteSetupPlan(preparation SetupPreparationCheckpoint, manifestSHA256 string, target SuiteReleaseTarget) (SuiteSetupPlan, error) {
+func NewSuiteSetupPlan(preparation SetupPreparationCheckpoint, release VerifiedSuiteRelease) (SuiteSetupPlan, error) {
 	if err := preparation.validate(); err != nil || preparation.Stage != SetupBootstrapDrafted {
 		return SuiteSetupPlan{}, fmt.Errorf("%w: preparation checkpoint", ErrSuiteSetupPlan)
 	}
+	if !release.verified || !validLowerSHA256(release.manifestSHA256) || release.manifest.Validate() != nil {
+		return SuiteSetupPlan{}, fmt.Errorf("%w: suite release proof", ErrSuiteSetupPlan)
+	}
 	plan := SuiteSetupPlan{
 		SchemaVersion: 1, PreparationRequestUID: preparation.RequestUID,
-		BootstrapSHA256: preparation.BootstrapSHA256, ManifestSHA256: manifestSHA256,
-		Target: target, StageID: deriveSuiteSetupStageID(manifestSHA256, target),
+		BootstrapSHA256: preparation.BootstrapSHA256, ManifestSHA256: release.manifestSHA256,
+		Target: release.manifest.Target, StageID: deriveSuiteSetupStageID(release.manifestSHA256, release.manifest.Target),
 	}
 	if err := plan.Validate(); err != nil {
 		return SuiteSetupPlan{}, err
@@ -76,7 +79,7 @@ func LoadSuiteSetupPlan(roots SuiteUserRoots) (*SuiteSetupPlan, error) {
 		return nil, err
 	}
 	var plan SuiteSetupPlan
-	if err := decodeSuiteReleaseStrictJSON(raw, &plan); err != nil {
+	if err := decodeSuiteSetupPlanJSON(raw, &plan); err != nil {
 		return nil, fmt.Errorf("%w: decode", ErrSuiteSetupPlan)
 	}
 	if err := plan.Validate(); err != nil {

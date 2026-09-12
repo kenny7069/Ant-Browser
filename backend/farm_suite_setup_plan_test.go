@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,7 +18,23 @@ func suiteSetupPlanFixture(t *testing.T) SuiteSetupPlan {
 		RequestUID:      "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6",
 		BootstrapSHA256: strings.Repeat("a", 64),
 	}
-	plan, err := NewSuiteSetupPlan(preparation, strings.Repeat("b", 64), SuiteReleaseTarget{OS: "linux", Arch: "amd64"})
+	manifestRaw, err := MarshalSuiteReleaseManifest(suiteReleaseManifestFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelopeRaw, err := SignSuiteReleaseManifest(manifestRaw, "plan-test", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := VerifySuiteReleaseManifest(manifestRaw, envelopeRaw, SuiteReleaseTrustAnchor{KeyID: "plan-test", PublicKey: publicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewSuiteSetupPlan(preparation, release)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,8 +122,16 @@ func TestSuiteSetupPlanStrictLoadAndValidation(t *testing.T) {
 		SchemaVersion: 1, Stage: SetupUserRootsReady,
 		RequestUID: "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6", BootstrapSHA256: strings.Repeat("a", 64),
 	}
-	if _, err := NewSuiteSetupPlan(preparation, strings.Repeat("b", 64), SuiteReleaseTarget{OS: "linux", Arch: "amd64"}); !errors.Is(err, ErrSuiteSetupPlan) {
+	verifiedPlan := suiteSetupPlanFixture(t)
+	proof := VerifiedSuiteRelease{
+		manifest: suiteReleaseManifestFixture(), manifestSHA256: verifiedPlan.ManifestSHA256, verified: true,
+	}
+	if _, err := NewSuiteSetupPlan(preparation, proof); !errors.Is(err, ErrSuiteSetupPlan) {
 		t.Fatalf("plan accepted before bootstrap draft: %v", err)
+	}
+	preparation.Stage = SetupBootstrapDrafted
+	if _, err := NewSuiteSetupPlan(preparation, VerifiedSuiteRelease{}); !errors.Is(err, ErrSuiteSetupPlan) {
+		t.Fatalf("unverified release accepted: %v", err)
 	}
 }
 
@@ -122,6 +148,13 @@ func TestSuiteSetupPlanRejectsDuplicateKeysAndRedirectedRoot(t *testing.T) {
 	}
 	if _, err := LoadSuiteSetupPlan(roots); !errors.Is(err, ErrSuiteSetupPlan) && !errors.Is(err, ErrSuiteReleaseManifest) {
 		t.Fatalf("duplicate plan key accepted: %v", err)
+	}
+	noncanonical := strings.Replace(string(raw), `"stage_id":"`+plan.StageID+`"`, `"Stage_ID":"`+plan.StageID+`"`, 1)
+	if err := os.WriteFile(filepath.Join(roots.AgentState, suiteSetupPlanName), []byte(noncanonical), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadSuiteSetupPlan(roots); !errors.Is(err, ErrSuiteSetupPlan) {
+		t.Fatalf("noncanonical plan key accepted: %v", err)
 	}
 	if runtime.GOOS == "windows" {
 		return
