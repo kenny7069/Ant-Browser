@@ -230,6 +230,16 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 	if _, err := parseSuiteBootstrapDiscovery(asciiUpdateRaw, origin, "3.0.0", "3.0.0"); err != nil {
 		t.Fatalf("visible ASCII update URL rejected: %v", err)
 	}
+	rfc3986Update := suiteBootstrapFixture(origin)
+	rfc3986Update["update"] = map[string]any{
+		"manifest_url":           origin + "/r/Az09-._~!$&'()*+,;=:@manifest?q=Az09-._~!$&'()*+,;=:@/?next",
+		"public_key_ed25519_b64": key,
+		"channel":                "stable",
+	}
+	rfc3986UpdateRaw, _ := json.Marshal(rfc3986Update)
+	if _, err := parseSuiteBootstrapDiscovery(rfc3986UpdateRaw, origin, "3.0.0", "3.0.0"); err != nil {
+		t.Fatalf("RFC3986 update URL rejected: %v", err)
+	}
 	maximumUpdate := suiteBootstrapFixture(origin)
 	maximumUpdateURL := origin + "/" + strings.Repeat("a", maxSuiteBootstrapURLBytes-len(origin)-1)
 	maximumUpdate["update"] = map[string]any{"manifest_url": maximumUpdateURL, "public_key_ed25519_b64": key, "channel": "stable"}
@@ -302,6 +312,27 @@ func TestParseSuiteBootstrapDiscoveryClosedSchemaAndEndpointPolicy(t *testing.T)
 		},
 		"update Unicode query": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=café"
+		},
+		"update backslash path": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/a\\b"
+		},
+		"update brace path": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/a{b"
+		},
+		"update brace query": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q={"
+		},
+		"update pipe query": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=|"
+		},
+		"update caret query": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=^"
+		},
+		"update backtick query": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=`"
+		},
+		"update angle query": func(v map[string]any) {
+			v["update"].(map[string]any)["manifest_url"] = origin + "/m?q=<x>"
 		},
 		"update empty query": func(v map[string]any) {
 			v["update"].(map[string]any)["manifest_url"] = origin + "/m?"

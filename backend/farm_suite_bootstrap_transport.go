@@ -345,11 +345,12 @@ func validateSuiteBootstrapUpdate(update SuiteBootstrapUpdate) (string, error) {
 		return "", ErrSuiteBootstrapResponse
 	}
 	parsed, err := url.Parse(update.ManifestURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" || parsed.RawPath != "" || parsed.ForceQuery || (parsed.Path != "" && strings.HasSuffix(parsed.Path, "/")) {
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" || parsed.ForceQuery ||
+		!validSuiteBootstrapURIComponent(parsed.Path, false) || !validSuiteBootstrapURIComponent(parsed.RawQuery, true) || (parsed.Path != "" && strings.HasSuffix(parsed.Path, "/")) {
 		return "", ErrSuiteBootstrapResponse
 	}
 	origin, err := canonicalSuiteBootstrapOrigin("https://"+parsed.Host, "https")
-	expected := origin + parsed.EscapedPath()
+	expected := origin + parsed.Path
 	if parsed.RawQuery != "" {
 		expected += "?" + parsed.RawQuery
 	}
@@ -361,6 +362,18 @@ func validateSuiteBootstrapUpdate(update SuiteBootstrapUpdate) (string, error) {
 		return "", ErrSuiteBootstrapResponse
 	}
 	return origin, nil
+}
+
+func validSuiteBootstrapURIComponent(value string, query bool) bool {
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') ||
+			strings.ContainsRune("-._~!$&'()*+,;=:@/", rune(character)) || (query && character == '?') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func containsUnsafeSuiteBootstrapURLRune(value string) bool {
