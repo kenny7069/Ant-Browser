@@ -386,6 +386,8 @@ func TestSuiteBootstrapOriginRejectsMalformedDNSAndPorts(t *testing.T) {
 		"https://farm.example.test#",
 		"https://192.168.001.001",
 		"https://[2001:0db8:0:0:0:0:0:1]",
+		"https://[::ffff:192.0.2.1]",
+		"https://[0:0:0:0:0:ffff:c000:201]",
 		"https://" + strings.Repeat("a", maxSuiteBootstrapURLBytes),
 	} {
 		if _, err := canonicalSuiteBootstrapOrigin(raw, "https"); err == nil {

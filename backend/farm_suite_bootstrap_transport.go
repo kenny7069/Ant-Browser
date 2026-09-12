@@ -261,6 +261,9 @@ func canonicalSuiteBootstrapOrigin(raw, scheme string) (string, error) {
 	canonicalHost := hostname
 	address, addressErr := netip.ParseAddr(hostname)
 	if addressErr == nil {
+		if address.Is4In6() {
+			return "", ErrSuiteBootstrapResponse
+		}
 		canonicalHost = address.String()
 	} else {
 		if strings.Contains(hostname, "%") || looksLikeSuiteBootstrapIPv4(hostname) || !validSuiteBootstrapDNSName(hostname) {
