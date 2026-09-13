@@ -26,10 +26,14 @@ type SuiteDoctorReport struct {
 }
 
 func DoctorSuite(ctx context.Context, roots SuiteUserRoots) SuiteDoctorReport {
-	return doctorSuiteWithPlatform(ctx, roots, newSuiteServicePlatform())
+	return doctorSuiteWithDependencies(ctx, roots, newSuiteServicePlatform(), newSuiteDoctorProbeDependencies())
 }
 
 func doctorSuiteWithPlatform(ctx context.Context, roots SuiteUserRoots, platform suiteServicePlatform) (report SuiteDoctorReport) {
+	return doctorSuiteWithDependencies(ctx, roots, platform, deferredSuiteDoctorProbeDependencies())
+}
+
+func doctorSuiteWithDependencies(ctx context.Context, roots SuiteUserRoots, platform suiteServicePlatform, probes suiteDoctorProbeDependencies) (report SuiteDoctorReport) {
 	report = SuiteDoctorReport{SchemaVersion: 1, Overall: "NOT_READY", ExitClass: "DEFERRED", DominantCode: "CHECK_NOT_IMPLEMENTED"}
 	defer classifySuiteDoctorReport(&report)
 	add := func(name, status, code string, retry bool) {
@@ -48,9 +52,21 @@ func doctorSuiteWithPlatform(ctx context.Context, roots SuiteUserRoots, platform
 	}
 	add("install_release", "PASS", "INSTALLED_RELEASE_VERIFIED", false)
 	add("handoff_config_identity", "PASS", "OWNERSHIP_EVIDENCE_VERIFIED", false)
-	for _, name := range []string{"session_display", "dns_tcp", "tls", "discovery"} {
-		add(name, "UNKNOWN", "CHECK_NOT_IMPLEMENTED", false)
+	probeCtx, cancelProbes := suiteDoctorProbeContext(ctx)
+	session := suiteDoctorProbeResult{Status: "UNKNOWN", Code: "CHECK_NOT_IMPLEMENTED"}
+	if probes.SessionDisplay != nil {
+		session = probes.SessionDisplay(probeCtx)
 	}
+	add("session_display", session.Status, session.Code, session.Retryable)
+	network := probeSuiteDoctorNetwork(probeCtx, roots, *handoff, probes)
+	cancelProbes()
+	dnsTCP := network[0]
+	if dnsTCP.Status == "PASS" {
+		dnsTCP = network[1]
+	}
+	add("dns_tcp", dnsTCP.Status, dnsTCP.Code, dnsTCP.Retryable)
+	add("tls", network[2].Status, network[2].Code, network[2].Retryable)
+	add("discovery", network[3].Status, network[3].Code, network[3].Retryable)
 	checkpoint, checkpointErr := LoadSetupCheckpoint(filepath.Join(roots.AgentState, "setup.json"))
 	if checkpointErr != nil {
 		add("enrollment", "FAIL", "CHECKPOINT_INVALID", false)
@@ -183,7 +199,7 @@ func SuiteServiceStatus(ctx context.Context, roots SuiteUserRoots) SuiteDoctorRe
 	if runtime.GOOS != "windows" {
 		return SuiteDoctorReport{SchemaVersion: 1, Overall: "UNKNOWN", ExitClass: "DEFERRED", DominantCode: "PLATFORM_ADAPTER_DEFERRED", Layers: []SuiteDoctorLayer{{Name: "registration", Status: "UNKNOWN", Code: "PLATFORM_ADAPTER_DEFERRED", SafeMessage: "PLATFORM_ADAPTER_DEFERRED", Remediation: "USE_SUPPORTED_PLATFORM", Retryable: false}, {Name: "resident_ipc", Status: "BLOCKED", Code: "PREREQUISITE_BLOCKED", SafeMessage: "PREREQUISITE_BLOCKED", Remediation: "USE_SUPPORTED_PLATFORM", Retryable: false}}}
 	}
-	full := DoctorSuite(ctx, roots)
+	full := doctorSuiteWithPlatform(ctx, roots, newSuiteServicePlatform())
 	result := SuiteDoctorReport{SchemaVersion: 1, Overall: "INACTIVE", ExitClass: full.ExitClass, DominantCode: full.DominantCode}
 	for _, layer := range full.Layers {
 		if layer.Name == "registration" || layer.Name == "resident_ipc" {
