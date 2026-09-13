@@ -40,9 +40,17 @@ func StartFarmClientIPCServerWithServiceStop(host *FarmClientHost, serviceStop f
 }
 
 func startFarmClientIPCServer(host *FarmClientHost, serviceStop func()) (*FarmClientIPCServer, error) {
-	management, err := newFarmProfileManagement(host)
-	if err != nil {
-		return nil, err
+	if host == nil {
+		return nil, ErrFarmClientIPCUnavailable
+	}
+	management := host.management
+	if management == nil {
+		var err error
+		management, err = newFarmProfileManagement(host)
+		if err != nil {
+			return nil, err
+		}
+		host.management = management
 	}
 	listener, err := listenFarmClientIPC(host.config.StateRoot)
 	if err != nil {
