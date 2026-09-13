@@ -30,6 +30,24 @@ func TestFarmClientIPCRequestStrictClosedSchema(t *testing.T) {
 	}
 }
 
+func TestFarmClientIPCServiceStopRequiresExactEmptyPayload(t *testing.T) {
+	requestUID := uuid.NewString()
+	request := func(payload string) string {
+		return `{"protocol_version":1,"request_uid":"` + requestUID + `","operation":"service_stop_v1","payload":` + payload + `}`
+	}
+	if _, err := decodeFarmClientIPCRequest([]byte(request(`{}`))); err != nil {
+		t.Fatalf("empty service stop rejected: %v", err)
+	}
+	for _, payload := range []string{
+		`null`, `[]`, `""`, `{"unknown":true}`, `{"unknown":true,"unknown":false}`,
+		`{"value":"` + strings.Repeat("x", farmClientIPCMaxFrameBytes) + `"}`,
+	} {
+		if _, err := decodeFarmClientIPCRequest([]byte(request(payload))); !errors.Is(err, ErrFarmClientIPCInvalid) {
+			t.Fatalf("service stop payload accepted: %.80q: %v", payload, err)
+		}
+	}
+}
+
 func TestFarmClientIPCFramingBoundsAndTruncation(t *testing.T) {
 	var oversized bytes.Buffer
 	var header [4]byte

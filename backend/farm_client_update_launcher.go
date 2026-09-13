@@ -16,6 +16,10 @@ import (
 
 const farmClientUpdateHealthNonceEnvironment = "ANT_FARM_CLIENT_UPDATE_HEALTH_NONCE"
 
+// FarmClientInternalControlledStopExitCode is private launcher/child evidence.
+// It is not a command surface and carries no caller-controlled material.
+const FarmClientInternalControlledStopExitCode = 23
+
 const (
 	farmClientControlStop     byte = 'S'
 	farmClientControlPreserve byte = 'P'
@@ -113,21 +117,12 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 			if ctx.Err() != nil {
 				return nil
 			}
-			current, loadErr := LoadFarmClientUpdateActivation(config.StateRoot)
-			if loadErr != nil {
-				return loadErr
+			controlledStop, reconcileErr := reconcileFarmClientPendingExit(config, configPath, launcherPath, pending, runErr, validate)
+			if reconcileErr != nil {
+				return reconcileErr
 			}
-			// Roll back only the same uncommitted candidate. Once probation was
-			// committed, a later child exit is a restart boundary, not failure.
-			if runErr != nil && current.Phase == farmClientUpdatePhaseProbation && current.Pending != nil && current.Pending.SHA256 == pending.SHA256 {
-				if validate != nil {
-					if err := validate(configPath, launcherPath); err != nil {
-						return err
-					}
-				}
-				if rollbackErr := RollbackFarmClientUpdateActivation(config); rollbackErr != nil {
-					return rollbackErr
-				}
+			if controlledStop {
+				return nil
 			}
 			continue
 		}
@@ -187,8 +182,11 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 		if startErr != nil {
 			return startErr
 		}
-		_ = waitFarmClientAgent(ctx, process)
+		runErr := waitFarmClientAgent(ctx, process)
 		if ctx.Err() != nil {
+			return nil
+		}
+		if farmClientAgentControlledStop(runErr) {
 			return nil
 		}
 		// Give unexpected crashes a bounded backoff, but skip it when an
@@ -205,6 +203,37 @@ func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launch
 			}
 		}
 	}
+}
+
+func reconcileFarmClientPendingExit(config FarmClientConfig, configPath, launcherPath string, pending FarmClientUpdateSlot, runErr error, validate suiteLauncherValidator) (bool, error) {
+	if farmClientAgentControlledStop(runErr) {
+		return true, nil
+	}
+	current, loadErr := LoadFarmClientUpdateActivation(config.StateRoot)
+	if loadErr != nil {
+		return false, loadErr
+	}
+	// Roll back only the same uncommitted candidate. Once probation was
+	// committed, a later child exit is a restart boundary, not failure.
+	if runErr != nil && current.Phase == farmClientUpdatePhaseProbation && current.Pending != nil && current.Pending.SHA256 == pending.SHA256 {
+		if validate != nil {
+			if err := validate(configPath, launcherPath); err != nil {
+				return false, err
+			}
+		}
+		if rollbackErr := RollbackFarmClientUpdateActivation(config); rollbackErr != nil {
+			return false, rollbackErr
+		}
+	}
+	return false, nil
+}
+
+func farmClientAgentControlledStop(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ProcessState == nil {
+		return false
+	}
+	return exitErr.ProcessState.ExitCode() == FarmClientInternalControlledStopExitCode
 }
 
 func runFarmClientPendingActivation(ctx context.Context, config FarmClientConfig, configPath, launcherPath string, stdout, stderr io.Writer, slot FarmClientUpdateSlot, validate suiteLauncherValidator) error {

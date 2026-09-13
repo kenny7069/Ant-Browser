@@ -43,6 +43,10 @@ func protectedRun(stderr io.Writer, action func() int) (code int) {
 	return action()
 }
 
+func farmAgentControlledStopCompleted(requested bool, runErr, admissionErr, shutdownErr error) bool {
+	return requested && (runErr == nil || runErr == context.Canceled) && admissionErr == nil && shutdownErr == nil
+}
+
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// v3 subcommands own their FlagSet. Dispatch before the legacy global
 	// parser, which intentionally stops at the first positional argument.
@@ -149,7 +153,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ant-farm-client: startup failed: %v\n", err)
 		return 1
 	}
-	ipcServer, err := backend.StartFarmClientIPCServer(host)
+	controlledStopRequest := make(chan struct{}, 1)
+	ipcServer, err := backend.StartFarmClientIPCServerWithServiceStop(host, func() {
+		select {
+		case controlledStopRequest <- struct{}{}:
+		default:
+		}
+	})
 	if err != nil {
 		fmt.Fprintln(stderr, "ant-farm-client: local IPC startup failed")
 		_ = host.Shutdown()
@@ -158,24 +168,36 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	hostCtx, cancelHost := context.WithCancel(context.Background())
 	defer cancelHost()
 	var residentStop sync.Once
-	stopResident := func(preserve bool) {
+	var controlledStop bool
+	var admissionErr error
+	stopResident := func(preserve, controlled bool) {
 		residentStop.Do(func() {
-			_ = ipcServer.Close()
+			admissionErr = ipcServer.Close()
 			if preserve {
 				_ = host.PrepareForUpdate()
+			}
+			if controlled {
+				controlledStop = true
 			}
 			cancelHost()
 		})
 	}
 	go func() {
+		select {
+		case <-controlledStopRequest:
+			stopResident(false, true)
+		case <-hostCtx.Done():
+		}
+	}()
+	go func() {
 		<-ctx.Done()
-		stopResident(false)
+		stopResident(false, false)
 	}()
 	// The immutable launcher owns the write end of this anonymous pipe. A
 	// deliberate service stop sends 'S'. Update rollback sends 'P', while EOF
 	// means the parent died. Both preserve live Browser runtimes for recovery.
 	go func() {
-		stopResident(farmAgentControlPreservesRuntimes(stdin))
+		stopResident(farmAgentControlPreservesRuntimes(stdin), false)
 	}()
 	go backend.RunFarmClientUpdateSupervisor(hostCtx, host, path, filepath.Clean(executable))
 	var runErr error
@@ -184,14 +206,25 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	} else {
 		runErr = host.Run(hostCtx)
 	}
-	stopResident(false)
-	if runErr != nil && ctx.Err() == nil {
-		fmt.Fprintf(stderr, "ant-farm-client: stopped: %v\n", runErr)
-		_ = host.Shutdown()
+	stopResident(false, false)
+	shutdownErr := host.Shutdown()
+	if controlledStop {
+		if farmAgentControlledStopCompleted(true, runErr, admissionErr, shutdownErr) {
+			return backend.FarmClientInternalControlledStopExitCode
+		}
+		fmt.Fprintln(stderr, "ant-farm-client: controlled stop failed")
 		return 1
 	}
-	if err := host.Shutdown(); err != nil {
-		fmt.Fprintf(stderr, "ant-farm-client: shutdown failed: %v\n", err)
+	if runErr != nil && ctx.Err() == nil {
+		fmt.Fprintf(stderr, "ant-farm-client: stopped: %v\n", runErr)
+		return 1
+	}
+	if admissionErr != nil {
+		fmt.Fprintln(stderr, "ant-farm-client: local IPC shutdown failed")
+		return 1
+	}
+	if shutdownErr != nil {
+		fmt.Fprintf(stderr, "ant-farm-client: shutdown failed: %v\n", shutdownErr)
 		return 1
 	}
 	return 0

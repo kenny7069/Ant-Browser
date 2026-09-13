@@ -23,6 +23,7 @@ const (
 	farmClientIPCProfileState  = "management_runtime_status_v1"
 	farmClientIPCProfilePair   = "profile_pair_v1"
 	farmClientIPCProfileUnpair = "profile_unpair_v1"
+	farmClientIPCServiceStop   = "service_stop_v1"
 )
 
 var (
@@ -58,12 +59,16 @@ type farmClientIPCPairPayload struct {
 	PairingCode string `json:"pairing_code"`
 }
 
+type farmClientIPCServiceStopResult struct {
+	Accepted bool `json:"accepted"`
+}
+
 func validateFarmClientIPCRequest(request farmClientIPCRequest) error {
 	if request.ProtocolVersion != FarmClientIPCProtocolVersion || uuid.Validate(request.RequestUID) != nil || uuid.MustParse(request.RequestUID).String() != request.RequestUID {
 		return ErrFarmClientIPCInvalid
 	}
 	switch request.Operation {
-	case farmClientIPCHealth, farmClientIPCProfileList:
+	case farmClientIPCHealth, farmClientIPCProfileList, farmClientIPCServiceStop:
 		var payload struct{}
 		return decodeFarmClientIPCObject(request.Payload, &payload, nil)
 	case farmClientIPCProfileOpen, farmClientIPCProfileStop, farmClientIPCProfileState, farmClientIPCProfileUnpair:

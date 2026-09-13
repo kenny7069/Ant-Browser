@@ -67,6 +67,20 @@ func (client *FarmClientIPCClient) UnpairProfile(ctx context.Context, profileID 
 	return result, err
 }
 
+// ServiceStop asks the resident process to perform a controlled
+// shutdown. The authenticated local transport is the only authorization;
+// callers cannot supply tokens, identities, process details, or paths.
+func (client *FarmClientIPCClient) ServiceStop(ctx context.Context) error {
+	var result farmClientIPCServiceStopResult
+	if err := client.call(ctx, farmClientIPCServiceStop, struct{}{}, &result); err != nil {
+		return err
+	}
+	if !result.Accepted {
+		return ErrFarmClientIPCInvalid
+	}
+	return nil
+}
+
 func (client *FarmClientIPCClient) call(ctx context.Context, operation string, payload, destination any) error {
 	if client == nil || client.stateRoot == "" {
 		return ErrFarmClientIPCUnavailable
@@ -121,6 +135,9 @@ func (client *FarmClientIPCClient) call(ctx context.Context, operation string, p
 }
 
 func decodeFarmClientIPCResult(operation string, raw json.RawMessage, destination any) error {
+	if err := rejectFarmClientIPCDuplicateKeys(raw); err != nil {
+		return ErrFarmClientIPCInvalid
+	}
 	switch operation {
 	case farmClientIPCProfileList:
 		var items []json.RawMessage
@@ -141,6 +158,11 @@ func decodeFarmClientIPCResult(operation string, raw json.RawMessage, destinatio
 	case farmClientIPCProfilePair, farmClientIPCProfileUnpair:
 		var object map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &object); err != nil || !exactFarmClientIPCKeys(object, []string{"success", "node_uid", "profile_id", "server_profile_id", "status"}) {
+			return ErrFarmClientIPCInvalid
+		}
+	case farmClientIPCServiceStop:
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil || !exactFarmClientIPCKeys(object, []string{"accepted"}) {
 			return ErrFarmClientIPCInvalid
 		}
 	default:

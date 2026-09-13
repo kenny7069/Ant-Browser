@@ -8,12 +8,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestFarmClientLauncherSurvivesTwoSuccessorBoundaries(t *testing.T) {
+func buildFarmClientLauncherExitFixture(t *testing.T) string {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("builds a small child-process fixture")
 	}
@@ -24,11 +26,16 @@ func TestFarmClientLauncherSurvivesTwoSuccessorBoundaries(t *testing.T) {
 		executable += ".exe"
 	}
 	program := `package main
-import "os"
+import (
+    "os"
+    "strconv"
+)
 func main() {
 	path := os.Getenv("ANT_FARM_LAUNCHER_COUNT_FILE")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err == nil { _, _ = file.Write([]byte("x")); _ = file.Close() }
+	code, _ := strconv.Atoi(os.Getenv("ANT_FARM_LAUNCHER_EXIT_CODE"))
+	os.Exit(code)
 }`
 	if err := os.WriteFile(source, []byte(program), 0o600); err != nil {
 		t.Fatal(err)
@@ -37,8 +44,11 @@ func main() {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build fixture: %v: %s", err, output)
 	}
-	countPath := filepath.Join(root, "starts")
-	t.Setenv("ANT_FARM_LAUNCHER_COUNT_FILE", countPath)
+	return executable
+}
+
+func writeFarmClientLauncherTestConfig(t *testing.T, root string) string {
+	t.Helper()
 	config := FarmClientConfig{
 		ApplicationRoot: root,
 		StateRoot:       filepath.Join(root, "state"),
@@ -50,6 +60,16 @@ func main() {
 	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return configPath
+}
+
+func TestFarmClientLauncherSurvivesTwoSuccessorBoundaries(t *testing.T) {
+	root := t.TempDir()
+	executable := buildFarmClientLauncherExitFixture(t)
+	countPath := filepath.Join(root, "starts")
+	t.Setenv("ANT_FARM_LAUNCHER_COUNT_FILE", countPath)
+	t.Setenv("ANT_FARM_LAUNCHER_EXIT_CODE", "1")
+	configPath := writeFarmClientLauncherTestConfig(t, root)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- RunFarmClientLauncher(ctx, configPath, executable, nil, nil) }()
@@ -73,6 +93,74 @@ func main() {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("launcher did not stop after context cancellation")
+	}
+}
+
+func TestFarmClientLauncherControlledStopDoesNotRestart(t *testing.T) {
+	root := t.TempDir()
+	executable := buildFarmClientLauncherExitFixture(t)
+	countPath := filepath.Join(root, "starts")
+	t.Setenv("ANT_FARM_LAUNCHER_COUNT_FILE", countPath)
+	t.Setenv("ANT_FARM_LAUNCHER_EXIT_CODE", strconv.Itoa(FarmClientInternalControlledStopExitCode))
+	configPath := writeFarmClientLauncherTestConfig(t, root)
+	if err := RunFarmClientLauncher(context.Background(), configPath, executable, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := os.ReadFile(countPath); err != nil || string(value) != "x" {
+		t.Fatalf("controlled stop restarted child: starts=%q err=%v", value, err)
+	}
+}
+
+func farmClientLauncherExitError(t *testing.T, code string) error {
+	t.Helper()
+	executable := buildFarmClientLauncherExitFixture(t)
+	command := exec.Command(executable)
+	command.Env = append(os.Environ(), "ANT_FARM_LAUNCHER_COUNT_FILE="+filepath.Join(t.TempDir(), "starts"), "ANT_FARM_LAUNCHER_EXIT_CODE="+code)
+	return command.Run()
+}
+
+func TestFarmClientControlledStopExitEvidenceIsExactAndWrapped(t *testing.T) {
+	controlled := farmClientLauncherExitError(t, strconv.Itoa(FarmClientInternalControlledStopExitCode))
+	if !farmClientAgentControlledStop(controlled) || !farmClientAgentControlledStop(errors.Join(ErrFarmClientUpdateApply, controlled)) {
+		t.Fatalf("controlled stop exit was not recognized: %v", controlled)
+	}
+	for _, err := range []error{nil, errors.New("exit status 23"), farmClientLauncherExitError(t, "1")} {
+		if farmClientAgentControlledStop(err) {
+			t.Fatalf("non-controlled exit was accepted: %v", err)
+		}
+	}
+}
+
+func TestFarmClientProbationControlledStopPreservesPendingActivation(t *testing.T) {
+	config, staged := preparedFarmClientActivation(t)
+	activation, err := PrepareFarmClientUpdateActivation(staged, config, "1.0.0", time.Now())
+	if err != nil || activation.Pending == nil {
+		t.Fatalf("activation=%+v err=%v", activation, err)
+	}
+	if err := AuthorizeFarmClientUpdateActivation(config); err != nil {
+		t.Fatal(err)
+	}
+	updateRoot, err := farmClientUpdateRoot(config.StateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activationPath := farmClientUpdateActivationPath(updateRoot)
+	before, err := os.ReadFile(activationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exitErr := farmClientLauncherExitError(t, strconv.Itoa(FarmClientInternalControlledStopExitCode))
+	controlledStop, err := reconcileFarmClientPendingExit(config, "/config", "/launcher", *activation.Pending, errors.Join(ErrFarmClientUpdateApply, exitErr), nil)
+	if err != nil || !controlledStop {
+		t.Fatalf("controlled=%t err=%v", controlledStop, err)
+	}
+	after, err := os.ReadFile(activationPath)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("probation activation mutated: before=%q after=%q err=%v", before, after, err)
+	}
+	current, err := LoadFarmClientUpdateActivation(config.StateRoot)
+	if err != nil || current.Phase != farmClientUpdatePhaseProbation || current.Pending == nil || *current.Pending != *activation.Pending {
+		t.Fatalf("pending activation not preserved: %+v err=%v", current, err)
 	}
 }
 

@@ -12,19 +12,34 @@ import (
 )
 
 type FarmClientIPCServer struct {
-	listener   net.Listener
-	management *farmProfileManagement
-	timeout    time.Duration
+	listener    net.Listener
+	management  *farmProfileManagement
+	timeout     time.Duration
+	serviceStop func()
 
-	closeOnce sync.Once
-	stopping  chan struct{}
-	closed    chan struct{}
-	handlers  sync.WaitGroup
-	serveErr  error
-	mu        sync.Mutex
+	closeOnce       sync.Once
+	serviceStopOnce sync.Once
+	stopping        chan struct{}
+	closed          chan struct{}
+	handlers        sync.WaitGroup
+	serveErr        error
+	mu              sync.Mutex
 }
 
 func StartFarmClientIPCServer(host *FarmClientHost) (*FarmClientIPCServer, error) {
+	return startFarmClientIPCServer(host, nil)
+}
+
+// StartFarmClientIPCServerWithServiceStop is the resident-only composition
+// constructor. The legacy constructor deliberately has no stop authority.
+func StartFarmClientIPCServerWithServiceStop(host *FarmClientHost, serviceStop func()) (*FarmClientIPCServer, error) {
+	if serviceStop == nil {
+		return nil, ErrFarmClientIPCInvalid
+	}
+	return startFarmClientIPCServer(host, serviceStop)
+}
+
+func startFarmClientIPCServer(host *FarmClientHost, serviceStop func()) (*FarmClientIPCServer, error) {
 	management, err := newFarmProfileManagement(host)
 	if err != nil {
 		return nil, err
@@ -37,7 +52,7 @@ func StartFarmClientIPCServer(host *FarmClientHost) (*FarmClientIPCServer, error
 	if timeout <= 0 || timeout > 30*time.Second {
 		timeout = 30 * time.Second
 	}
-	server := &FarmClientIPCServer{listener: listener, management: management, timeout: timeout, stopping: make(chan struct{}), closed: make(chan struct{})}
+	server := &FarmClientIPCServer{listener: listener, management: management, timeout: timeout, serviceStop: serviceStop, stopping: make(chan struct{}), closed: make(chan struct{})}
 	go server.serve()
 	return server, nil
 }
@@ -60,19 +75,27 @@ func (server *FarmClientIPCServer) serve() {
 		server.handlers.Add(1)
 		go func(connection net.Conn) {
 			defer server.handlers.Done()
-			defer connection.Close()
-			forceClose := time.AfterFunc(server.timeout, func() { _ = connection.Close() })
-			defer forceClose.Stop()
-			_ = connection.SetDeadline(time.Now().Add(server.timeout))
-			server.handle(connection)
+			server.handleConnection(connection)
 		}(connection)
 	}
 }
 
-func (server *FarmClientIPCServer) handle(connection net.Conn) {
+func (server *FarmClientIPCServer) handleConnection(connection net.Conn) {
+	forceClose := time.AfterFunc(server.timeout, func() { _ = connection.Close() })
+	defer forceClose.Stop()
+	_ = connection.SetDeadline(time.Now().Add(server.timeout))
+	requestStop := server.handle(connection)
+	closeErr := connection.Close()
+	if requestStop && closeErr == nil {
+		server.serviceStopOnce.Do(func() { go server.serviceStop() })
+	}
+}
+
+func (server *FarmClientIPCServer) handle(connection net.Conn) bool {
 	raw, err := readFarmClientIPCFrame(connection)
 	requestUID := uuid.NewString()
 	var result any
+	requestStop := false
 	if err == nil {
 		var request farmClientIPCRequest
 		request, err = decodeFarmClientIPCRequest(raw)
@@ -81,6 +104,7 @@ func (server *FarmClientIPCServer) handle(connection net.Conn) {
 			ctx, cancel := context.WithTimeout(context.Background(), server.timeout)
 			result, err = server.dispatch(ctx, request)
 			cancel()
+			requestStop = err == nil && request.Operation == farmClientIPCServiceStop
 		}
 	}
 	response := farmClientIPCResponse{ProtocolVersion: FarmClientIPCProtocolVersion, RequestUID: requestUID, OK: err == nil}
@@ -93,9 +117,10 @@ func (server *FarmClientIPCServer) handle(connection net.Conn) {
 		response.Error = &farmClientIPCError{Code: farmClientIPCErrorCode(err)}
 	}
 	encoded, marshalErr := json.Marshal(response)
-	if marshalErr == nil {
-		_ = writeFarmClientIPCFrame(connection, encoded)
+	if marshalErr != nil || writeFarmClientIPCFrame(connection, encoded) != nil {
+		return false
 	}
+	return requestStop
 }
 
 func (server *FarmClientIPCServer) dispatch(ctx context.Context, request farmClientIPCRequest) (any, error) {
@@ -138,6 +163,11 @@ func (server *FarmClientIPCServer) dispatch(ctx context.Context, request farmCli
 			return nil, err
 		}
 		return server.management.Unpair(ctx, payload.ProfileID)
+	case farmClientIPCServiceStop:
+		if server.serviceStop == nil {
+			return nil, ErrFarmClientIPCUnavailable
+		}
+		return farmClientIPCServiceStopResult{Accepted: true}, nil
 	default:
 		return nil, ErrFarmClientIPCInvalid
 	}

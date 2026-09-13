@@ -4,9 +4,11 @@ import (
 	"ant-chrome/backend"
 	"ant-chrome/backend/internal/database"
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -139,6 +141,33 @@ func TestFarmAgentControlDistinguishesStopFromPreserve(t *testing.T) {
 	}
 	if !farmAgentControlPreservesRuntimes(strings.NewReader("")) {
 		t.Fatal("launcher death EOF did not preserve runtimes")
+	}
+}
+
+func TestFarmAgentControlledStopRequiresCompleteShutdownEvidence(t *testing.T) {
+	if !farmAgentControlledStopCompleted(true, nil, nil, nil) {
+		t.Fatal("complete controlled stop was rejected")
+	}
+	if !farmAgentControlledStopCompleted(true, context.Canceled, nil, nil) {
+		t.Fatal("controlled update-health cancellation was rejected after complete shutdown")
+	}
+	failure := errors.New("injected")
+	for _, test := range []struct {
+		name                        string
+		requested                   bool
+		runErr, admission, shutdown error
+	}{
+		{name: "not requested"},
+		{name: "run failure", requested: true, runErr: failure},
+		{name: "admission failure", requested: true, admission: failure},
+		{name: "shutdown failure", requested: true, shutdown: failure},
+		{name: "wrapped cancellation", requested: true, runErr: errors.Join(context.Canceled, failure)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if farmAgentControlledStopCompleted(test.requested, test.runErr, test.admission, test.shutdown) {
+				t.Fatal("incomplete shutdown produced controlled-stop evidence")
+			}
+		})
 	}
 }
 
