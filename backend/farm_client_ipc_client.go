@@ -36,6 +36,15 @@ func (client *FarmClientIPCClient) ProfileList(ctx context.Context) ([]FarmClien
 	return result, err
 }
 
+func (client *FarmClientIPCClient) ProfileCreate(ctx context.Context, request FarmProfileCreateRequest) (FarmProfileCreateResult, error) {
+	var result FarmProfileCreateResult
+	err := client.call(ctx, farmClientIPCProfileCreate, request, &result)
+	if err == nil && (!validFarmProfileCreateResult(result) || result.OperationUID != request.OperationUID || result.RequestUID != request.RequestUID || result.DisplayName != request.DisplayName || result.CoreRef != request.CoreRef) {
+		err = ErrFarmClientIPCInvalid
+	}
+	return result, err
+}
+
 func (client *FarmClientIPCClient) ProfileOpen(ctx context.Context, profileID string) (FarmClientManagedProfile, error) {
 	var result FarmClientManagedProfile
 	err := client.call(ctx, farmClientIPCProfileOpen, farmClientIPCProfilePayload{ProfileID: profileID}, &result)
@@ -149,6 +158,15 @@ func decodeFarmClientIPCResult(operation string, raw json.RawMessage, destinatio
 			if err := json.Unmarshal(item, &object); err != nil || !exactFarmClientIPCKeys(object, []string{"profile_id", "display_name", "login_readiness", "provider", "profile_incarnation"}) {
 				return ErrFarmClientIPCInvalid
 			}
+		}
+	case farmClientIPCProfileCreate:
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil || !exactFarmClientIPCKeys(object, []string{"operation_uid", "request_uid", "status", "ant_profile_id", "display_name", "profile_incarnation", "core_ref"}) {
+			return ErrFarmClientIPCInvalid
+		}
+		var result FarmProfileCreateResult
+		if err := decodeStrictJSON(raw, &result); err != nil || !validFarmProfileCreateResult(result) {
+			return ErrFarmClientIPCInvalid
 		}
 	case farmClientIPCProfileOpen, farmClientIPCProfileStop, farmClientIPCProfileState:
 		var object map[string]json.RawMessage

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 var ErrFarmClientProfileInUseUnowned = errors.New("profile is in use by an unowned browser")
@@ -19,7 +20,10 @@ type FarmClientManagedProfile struct {
 	Generation uint64 `json:"generation"`
 }
 
-type farmProfileManagement struct{ host *FarmClientHost }
+type farmProfileManagement struct {
+	host     *FarmClientHost
+	createMu sync.Mutex
+}
 
 func newFarmProfileManagement(host *FarmClientHost) (*farmProfileManagement, error) {
 	if host == nil || host.manager == nil || host.runtime == nil {
@@ -206,6 +210,8 @@ func farmClientIPCErrorCode(err error) string {
 		return "FARM_OWNED_CONFLICT"
 	case errors.Is(err, ErrFarmClientProfileNotFound):
 		return "PROFILE_NOT_FOUND"
+	case errors.Is(err, ErrFarmProfileCreateConflict):
+		return "IDEMPOTENCY_CONFLICT"
 	case errors.Is(err, ErrFarmClientPairingRejected):
 		return "PAIRING_REJECTED"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
@@ -225,6 +231,8 @@ func farmClientIPCRemoteError(code string) error {
 		return ErrFarmClientProfileFarmOwned
 	case "PROFILE_NOT_FOUND":
 		return ErrFarmClientProfileNotFound
+	case "IDEMPOTENCY_CONFLICT":
+		return ErrFarmProfileCreateConflict
 	case "PAIRING_REJECTED":
 		return ErrFarmClientPairingRejected
 	case "DEADLINE_EXCEEDED":

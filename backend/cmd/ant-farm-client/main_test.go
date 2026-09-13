@@ -306,3 +306,21 @@ func TestSuiteReleaseVerificationRejectsSymlinkAndOversize(t *testing.T) {
 		t.Fatal("oversized release input accepted")
 	}
 }
+
+func TestParseProfileCreateArgumentsBuildsCanonicalRequest(t *testing.T) {
+	operationUID := "d7823c53-82d0-4c91-8dd6-2453fe0f6436"
+	requestUID := "0a4413e3-9a63-49fd-a93c-37340ed5ec76"
+	request, err := parseProfileCreateArguments([]string{"-operation-uid", operationUID, "-request-uid", requestUID, "-display-name", "受控 Profile", "-core-ref", "core-stable"}, &bytes.Buffer{})
+	if err != nil || request.OperationUID != operationUID || request.RequestUID != requestUID || len(request.PayloadDigest) != 64 {
+		t.Fatalf("request=%+v err=%v", request, err)
+	}
+	for _, args := range [][]string{
+		{"-operation-uid", "not-a-uuid", "-request-uid", requestUID, "-display-name", "name", "-core-ref", "core-stable"},
+		{"-operation-uid", operationUID, "-request-uid", requestUID, "-display-name", " name", "-core-ref", "core-stable"},
+		{"-operation-uid", operationUID, "-request-uid", requestUID, "-display-name", "name", "-core-ref", "../core"},
+	} {
+		if _, err := parseProfileCreateArguments(args, &bytes.Buffer{}); err == nil {
+			t.Fatalf("invalid arguments accepted: %v", args)
+		}
+	}
+}

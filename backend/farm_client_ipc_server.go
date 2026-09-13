@@ -131,6 +131,12 @@ func (server *FarmClientIPCServer) dispatch(ctx context.Context, request farmCli
 		}{Status: "ready"}, nil
 	case farmClientIPCProfileList:
 		return server.management.List()
+	case farmClientIPCProfileCreate:
+		var payload FarmProfileCreateRequest
+		if err := decodeFarmClientIPCObject(request.Payload, &payload, []string{"operation_uid", "request_uid", "payload_digest", "display_name", "core_ref"}); err != nil {
+			return nil, err
+		}
+		return server.management.Create(payload)
 	case farmClientIPCProfileOpen:
 		var payload farmClientIPCProfilePayload
 		if err := decodeFarmClientIPCObject(request.Payload, &payload, []string{"profile_id"}); err != nil {

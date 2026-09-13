@@ -473,6 +473,19 @@ func runProfileCommand(configPath string, args []string, stdin io.Reader, stdout
 		}
 		return write(profiles)
 	}
+	if len(args) > 1 && args[0] == "profiles" && args[1] == "create" {
+		request, err := parseProfileCreateArguments(args[2:], stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: invalid profile create arguments")
+			return 2
+		}
+		result, err := client.ProfileCreate(ctx, request)
+		if err != nil {
+			fmt.Fprintln(stderr, "ant-farm-client: profile create failed")
+			return 1
+		}
+		return write(result)
+	}
 	if len(args) == 3 && args[0] == "profiles" && args[1] == "open" {
 		profile, err := client.ProfileOpen(ctx, args[2])
 		if err != nil {
@@ -521,6 +534,19 @@ func runProfileCommand(configPath string, args []string, stdin io.Reader, stdout
 	}
 	fmt.Fprintln(stderr, "ant-farm-client: invalid profile command")
 	return 2
+}
+
+func parseProfileCreateArguments(args []string, stderr io.Writer) (backend.FarmProfileCreateRequest, error) {
+	flags := flag.NewFlagSet("profiles create", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	operationUID := flags.String("operation-uid", "", "canonical management operation UUID")
+	requestUID := flags.String("request-uid", "", "canonical idempotency request UUID")
+	displayName := flags.String("display-name", "", "profile display name")
+	coreRef := flags.String("core-ref", "", "approved existing browser core ID")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		return backend.FarmProfileCreateRequest{}, errors.New("invalid profile create flags")
+	}
+	return backend.NewFarmProfileCreateRequest(*operationUID, *requestUID, *displayName, *coreRef)
 }
 
 func runEnrollment(configPath string, stdin io.Reader, stdout, stderr io.Writer) int {

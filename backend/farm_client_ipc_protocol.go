@@ -18,6 +18,7 @@ const (
 
 	farmClientIPCHealth        = "health_v1"
 	farmClientIPCProfileList   = "profile_list_v1"
+	farmClientIPCProfileCreate = "profile_create_v1"
 	farmClientIPCProfileOpen   = "management_runtime_open_v1"
 	farmClientIPCProfileStop   = "management_runtime_stop_v1"
 	farmClientIPCProfileState  = "management_runtime_status_v1"
@@ -79,6 +80,11 @@ func validateFarmClientIPCRequest(request farmClientIPCRequest) error {
 	case farmClientIPCProfilePair:
 		var payload farmClientIPCPairPayload
 		if err := decodeFarmClientIPCObject(request.Payload, &payload, []string{"profile_id", "pairing_code"}); err != nil || strings.TrimSpace(payload.ProfileID) == "" || len(payload.ProfileID) > 128 || strings.TrimSpace(payload.PairingCode) == "" || len(payload.PairingCode) > 4096 {
+			return ErrFarmClientIPCInvalid
+		}
+	case farmClientIPCProfileCreate:
+		var payload FarmProfileCreateRequest
+		if err := decodeFarmClientIPCObject(request.Payload, &payload, []string{"operation_uid", "request_uid", "payload_digest", "display_name", "core_ref"}); err != nil || !validFarmProfileCreateRequest(payload) {
 			return ErrFarmClientIPCInvalid
 		}
 	default:
