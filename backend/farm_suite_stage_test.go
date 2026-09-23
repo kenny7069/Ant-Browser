@@ -171,12 +171,12 @@ func TestSuiteCanonicalStageRejectsProofPlanAndInstalledTreeDrift(t *testing.T) 
 			}
 		}},
 		{"missing entry", func(t *testing.T, f *suiteStageFixture) {
-			if err := os.Remove(filepath.Join(f.source, "AntBrowser.exe")); err != nil {
+			if err := os.Remove(filepath.Join(f.source, filepath.FromSlash(suiteCurrentReleaseLayout().GUI))); err != nil {
 				t.Fatal(err)
 			}
 		}},
 		{"entry hash and size", func(t *testing.T, f *suiteStageFixture) {
-			if err := os.WriteFile(filepath.Join(f.source, "AntBrowser.exe"), []byte("tampered"), 0o755); err != nil {
+			if err := os.WriteFile(filepath.Join(f.source, filepath.FromSlash(suiteCurrentReleaseLayout().GUI)), []byte("tampered"), 0o755); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -196,6 +196,11 @@ func TestSuiteCanonicalStageRejectsProofPlanAndInstalledTreeDrift(t *testing.T) 
 			manifest.Target.OS = "windows"
 			if runtime.GOOS == "windows" {
 				manifest.Target.OS = "linux"
+			}
+			if runtime.GOOS == "darwin" {
+				// macOS bundle paths are only valid for darwin targets.
+				manifest.Target.OS = "darwin"
+				manifest.Target.Arch = map[string]string{"arm64": "amd64", "amd64": "arm64"}[runtime.GOARCH]
 			}
 			raw, err := MarshalSuiteReleaseManifest(manifest)
 			if err != nil {

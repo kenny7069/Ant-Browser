@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -272,6 +273,18 @@ func runSuiteCommand(roots backend.SuiteUserRoots, args []string, stdout, stderr
 			encoded, _ := json.Marshal(report)
 			fmt.Fprintln(stdout, string(encoded))
 			return backend.SuiteDoctorExitCode(report)
+		}
+		// Activation is public only where its native lifecycle is proven
+		// (macOS LaunchAgent); Windows stays internal until its matrix runs.
+		if args[1] == "activate" && runtime.GOOS == "darwin" {
+			if err := backend.ActivateSuiteService(context.Background(), roots); err != nil {
+				encoded, _ := json.Marshal(map[string]string{"state": "SERVICE_ACTIVATION_FAILED", "next_action": "suite_doctor"})
+				fmt.Fprintln(stdout, string(encoded))
+				return 1
+			}
+			encoded, _ := json.Marshal(map[string]string{"state": string(backend.SetupServiceStarted)})
+			fmt.Fprintln(stdout, string(encoded))
+			return 0
 		}
 		fmt.Fprintln(stderr, "ant-farm-client: invalid Suite service command")
 		return 2

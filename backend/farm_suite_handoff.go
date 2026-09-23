@@ -99,7 +99,7 @@ func FinalizeSuiteOwnershipHandoff(roots SuiteUserRoots, setupRequestUID, suiteB
 	if err != nil {
 		return SuiteOwnershipHandoff{}, err
 	}
-	if !sameSuiteHandoffPath(guiBinaryPath, filepath.Join(suiteBinaryRoot, "AntBrowser.exe")) || manifest.Version != filepath.Base(suiteBinaryRoot) || filepath.Base(filepath.Dir(suiteBinaryRoot)) != "versions" {
+	if !sameSuiteHandoffPath(guiBinaryPath, filepath.Join(suiteBinaryRoot, filepath.FromSlash(suiteCurrentReleaseLayout().GUI))) || manifest.Version != filepath.Base(suiteBinaryRoot) || filepath.Base(filepath.Dir(suiteBinaryRoot)) != "versions" {
 		return SuiteOwnershipHandoff{}, fmt.Errorf("%w: unplanned Suite version root or GUI", ErrSuiteOwnershipHandoff)
 	}
 	handoff := SuiteOwnershipHandoff{
@@ -160,7 +160,7 @@ func LoadSuiteOwnershipHandoff(roots SuiteUserRoots) (*SuiteOwnershipHandoff, er
 	}
 	manifest, digest, err := validateInstalledSuiteRelease(handoff.SuiteBinaryRoot, *plan)
 	if err != nil || digest != handoff.ManifestSHA256 || manifest.Version != filepath.Base(handoff.SuiteBinaryRoot) ||
-		filepath.Base(filepath.Dir(handoff.SuiteBinaryRoot)) != "versions" || !sameSuiteHandoffPath(handoff.GUIBinaryPath, filepath.Join(handoff.SuiteBinaryRoot, "AntBrowser.exe")) {
+		filepath.Base(filepath.Dir(handoff.SuiteBinaryRoot)) != "versions" || !sameSuiteHandoffPath(handoff.GUIBinaryPath, filepath.Join(handoff.SuiteBinaryRoot, filepath.FromSlash(suiteCurrentReleaseLayout().GUI))) {
 		return nil, fmt.Errorf("%w: installed Suite release mismatch", ErrSuiteOwnershipHandoff)
 	}
 	if err := validateSuiteMutableApplicationRoot(handoff.ApplicationRoot, roots.BrowserData); err != nil {
@@ -343,28 +343,15 @@ func validateInstalledSuiteRelease(suiteBinaryRoot string, plan SuiteSetupPlan) 
 	if digest != plan.ManifestSHA256 || manifest.Target != plan.Target || plan.Target != currentTarget {
 		return SuiteReleaseManifest{}, "", fmt.Errorf("%w: release manifest does not match setup plan", ErrSuiteOwnershipHandoff)
 	}
-	required := map[string]bool{
-		"AntBrowser.exe": false, "ant-farm-client.exe": false, "runtime/xray.exe": false,
-		"runtime/sing-box.exe": false, "runtime/chrome/chrome.exe": false, "LICENSES.json": false,
+	required := map[string]bool{}
+	for _, path := range suiteCurrentReleaseLayout().required() {
+		required[path] = false
+	}
+	if err := validateInstalledSuiteEntries(suiteBinaryRoot, manifest); err != nil {
+		return SuiteReleaseManifest{}, "", err
 	}
 	for _, entry := range manifest.Entries {
-		candidate, err := safeSuiteReleaseEntryPath(suiteBinaryRoot, entry.Path)
-		if err != nil {
-			return SuiteReleaseManifest{}, "", err
-		}
-		entryInfo, err := os.Lstat(candidate)
-		if err != nil || entryInfo.Mode()&os.ModeSymlink != 0 || !entryInfo.Mode().IsRegular() || entryInfo.Size() != entry.Size {
-			return SuiteReleaseManifest{}, "", fmt.Errorf("%w: installed entry shape mismatch", ErrSuiteOwnershipHandoff)
-		}
-		resolved, err := filepath.EvalSymlinks(candidate)
-		if err != nil || !sameSuiteHandoffPath(resolved, candidate) {
-			return SuiteReleaseManifest{}, "", fmt.Errorf("%w: redirected installed entry", ErrSuiteOwnershipHandoff)
-		}
-		entryDigest, err := streamSuiteInstalledEntryDigest(candidate, entry.Size)
-		if err != nil || entryDigest != entry.SHA256 {
-			return SuiteReleaseManifest{}, "", fmt.Errorf("%w: installed entry digest mismatch", ErrSuiteOwnershipHandoff)
-		}
-		if _, ok := required[entry.Path]; ok {
+		if _, ok := required[entry.Path]; ok && entry.Role != SuiteReleaseEntrySymlink {
 			required[entry.Path] = true
 		}
 	}
@@ -385,9 +372,14 @@ func validateInstalledSuiteTree(root string, manifest SuiteReleaseManifest) erro
 		"release-manifest.envelope.json": {},
 	}
 	allowedDirectories := map[string]struct{}{".": {}}
+	allowedSymlinks := map[string]struct{}{}
 	for _, entry := range manifest.Entries {
 		relative := filepath.ToSlash(filepath.Clean(filepath.FromSlash(entry.Path)))
-		allowedFiles[relative] = struct{}{}
+		if entry.Role == SuiteReleaseEntrySymlink {
+			allowedSymlinks[relative] = struct{}{}
+		} else {
+			allowedFiles[relative] = struct{}{}
+		}
 		for directory := filepath.ToSlash(filepath.Dir(filepath.FromSlash(entry.Path))); directory != "."; directory = filepath.ToSlash(filepath.Dir(filepath.FromSlash(directory))) {
 			allowedDirectories[directory] = struct{}{}
 		}
@@ -402,6 +394,11 @@ func validateInstalledSuiteTree(root string, manifest SuiteReleaseManifest) erro
 		}
 		relative = filepath.ToSlash(relative)
 		if entry.Type()&os.ModeSymlink != 0 {
+			// Only manifest-covered macOS bundle links; their targets are
+			// checked by validateInstalledSuiteEntries.
+			if _, allowed := allowedSymlinks[relative]; allowed {
+				return nil
+			}
 			return fmt.Errorf("%w: symlink in installed Suite tree", ErrSuiteOwnershipHandoff)
 		}
 		isReparsePoint, err := suitePathIsReparsePoint(path)
@@ -451,7 +448,8 @@ func streamSuiteInstalledEntryDigest(path string, expectedSize int64) (digest st
 }
 
 func safeSuiteReleaseEntryPath(root, entryPath string) (string, error) {
-	normalized, _, err := normalizeSuiteReleasePath(entryPath)
+	// Installed validation always requires manifest target == running GOOS.
+	normalized, _, err := normalizeSuiteReleasePathForTarget(entryPath, runtime.GOOS == "darwin")
 	if err != nil || normalized != entryPath {
 		return "", fmt.Errorf("%w: unsafe release entry path", ErrSuiteOwnershipHandoff)
 	}

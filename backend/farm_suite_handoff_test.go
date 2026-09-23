@@ -34,7 +34,7 @@ func suiteHandoffFixture(t *testing.T) (SuiteUserRoots, SetupPreparationCheckpoi
 	if err := os.MkdirAll(suiteBinaryRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	guiPath := filepath.Join(suiteBinaryRoot, "AntBrowser.exe")
+	guiPath := filepath.Join(suiteBinaryRoot, filepath.FromSlash(suiteCurrentReleaseLayout().GUI))
 	config := FarmClientConfig{
 		ApplicationRoot: filepath.Join(roots.BrowserData, "ant-application"), StateRoot: roots.AgentState,
 		ControlURL: "wss://farm.example.test/control/ws", NodeName: "Farm One",
@@ -63,16 +63,16 @@ func suiteHandoffFixture(t *testing.T) (SuiteUserRoots, SetupPreparationCheckpoi
 		}
 	}
 	files := map[string][]byte{
-		"AntBrowser.exe":                []byte("signed-gui-fixture"),
-		"ant-farm-client.exe":           []byte("signed-agent-fixture"),
-		"runtime/xray.exe":              []byte("signed-xray-fixture"),
-		"runtime/sing-box.exe":          []byte("signed-sing-box-fixture"),
-		"runtime/chrome/chrome.exe":     []byte("signed-chromium-fixture"),
-		"LICENSES.json":                 []byte("license-manifest-fixture"),
-		"licenses/Ant-LICENSE.txt":      []byte("Ant license fixture"),
-		"licenses/Xray-LICENSE.txt":     []byte("Xray license fixture"),
-		"licenses/SingBox-LICENSE.txt":  []byte("Sing-box license fixture"),
-		"licenses/Chromium-LICENSE.txt": []byte("Chromium license fixture"),
+		suiteCurrentReleaseLayout().GUI:      []byte("signed-gui-fixture"),
+		suiteCurrentReleaseLayout().Client:   []byte("signed-agent-fixture"),
+		suiteCurrentReleaseLayout().Xray:     []byte("signed-xray-fixture"),
+		suiteCurrentReleaseLayout().SingBox:  []byte("signed-sing-box-fixture"),
+		suiteCurrentReleaseLayout().Chromium: []byte("signed-chromium-fixture"),
+		"LICENSES.json":                      []byte("license-manifest-fixture"),
+		"licenses/Ant-LICENSE.txt":           []byte("Ant license fixture"),
+		"licenses/Xray-LICENSE.txt":          []byte("Xray license fixture"),
+		"licenses/SingBox-LICENSE.txt":       []byte("Sing-box license fixture"),
+		"licenses/Chromium-LICENSE.txt":      []byte("Chromium license fixture"),
 	}
 	entries := make([]SuiteReleaseEntry, 0, len(files))
 	for relative, content := range files {
@@ -85,7 +85,7 @@ func suiteHandoffFixture(t *testing.T) (SuiteUserRoots, SetupPreparationCheckpoi
 		}
 		digest := sha256.Sum256(content)
 		role, executable := SuiteReleaseEntryLegal, false
-		if strings.HasSuffix(relative, ".exe") {
+		if suiteTestIsLayoutBinary(relative) {
 			role, executable = SuiteReleaseEntryBinary, true
 		}
 		entries = append(entries, SuiteReleaseEntry{Path: relative, Role: role, Size: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), Executable: executable})
@@ -262,6 +262,10 @@ func TestSuiteOwnershipHandoffBindsInstalledReleaseBytesAndRoot(t *testing.T) {
 		if otherTarget == (SuiteReleaseTarget{OS: runtime.GOOS, Arch: runtime.GOARCH}) {
 			otherTarget = SuiteReleaseTarget{OS: "linux", Arch: "arm64"}
 		}
+		if runtime.GOOS == "darwin" {
+			// macOS bundle paths only validate for darwin; cross the arch instead.
+			otherTarget = SuiteReleaseTarget{OS: "darwin", Arch: map[string]string{"arm64": "amd64", "amd64": "arm64"}[runtime.GOARCH]}
+		}
 		rewriteSuiteHandoffReleaseTarget(t, roots, checkpoint, suiteBinaryRoot, otherTarget)
 		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
 			t.Fatalf("cross target = %v", err)
@@ -293,7 +297,7 @@ func TestSuiteOwnershipHandoffBindsInstalledReleaseBytesAndRoot(t *testing.T) {
 	})
 	t.Run("tampered non-GUI entry", func(t *testing.T) {
 		roots, checkpoint, suiteBinaryRoot, guiPath := suiteHandoffFixture(t)
-		if err := os.WriteFile(filepath.Join(suiteBinaryRoot, "runtime", "xray.exe"), []byte("tampered runtime"), 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(suiteBinaryRoot, filepath.FromSlash(suiteCurrentReleaseLayout().Xray)), []byte("tampered runtime"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := FinalizeSuiteOwnershipHandoff(roots, checkpoint.RequestUID, suiteBinaryRoot, guiPath); !errors.Is(err, ErrSuiteOwnershipHandoff) {
@@ -563,4 +567,14 @@ func TestSuiteWindowsPackageScaffoldFailsClosedAndSeparatesRoots(t *testing.T) {
 			t.Fatalf("version-agnostic license policy is pinned to %q", forbiddenVersion)
 		}
 	}
+}
+
+func suiteTestIsLayoutBinary(relative string) bool {
+	layout := suiteCurrentReleaseLayout()
+	for _, binary := range []string{layout.GUI, layout.Client, layout.Xray, layout.SingBox, layout.Chromium} {
+		if relative == binary {
+			return true
+		}
+	}
+	return false
 }

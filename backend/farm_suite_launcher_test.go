@@ -237,7 +237,7 @@ func TestSuiteLauncherProductionValidatorRejectsDurableEvidenceDrift(t *testing.
 			}
 			platform.calls = nil
 			configPath := filepath.Join(roots.Config, SuiteClientConfigName)
-			launcherPath := filepath.Join(handoff.SuiteBinaryRoot, "ant-farm-client.exe")
+			launcherPath := filepath.Join(handoff.SuiteBinaryRoot, filepath.FromSlash(suiteCurrentReleaseLayout().Client))
 			if err := validateSuiteLauncherStartWithPlatform(roots, configPath, launcherPath, platform); err != nil {
 				t.Fatalf("valid production fixture rejected: %v", err)
 			}

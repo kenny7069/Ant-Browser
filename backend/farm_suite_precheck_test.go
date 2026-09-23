@@ -49,12 +49,12 @@ func newSuitePrecheckFixture(t *testing.T) suitePrecheckFixture {
 	}
 	source := filepath.Join(t.TempDir(), "source-parent", "suite-source")
 	files := map[string][]byte{
-		"AntBrowser.exe":            []byte("gui"),
-		"ant-farm-client.exe":       []byte("agent"),
-		"runtime/xray.exe":          []byte("xray"),
-		"runtime/sing-box.exe":      []byte("sing-box"),
-		"runtime/chrome/chrome.exe": []byte("chrome"),
-		"LICENSES.json":             []byte("licenses"),
+		suiteCurrentReleaseLayout().GUI:      []byte("gui"),
+		suiteCurrentReleaseLayout().Client:   []byte("agent"),
+		suiteCurrentReleaseLayout().Xray:     []byte("xray"),
+		suiteCurrentReleaseLayout().SingBox:  []byte("sing-box"),
+		suiteCurrentReleaseLayout().Chromium: []byte("chrome"),
+		"LICENSES.json":                      []byte("licenses"),
 	}
 	entries := make([]SuiteReleaseEntry, 0, len(files))
 	for path, content := range files {
@@ -261,7 +261,7 @@ func TestSuiteCanonicalPrecheckRejectsSourceRootAndCapacityFailures(t *testing.T
 		mutate func(*testing.T, *suitePrecheckFixture, *suiteCanonicalPrecheckDependencies)
 	}{
 		{"tampered entry", func(t *testing.T, fixture *suitePrecheckFixture, _ *suiteCanonicalPrecheckDependencies) {
-			if err := os.WriteFile(filepath.Join(fixture.source, "AntBrowser.exe"), []byte("bad"), 0o755); err != nil {
+			if err := os.WriteFile(filepath.Join(fixture.source, filepath.FromSlash(suiteCurrentReleaseLayout().GUI)), []byte("bad"), 0o755); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -271,7 +271,7 @@ func TestSuiteCanonicalPrecheckRejectsSourceRootAndCapacityFailures(t *testing.T
 			}
 		}},
 		{"source symlink", func(t *testing.T, fixture *suitePrecheckFixture, _ *suiteCanonicalPrecheckDependencies) {
-			target := filepath.Join(fixture.source, "AntBrowser.exe")
+			target := filepath.Join(fixture.source, filepath.FromSlash(suiteCurrentReleaseLayout().GUI))
 			content, err := os.ReadFile(target)
 			if err != nil {
 				t.Fatal(err)
@@ -279,7 +279,7 @@ func TestSuiteCanonicalPrecheckRejectsSourceRootAndCapacityFailures(t *testing.T
 			if err := os.Remove(target); err != nil {
 				t.Fatal(err)
 			}
-			outside := filepath.Join(t.TempDir(), "AntBrowser.exe")
+			outside := filepath.Join(t.TempDir(), filepath.Base(suiteCurrentReleaseLayout().GUI))
 			if err := os.WriteFile(outside, content, 0o755); err != nil {
 				t.Fatal(err)
 			}

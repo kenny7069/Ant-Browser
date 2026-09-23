@@ -27,7 +27,7 @@ func suiteDoctorProbeFixture(t *testing.T) (suiteIdentityFixture, SuiteOwnership
 		t.Fatal(err)
 	}
 	fixture.source = versionRoot
-	if _, err := FinalizeSuiteOwnershipHandoff(fixture.roots, fixture.preparation.RequestUID, fixture.source, filepath.Join(fixture.source, "AntBrowser.exe")); err != nil {
+	if _, err := FinalizeSuiteOwnershipHandoff(fixture.roots, fixture.preparation.RequestUID, fixture.source, filepath.Join(fixture.source, filepath.FromSlash(suiteCurrentReleaseLayout().GUI))); err != nil {
 		t.Fatal(err)
 	}
 	handoff, err := LoadSuiteOwnershipHandoff(fixture.roots)

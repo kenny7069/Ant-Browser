@@ -24,6 +24,10 @@ const (
 	SuiteReleaseEntryConfig  = "config"
 	SuiteReleaseEntryAsset   = "asset"
 	SuiteReleaseEntryLegal   = "legal"
+	// SuiteReleaseEntrySymlink is macOS-only: bundle frameworks require
+	// relative symlinks. Its sha256 is the digest of the exact link target
+	// string and its size is zero; install validation re-reads the link.
+	SuiteReleaseEntrySymlink = "symlink"
 
 	maxSuiteReleaseManifestBytes = 1 << 20
 	maxSuiteReleaseEnvelopeBytes = 16 << 10
@@ -41,6 +45,13 @@ var suiteReleaseTokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0
 var suiteReleaseCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 var suiteReleaseSemverPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 var suiteReleasePathSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*$`)
+
+// macOS bundles use inner spaces and parentheses ("Google Chrome for Testing
+// Helper (GPU).app") and underscore-led names ("_CodeSignature"); they also
+// nest deeper than the Windows path budget.  Only darwin targets allow these.
+var suiteReleaseDarwinPathSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9 ._+()-]*[A-Za-z0-9._+()-]$|^[A-Za-z0-9_]$`)
+
+const maxSuiteDarwinReleasePathBytes = 512
 
 type SuiteReleaseTarget struct {
 	OS   string `json:"os"`
@@ -147,8 +158,9 @@ func (m SuiteReleaseManifest) Validate() error {
 	legalPaths := map[string]string{}
 	hasBinary, hasLegal := false, false
 	totalSize := int64(0)
+	darwin := m.Target.OS == "darwin"
 	for _, entry := range m.Entries {
-		normalized, canonical, err := normalizeSuiteReleasePath(entry.Path)
+		normalized, canonical, err := normalizeSuiteReleasePathForTarget(entry.Path, darwin)
 		if err != nil || normalized != entry.Path {
 			return fmt.Errorf("%w: invalid entry path %q", ErrSuiteReleaseManifest, entry.Path)
 		}
@@ -168,6 +180,9 @@ func (m SuiteReleaseManifest) Validate() error {
 		seenPaths[canonical] = struct{}{}
 		if entry.Size < 0 || entry.Size > maxSuiteReleaseEntryBytes || !validLowerSHA256(entry.SHA256) || !validSuiteReleaseEntryRole(entry.Role) {
 			return fmt.Errorf("%w: invalid entry metadata", ErrSuiteReleaseManifest)
+		}
+		if entry.Role == SuiteReleaseEntrySymlink && (!darwin || entry.Size != 0 || entry.Executable) {
+			return fmt.Errorf("%w: symlink entries are macOS-only and carry no bytes", ErrSuiteReleaseManifest)
 		}
 		if (entry.Role == SuiteReleaseEntryBinary) != entry.Executable {
 			return fmt.Errorf("%w: executable flag does not match role", ErrSuiteReleaseManifest)
@@ -194,7 +209,7 @@ func (m SuiteReleaseManifest) Validate() error {
 		return fmt.Errorf("%w: binary and legal entries are required", ErrSuiteReleaseManifest)
 	}
 	for _, dependency := range m.Dependencies {
-		normalized, canonical, err := normalizeSuiteReleasePath(dependency.LicenseRef)
+		normalized, canonical, err := normalizeSuiteReleasePathForTarget(dependency.LicenseRef, darwin)
 		if err != nil || normalized != dependency.LicenseRef || legalPaths[canonical] != dependency.LicenseRef {
 			return fmt.Errorf("%w: dependency license_ref must exactly name a legal entry", ErrSuiteReleaseManifest)
 		}
@@ -286,8 +301,16 @@ func SuiteReleaseManifestSHA256(raw []byte) (string, error) {
 }
 
 func normalizeSuiteReleasePath(raw string) (string, string, error) {
+	return normalizeSuiteReleasePathForTarget(raw, false)
+}
+
+func normalizeSuiteReleasePathForTarget(raw string, darwin bool) (string, string, error) {
+	segmentPattern, maxPathBytes := suiteReleasePathSegmentPattern, maxSuiteReleasePathBytes
+	if darwin {
+		segmentPattern, maxPathBytes = suiteReleaseDarwinPathSegmentPattern, maxSuiteDarwinReleasePathBytes
+	}
 	if raw == "" || strings.TrimSpace(raw) != raw || strings.Contains(raw, `\`) || strings.Contains(raw, ":") ||
-		strings.IndexByte(raw, 0) >= 0 || strings.HasPrefix(raw, "/") || filepath.IsAbs(raw) || len(raw) > maxSuiteReleasePathBytes {
+		strings.IndexByte(raw, 0) >= 0 || strings.HasPrefix(raw, "/") || filepath.IsAbs(raw) || len(raw) > maxPathBytes {
 		return "", "", ErrSuiteReleaseManifest
 	}
 	cleaned := path.Clean(raw)
@@ -296,7 +319,7 @@ func normalizeSuiteReleasePath(raw string) (string, string, error) {
 	}
 	for _, segment := range strings.Split(cleaned, "/") {
 		if segment == "" || segment == "." || segment == ".." || len(segment) > maxSuiteReleaseSegmentBytes ||
-			!suiteReleasePathSegmentPattern.MatchString(segment) || strings.HasSuffix(segment, ".") || isWindowsReservedSuiteBasename(segment) {
+			!segmentPattern.MatchString(segment) || strings.HasSuffix(segment, ".") || isWindowsReservedSuiteBasename(segment) {
 			return "", "", ErrSuiteReleaseManifest
 		}
 	}
@@ -331,7 +354,7 @@ func validateSuiteReleaseTokens(values []string) error {
 
 func validSuiteReleaseEntryRole(role string) bool {
 	switch role {
-	case SuiteReleaseEntryBinary, SuiteReleaseEntryLibrary, SuiteReleaseEntryConfig, SuiteReleaseEntryAsset, SuiteReleaseEntryLegal:
+	case SuiteReleaseEntryBinary, SuiteReleaseEntryLibrary, SuiteReleaseEntryConfig, SuiteReleaseEntryAsset, SuiteReleaseEntryLegal, SuiteReleaseEntrySymlink:
 		return true
 	default:
 		return false

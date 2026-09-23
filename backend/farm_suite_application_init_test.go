@@ -386,7 +386,7 @@ func TestSuiteCanonicalApplicationInitRejectsCheckpointByteDriftAndManifestDrift
 		func(release *VerifiedSuiteRelease) { release.manifest.ConfigSchema++ },
 		func(release *VerifiedSuiteRelease) {
 			for index := range release.manifest.Entries {
-				if release.manifest.Entries[index].Path == "runtime/chrome/chrome.exe" {
+				if release.manifest.Entries[index].Path == suiteCurrentReleaseLayout().Chromium {
 					release.manifest.Entries[index].Role = "data"
 				}
 			}

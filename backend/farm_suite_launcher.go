@@ -101,7 +101,7 @@ func validateSuiteLauncherStartWithPlatform(roots SuiteUserRoots, configPath, la
 	if err != nil || registration != suiteServiceRegistrationExactEnabled {
 		return ErrSuiteLauncherRevalidation
 	}
-	expectedLauncher := filepath.Join(handoff.SuiteBinaryRoot, "ant-farm-client.exe")
+	expectedLauncher := filepath.Join(handoff.SuiteBinaryRoot, filepath.FromSlash(suiteCurrentReleaseLayout().Client))
 	if !sameSuiteHandoffPath(launcherPath, expectedLauncher) {
 		return ErrSuiteLauncherRevalidation
 	}

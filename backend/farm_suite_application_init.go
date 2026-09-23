@@ -193,7 +193,7 @@ func loadSuiteApplicationInitEvidence(ctx context.Context, bootstrap BootstrapCo
 	if !ok || strings.TrimSpace(chromiumVersion) != chromiumVersion || chromiumVersion == "" || release.manifest.ConfigSchema != suiteApplicationConfigSchema {
 		return emptyEvidence, nil, SuiteBootstrapEnrollmentAttempt{}, SuiteApplicationInitState{}, nil, appbrowser.Core{}, ErrSuiteCanonicalApplicationInit
 	}
-	const chromeRelative = "runtime/chrome/chrome.exe"
+	chromeRelative := suiteCurrentReleaseLayout().Chromium
 	covered := 0
 	for _, entry := range release.manifest.Entries {
 		if entry.Path == chromeRelative && entry.Executable && entry.Role == "binary" {
