@@ -639,3 +639,51 @@ func TestSuiteSetupRerunKeepsCanonicalCheckpoint(t *testing.T) {
 		})
 	}
 }
+
+// Once a setup plan exists the state is canonical: an unreadable plan or a
+// missing preparation checkpoint is corruption and never archives setup.json.
+func TestSuiteSetupPlanPresenceNeverFallsBackToLegacyArchive(t *testing.T) {
+	for _, damage := range []string{"corrupt plan", "preparation missing"} {
+		t.Run(damage, func(t *testing.T) {
+			roots, config := setupEngineFixture(t)
+			coordinator, err := NewSuiteSetupCoordinatorWithRoots(config, roots)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := coordinator.Run()
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest, _ := bootstrapConfigDigest(config)
+			plan := SuiteSetupPlan{SchemaVersion: 1, PreparationRequestUID: first.Checkpoint.RequestUID,
+				BootstrapSHA256: digest, ManifestSHA256: strings.Repeat("a", 64),
+				Target: SuiteReleaseTarget{OS: runtime.GOOS, Arch: runtime.GOARCH}}
+			plan.StageID = deriveSuiteSetupStageID(plan.ManifestSHA256, plan.Target)
+			if err := SaveSuiteSetupPlan(roots, plan); err != nil {
+				t.Fatal(err)
+			}
+			for _, stage := range []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafted} {
+				if err := SaveSetupCheckpoint(config.StatePath, SetupCheckpoint{SchemaVersion: 1, Stage: stage, RequestUID: first.Checkpoint.RequestUID}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			planPath, _ := suiteSetupPlanPath(roots)
+			if damage == "corrupt plan" {
+				if err := os.WriteFile(planPath, []byte("{not json"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Remove(filepath.Join(roots.AgentState, suitePreparationStateName)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := coordinator.Run(); !errors.Is(err, ErrSuiteSetupCorrupt) {
+				t.Fatalf("damaged canonical state accepted: %v", err)
+			}
+			if matches, _ := filepath.Glob(config.StatePath + "*.legacy-preparation.*"); len(matches) != 0 {
+				t.Fatalf("canonical checkpoint archived as legacy: %v", matches)
+			}
+			if kept, err := LoadSetupCheckpoint(config.StatePath); err != nil || kept == nil || kept.Stage != SetupConfigDrafted {
+				t.Fatalf("canonical checkpoint lost: %+v, %v", kept, err)
+			}
+		})
+	}
+}

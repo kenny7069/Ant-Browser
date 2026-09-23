@@ -5,6 +5,7 @@ package backend
 import (
 	"fmt"
 	"os"
+	"syscall"
 )
 
 func secureSuiteSetupPath(path string, directory bool) error {
@@ -25,6 +26,9 @@ func validateSuiteSetupPathSecurity(path string, directory bool) error {
 	}
 	if info.Mode()&os.ModeSymlink != 0 || (directory && !info.IsDir()) || (!directory && !info.Mode().IsRegular()) {
 		return fmt.Errorf("invalid owner-only path type")
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Geteuid() {
+		return fmt.Errorf("owner-only path is not owned by the current user")
 	}
 	want := os.FileMode(0o600)
 	if directory {

@@ -27,8 +27,11 @@ func suiteIdentityStoreKindFor(goos string) string {
 		return "MACOS_LOGIN_KEYCHAIN"
 	case "linux":
 		return "LINUX_SECRET_SERVICE"
-	default:
+	case "windows":
 		return "WINDOWS_CURRENT_USER_DPAPI"
+	default:
+		// Never mislabel a future platform: its receipts cannot validate.
+		return "UNSUPPORTED"
 	}
 }
 

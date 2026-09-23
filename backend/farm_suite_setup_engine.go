@@ -377,29 +377,42 @@ func inspectLegacySetupMigration(roots SuiteUserRoots, config BootstrapConfig) (
 }
 
 // suiteCanonicalCheckpointOwned reports whether setup.json belongs to the
-// canonical chain: a BOOTSTRAP_DRAFTED preparation checkpoint and a setup
-// plan exist for this exact bootstrap, and setup.json carries the same
-// request UID.  Legacy installs predate the setup plan entirely.
+// canonical chain.  Legacy installs predate the setup plan entirely, so the
+// mere presence of setup-plan.json makes the state canonical: from then on
+// any unreadable plan/preparation, digest or request mismatch is corruption,
+// never a reason to fall back to the legacy archive path.
 func suiteCanonicalCheckpointOwned(roots SuiteUserRoots, config BootstrapConfig) (bool, error) {
-	preparation, err := loadSetupPreparationCheckpoint(filepath.Join(roots.AgentState, suitePreparationStateName))
-	if err != nil || preparation == nil || preparation.Stage != SetupBootstrapDrafted {
+	planPath, err := suiteSetupPlanPath(roots)
+	if err != nil {
+		return false, fmt.Errorf("%w: setup plan path: %v", ErrSuiteSetupCorrupt, err)
+	}
+	if _, err := os.Lstat(planPath); errors.Is(err, os.ErrNotExist) {
 		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("%w: setup plan: %v", ErrSuiteSetupCorrupt, err)
+	}
+	corrupt := func(reason string) (bool, error) {
+		return false, fmt.Errorf("%w: canonical setup %s", ErrSuiteSetupCorrupt, reason)
 	}
 	plan, err := LoadSuiteSetupPlan(roots)
 	if err != nil || plan == nil {
-		return false, nil
+		return corrupt("plan unreadable")
+	}
+	preparation, err := loadSetupPreparationCheckpoint(filepath.Join(roots.AgentState, suitePreparationStateName))
+	if err != nil || preparation == nil || preparation.Stage != SetupBootstrapDrafted {
+		return corrupt("preparation missing or behind the plan")
 	}
 	digest, err := bootstrapConfigDigest(config)
 	if err != nil || preparation.BootstrapSHA256 != digest || plan.BootstrapSHA256 != digest ||
 		plan.PreparationRequestUID != preparation.RequestUID {
-		return false, nil
+		return corrupt("plan binding mismatch")
 	}
 	checkpoint, err := LoadSetupCheckpoint(config.StatePath)
 	if err != nil {
-		return false, fmt.Errorf("%w: canonical checkpoint: %v", ErrSuiteSetupCorrupt, err)
+		return corrupt("checkpoint unreadable")
 	}
 	if checkpoint != nil && checkpoint.RequestUID != preparation.RequestUID {
-		return false, fmt.Errorf("%w: canonical checkpoint request mismatch", ErrSuiteSetupCorrupt)
+		return corrupt("checkpoint request mismatch")
 	}
 	return true, nil
 }

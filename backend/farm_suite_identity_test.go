@@ -595,6 +595,7 @@ func assertSuiteIdentityNoLaterArtifacts(t *testing.T, fixture suiteIdentityFixt
 func TestSuiteIdentityStoreKindNamesTheNativeStore(t *testing.T) {
 	for goos, want := range map[string]string{
 		"windows": "WINDOWS_CURRENT_USER_DPAPI", "darwin": "MACOS_LOGIN_KEYCHAIN", "linux": "LINUX_SECRET_SERVICE",
+		"freebsd": "UNSUPPORTED",
 	} {
 		if got := suiteIdentityStoreKindFor(goos); got != want {
 			t.Fatalf("%s store kind = %q, want %q", goos, got, want)
