@@ -313,6 +313,14 @@ func inspectLegacySetupMigration(roots SuiteUserRoots, config BootstrapConfig) (
 		return &marker, nil
 	}
 
+	if owned, err := suiteCanonicalCheckpointOwned(roots, config); err != nil {
+		return nil, err
+	} else if owned {
+		// The canonical v3 chain reuses PRECHECK/STAGED/CONFIG_DRAFTED in
+		// setup.json after preparation finished; that is a resumable
+		// checkpoint, never a pre-preparation legacy file.
+		return nil, nil
+	}
 	primaryRaw, primaryExists, primaryReadErr := readOwnerFile(config.StatePath)
 	backupRaw, backupExists, backupReadErr := readOwnerFile(config.StatePath + ".bak")
 	if primaryReadErr != nil || backupReadErr != nil {
@@ -366,6 +374,34 @@ func inspectLegacySetupMigration(roots SuiteUserRoots, config BootstrapConfig) (
 		migration.BackupSHA256 = bytesDigest(backupRaw)
 	}
 	return migration, nil
+}
+
+// suiteCanonicalCheckpointOwned reports whether setup.json belongs to the
+// canonical chain: a BOOTSTRAP_DRAFTED preparation checkpoint and a setup
+// plan exist for this exact bootstrap, and setup.json carries the same
+// request UID.  Legacy installs predate the setup plan entirely.
+func suiteCanonicalCheckpointOwned(roots SuiteUserRoots, config BootstrapConfig) (bool, error) {
+	preparation, err := loadSetupPreparationCheckpoint(filepath.Join(roots.AgentState, suitePreparationStateName))
+	if err != nil || preparation == nil || preparation.Stage != SetupBootstrapDrafted {
+		return false, nil
+	}
+	plan, err := LoadSuiteSetupPlan(roots)
+	if err != nil || plan == nil {
+		return false, nil
+	}
+	digest, err := bootstrapConfigDigest(config)
+	if err != nil || preparation.BootstrapSHA256 != digest || plan.BootstrapSHA256 != digest ||
+		plan.PreparationRequestUID != preparation.RequestUID {
+		return false, nil
+	}
+	checkpoint, err := LoadSetupCheckpoint(config.StatePath)
+	if err != nil {
+		return false, fmt.Errorf("%w: canonical checkpoint: %v", ErrSuiteSetupCorrupt, err)
+	}
+	if checkpoint != nil && checkpoint.RequestUID != preparation.RequestUID {
+		return false, fmt.Errorf("%w: canonical checkpoint request mismatch", ErrSuiteSetupCorrupt)
+	}
+	return true, nil
 }
 
 func (m *legacySetupMigration) validate() error {

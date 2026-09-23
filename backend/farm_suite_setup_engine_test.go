@@ -579,3 +579,63 @@ func TestSuiteSetupRejectsPreparationAndLegacyInconsistency(t *testing.T) {
 		})
 	}
 }
+
+// A canonical run that stopped after preparation (e.g. an untrusted TLS
+// Server failed TRANSPORT_VERIFIED) must resume, not be archived as legacy.
+func TestSuiteSetupRerunKeepsCanonicalCheckpoint(t *testing.T) {
+	for _, stage := range []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafted, SetupTransportVerified} {
+		t.Run(string(stage), func(t *testing.T) {
+			roots, config := setupEngineFixture(t)
+			coordinator, err := NewSuiteSetupCoordinatorWithRoots(config, roots)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := coordinator.Run()
+			if err != nil || first.Checkpoint.Stage != SetupBootstrapDrafted {
+				t.Fatalf("first run = %+v, %v", first, err)
+			}
+			digest, _ := bootstrapConfigDigest(config)
+			plan := SuiteSetupPlan{SchemaVersion: 1, PreparationRequestUID: first.Checkpoint.RequestUID,
+				BootstrapSHA256: digest, ManifestSHA256: strings.Repeat("a", 64),
+				Target: SuiteReleaseTarget{OS: runtime.GOOS, Arch: runtime.GOARCH}}
+			plan.StageID = deriveSuiteSetupStageID(plan.ManifestSHA256, plan.Target)
+			if err := SaveSuiteSetupPlan(roots, plan); err != nil {
+				t.Fatal(err)
+			}
+			canonical := SetupCheckpoint{SchemaVersion: 1, Stage: stage, RequestUID: first.Checkpoint.RequestUID}
+			for _, candidate := range []SetupStage{SetupPrecheck, SetupStaged, SetupConfigDrafted, SetupTransportVerified} {
+				if setupStageIndex(candidate) > setupStageIndex(stage) {
+					break
+				}
+				next := canonical
+				next.Stage = candidate
+				if err := SaveSetupCheckpoint(config.StatePath, next); err != nil {
+					t.Fatal(err)
+				}
+			}
+			second, err := coordinator.Run()
+			if err != nil || second.Checkpoint.RequestUID != first.Checkpoint.RequestUID {
+				t.Fatalf("rerun = %+v, %v", second, err)
+			}
+			kept, err := LoadSetupCheckpoint(config.StatePath)
+			if err != nil || kept == nil || *kept != canonical {
+				t.Fatalf("canonical checkpoint lost: %+v, %v", kept, err)
+			}
+			if _, err := os.Stat(legacyArchivePath(config.StatePath, first.Checkpoint.RequestUID)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("canonical checkpoint was archived as legacy: %v", err)
+			}
+			// A checkpoint for another request is corruption, not a resume.
+			for _, path := range []string{config.StatePath, config.StatePath + ".bak"} {
+				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+			}
+			if err := SaveSetupCheckpoint(config.StatePath, SetupCheckpoint{SchemaVersion: 1, Stage: SetupPrecheck, RequestUID: "b3308b52-ae5b-4bc7-9ecd-42fc9e3fc9c6"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := coordinator.Run(); !errors.Is(err, ErrSuiteSetupCorrupt) {
+				t.Fatalf("foreign canonical checkpoint accepted: %v", err)
+			}
+		})
+	}
+}
