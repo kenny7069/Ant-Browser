@@ -38,6 +38,7 @@ type FarmClientHost struct {
 	runtime         *BrowserRuntimeService
 	farm            *FarmRuntimeService
 	adapter         *FarmRuntimeControlAdapter
+	management      *farmProfileManagement
 	transport       *FarmControlWSSClient
 	log             *logger.Logger
 	logging         bool
@@ -163,6 +164,16 @@ func NewFarmClientHostWithIdentityStore(configPath string, suppliedIdentityStore
 		_ = db.Close()
 		return nil, err
 	}
+	management, err := newFarmProfileManagement(&FarmClientHost{db: db, manager: manager, runtime: runtimeService, farm: farmService, identity: identity})
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	profileAdapter, err := NewFarmProfileControlAdapter(management)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	transport, err := NewFarmControlWSSClient(FarmControlWSSClientConfig{
 		URL: cfg.ControlURL, NodeUID: identity.NodeUID, PrivateKey: identity.PrivateKey,
 		HandshakeTimeout: cfg.handshakeTimeout(), CommandTimeout: cfg.commandTimeout(),
@@ -173,6 +184,10 @@ func NewFarmClientHostWithIdentityStore(configPath string, suppliedIdentityStore
 		_ = db.Close()
 		return nil, err
 	}
+	if err := transport.SetProfileControlAdapter(profileAdapter); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	logger.InitWithConfig(context.Background(), logger.LoggerConfig{
 		Level: "info", FileEnabled: true, FilePath: cfg.LogFile,
 		Format: "json", BufferSize: 4, AsyncQueueSize: 256, FlushIntervalMs: 250,
@@ -180,11 +195,13 @@ func NewFarmClientHostWithIdentityStore(configPath string, suppliedIdentityStore
 	log := logger.New("FarmClient")
 	log.Info("standalone farm client started", logger.F("version", FarmClientVersion), logger.F("goos", FarmClientVersionInfoValue().GOOS), logger.F("goarch", FarmClientVersionInfoValue().GOARCH))
 	cleanupLock = false
-	return &FarmClientHost{
+	standaloneHost := &FarmClientHost{
 		config: cfg, identity: identity, lock: lock, db: db, manager: manager,
-		runtime: runtimeService, farm: farmService, adapter: adapter,
+		runtime: runtimeService, farm: farmService, adapter: adapter, management: management,
 		transport: transport, log: log, logging: true,
-	}, nil
+	}
+	management.host = standaloneHost
+	return standaloneHost, nil
 }
 
 // VersionInfo intentionally excludes roots, profile IDs, URLs and identity.

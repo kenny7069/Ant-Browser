@@ -275,6 +275,27 @@ var migrations = []migration{
 				 END`,
 		},
 	},
+	{
+		version: 19,
+		desc:    "添加 Farm Profile 建立冪等操作日誌",
+		stmts: []string{
+			`CREATE TABLE IF NOT EXISTS farm_profile_create_operations (
+				operation_uid       TEXT PRIMARY KEY,
+				request_uid         TEXT NOT NULL UNIQUE,
+				command             TEXT NOT NULL CHECK (command = 'profile_create_v1'),
+				node_uid            TEXT NOT NULL,
+				payload_digest      TEXT NOT NULL,
+				profile_id          TEXT NOT NULL UNIQUE,
+				profile_incarnation TEXT NOT NULL UNIQUE,
+				display_name        TEXT NOT NULL,
+				core_ref            TEXT NOT NULL,
+				status              TEXT NOT NULL CHECK (status = 'COMPLETED'),
+				created_at          TEXT NOT NULL,
+				updated_at          TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_farm_profile_create_operations_created_at ON farm_profile_create_operations(created_at)`,
+		},
+	},
 	// ── 新版本在此追加，格式：
 	// {
 	//     version: 4,

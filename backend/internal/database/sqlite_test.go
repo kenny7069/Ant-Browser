@@ -73,3 +73,24 @@ func TestMigrateDefaultsNewPluginsToManualInstall(t *testing.T) {
 		t.Fatalf("default_install = %d, want 0 for a newly stored plugin", defaultInstall)
 	}
 }
+
+func TestMigrateCreatesClosedFarmProfileOperationJournal(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "database.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := db.GetConn().QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version < 19 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	_, err = db.GetConn().Exec(`INSERT INTO farm_profile_create_operations
+		(operation_uid, request_uid, command, node_uid, payload_digest, profile_id, profile_incarnation, display_name, core_ref, status, created_at, updated_at)
+		VALUES ('op', 'request', 'unknown', 'node', 'digest', 'profile', 'incarnation', 'name', 'core', 'COMPLETED', 'now', 'now')`)
+	if err == nil {
+		t.Fatal("journal accepted an unknown command")
+	}
+}

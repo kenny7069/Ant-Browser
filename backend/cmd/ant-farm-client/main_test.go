@@ -1,11 +1,20 @@
 package main
 
 import (
+	"ant-chrome/backend"
+	"ant-chrome/backend/internal/database"
 	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestDiagnosticsCLIUsesAllowlist(t *testing.T) {
@@ -24,6 +33,84 @@ func TestDiagnosticsCLIUsesAllowlist(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), secret) || strings.Contains(stdout.String(), "node-a") || strings.Contains(stdout.String(), root) {
 		t.Fatalf("diagnostics leaked configured value: %s", stdout.String())
+	}
+}
+
+func TestProfileCLIUsesResidentIPCForListAndStatus(t *testing.T) {
+	root, err := os.MkdirTemp("", "af-cli-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	antConfigPath := filepath.Join(root, "ant.yaml")
+	antConfig := backend.DefaultConfig()
+	antConfig.Database.SQLite.Path = "profiles.db"
+	if err := antConfig.Save(antConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.NewDB(filepath.Join(root, "profiles.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetConn().Exec(`INSERT INTO browser_profiles
+		(profile_id, incarnation_id, profile_name, created_at, updated_at)
+		VALUES ('profile-1', 'incarnation-1', 'Safe profile', '2026-09-12T00:00:00Z', '2026-09-12T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	key := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	clientConfig := backend.FarmClientConfig{
+		ApplicationRoot: root,
+		StateRoot:       filepath.Join(root, "state"),
+		AntConfigPath:   antConfigPath,
+		ControlURL:      "ws://127.0.0.1:1",
+		Identity: backend.FarmClientIdentityConfig{
+			NodeUID:    "node-ipc-test",
+			PrivateKey: base64.StdEncoding.EncodeToString(key),
+		},
+	}
+	raw, err := yaml.Marshal(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "client.yaml")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	host, err := backend.NewFarmClientHost(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := backend.StartFarmClientIPCServer(host)
+	if err != nil {
+		_ = host.Shutdown()
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = server.Close()
+		_ = host.Shutdown()
+	}()
+	for _, args := range [][]string{{"profiles", "list"}, {"profiles", "status", "profile-1"}} {
+		var stdout, stderr bytes.Buffer
+		if code := runProfileCommand(configPath, args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("args=%v exit=%d stderr=%q", args, code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "profile-1") {
+			t.Fatalf("args=%v output=%q", args, stdout.String())
+		}
+		for _, forbidden := range []string{root, "debugPort", "proxyConfig", "private_key"} {
+			if strings.Contains(stdout.String(), forbidden) {
+				t.Fatalf("args=%v leaked %q: %s", args, forbidden, stdout.String())
+			}
+		}
 	}
 }
 
@@ -54,5 +141,186 @@ func TestFarmAgentControlDistinguishesStopFromPreserve(t *testing.T) {
 	}
 	if !farmAgentControlPreservesRuntimes(strings.NewReader("")) {
 		t.Fatal("launcher death EOF did not preserve runtimes")
+	}
+}
+
+func TestFarmAgentControlledStopRequiresCompleteShutdownEvidence(t *testing.T) {
+	if !farmAgentControlledStopCompleted(true, nil, nil, nil) {
+		t.Fatal("complete controlled stop was rejected")
+	}
+	if !farmAgentControlledStopCompleted(true, context.Canceled, nil, nil) {
+		t.Fatal("controlled update-health cancellation was rejected after complete shutdown")
+	}
+	failure := errors.New("injected")
+	for _, test := range []struct {
+		name                        string
+		requested                   bool
+		runErr, admission, shutdown error
+	}{
+		{name: "not requested"},
+		{name: "run failure", requested: true, runErr: failure},
+		{name: "admission failure", requested: true, admission: failure},
+		{name: "shutdown failure", requested: true, shutdown: failure},
+		{name: "wrapped cancellation", requested: true, runErr: errors.Join(context.Canceled, failure)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if farmAgentControlledStopCompleted(test.requested, test.runErr, test.admission, test.shutdown) {
+				t.Fatal("incomplete shutdown produced controlled-stop evidence")
+			}
+		})
+	}
+}
+
+func TestSuiteGUILaunchSurfaceIsDeferred(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runSuiteCommand(backend.SuiteUserRoots{}, []string{"launch-gui"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("deferred launch surface exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestSuiteDoctorAndServiceFailClosedWithoutEvidence(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		code int
+	}{
+		{[]string{"doctor"}, 5}, {[]string{"service", "status"}, 5}, {[]string{"service", "start"}, 2}, {[]string{"service", "stop"}, 2},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := runSuiteCommand(backend.SuiteUserRoots{}, test.args, &stdout, &stderr); code != test.code {
+			t.Fatalf("args=%v exit=%d want=%d stdout=%q stderr=%q", test.args, code, test.code, stdout.String(), stderr.String())
+		}
+		if strings.Contains(strings.ToLower(stdout.String()+stderr.String()), "private_key") {
+			t.Fatalf("args=%v leaked secret field", test.args)
+		}
+	}
+}
+
+func TestTopLevelDoctorAndServiceClosedParser(t *testing.T) {
+	roots, err := backend.ResolveSuiteUserRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := filepath.Join(roots.Config, backend.SuiteClientConfigName)
+	for _, test := range []struct {
+		args []string
+		code int
+	}{
+		{[]string{"doctor", "--config", canonical, "--json"}, 5},
+		{[]string{"doctor", "--config", filepath.Join(t.TempDir(), "client.yaml"), "--json"}, 2},
+		{[]string{"doctor", "--config", canonical}, 2},
+		{[]string{"service", "status"}, 5},
+		{[]string{"service", "start"}, 2},
+	} {
+		if code := run(test.args, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); code != test.code {
+			t.Fatalf("args=%v code=%d want=%d", test.args, code, test.code)
+		}
+	}
+}
+
+func TestSuiteReleaseVerificationUsesCallerPinnedTrustAnchor(t *testing.T) {
+	manifest := []byte(`{"schema_version":1,"version":"1.2.3","target":{"os":"windows","arch":"amd64"},"commits":{"ant_browser":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","farm_agent":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","farm_control":"cccccccccccccccccccccccccccccccccccccccc"},"config_schema":1,"capabilities":["setup-plan"],"core_versions":{"chromium":"120.0.0"},"dependencies":[{"name":"Ant-Suite","version":"1.2.3","license_ref":"LICENSE"}],"entries":[{"path":"Ant.exe","role":"binary","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","executable":true},{"path":"LICENSE","role":"legal","size":1,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","executable":false}]}`)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := backend.SignSuiteReleaseManifest(manifest, "suite-key-1", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	manifestPath, envelopePath := filepath.Join(root, "release.json"), filepath.Join(root, "release-envelope.json")
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envelopePath, envelope, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	arguments := []string{"verify-release", "-manifest", manifestPath, "-envelope", envelopePath, "-key-id", "suite-key-1", "-public-key", base64.StdEncoding.EncodeToString(publicKey)}
+	var stdout, stderr bytes.Buffer
+	if code := runSuiteCommand(backend.SuiteUserRoots{}, arguments, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != `{"verified":true}` {
+		t.Fatalf("verify exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	arguments[6] = "wrong-key"
+	stdout.Reset()
+	stderr.Reset()
+	if code := runSuiteCommand(backend.SuiteUserRoots{}, arguments, &stdout, &stderr); code != 1 || strings.Contains(stderr.String(), base64.StdEncoding.EncodeToString(publicKey)) {
+		t.Fatalf("wrong trust anchor exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestSuiteReleaseVerificationUsesBinaryEmbeddedTrustAnchor(t *testing.T) {
+	manifest := []byte(`{"schema_version":1,"version":"1.2.3","target":{"os":"windows","arch":"amd64"},"commits":{"ant_browser":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","farm_agent":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","farm_control":"cccccccccccccccccccccccccccccccccccccccc"},"config_schema":1,"capabilities":["setup-plan"],"core_versions":{"chromium":"120.0.0"},"dependencies":[{"name":"Ant-Suite","version":"1.2.3","license_ref":"LICENSE"}],"entries":[{"path":"Ant.exe","role":"binary","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","executable":true},{"path":"LICENSE","role":"legal","size":1,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","executable":false}]}`)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := backend.SignSuiteReleaseManifest(manifest, "suite-key-embedded", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	manifestPath, envelopePath := filepath.Join(root, "release.json"), filepath.Join(root, "release-envelope.json")
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envelopePath, envelope, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousKeyID, previousPublicKey, previousVersion := suiteReleaseKeyID, suiteReleasePublicKeyBase64, backend.FarmClientVersion
+	suiteReleaseKeyID = "suite-key-embedded"
+	suiteReleasePublicKeyBase64 = base64.StdEncoding.EncodeToString(publicKey)
+	backend.FarmClientVersion = "1.2.3"
+	t.Cleanup(func() {
+		suiteReleaseKeyID, suiteReleasePublicKeyBase64, backend.FarmClientVersion = previousKeyID, previousPublicKey, previousVersion
+	})
+	args := []string{"verify-release-embedded", "-manifest", manifestPath, "-envelope", envelopePath}
+	var stdout, stderr bytes.Buffer
+	if code := runSuiteCommand(backend.SuiteUserRoots{}, args, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != `{"verified":true}` {
+		t.Fatalf("verify exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	args = append(args, "-key-id", "runtime-override")
+	if code := runSuiteCommand(backend.SuiteUserRoots{}, args, &stdout, &stderr); code != 2 || strings.Contains(stderr.String(), "suite-key-embedded") {
+		t.Fatalf("override exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestSuiteReleaseVerificationRejectsSymlinkAndOversize(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.json")
+	if err := os.WriteFile(target, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "manifest.json")
+	if err := os.Symlink(target, link); err == nil {
+		if _, err := readSuiteReleaseVerificationFile(link, 1024); err == nil {
+			t.Fatal("symlinked release input accepted")
+		}
+	}
+	large := filepath.Join(root, "large.json")
+	if err := os.WriteFile(large, make([]byte, 1025), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSuiteReleaseVerificationFile(large, 1024); err == nil {
+		t.Fatal("oversized release input accepted")
+	}
+}
+
+func TestParseProfileCreateArgumentsBuildsCanonicalRequest(t *testing.T) {
+	operationUID := "d7823c53-82d0-4c91-8dd6-2453fe0f6436"
+	requestUID := "0a4413e3-9a63-49fd-a93c-37340ed5ec76"
+	request, err := parseProfileCreateArguments([]string{"-operation-uid", operationUID, "-request-uid", requestUID, "-display-name", "受控 Profile", "-core-ref", "core-stable"}, &bytes.Buffer{})
+	if err != nil || request.OperationUID != operationUID || request.RequestUID != requestUID || len(request.PayloadDigest) != 64 {
+		t.Fatalf("request=%+v err=%v", request, err)
+	}
+	for _, args := range [][]string{
+		{"-operation-uid", "not-a-uuid", "-request-uid", requestUID, "-display-name", "name", "-core-ref", "core-stable"},
+		{"-operation-uid", operationUID, "-request-uid", requestUID, "-display-name", " name", "-core-ref", "core-stable"},
+		{"-operation-uid", operationUID, "-request-uid", requestUID, "-display-name", "name", "-core-ref", "../core"},
+	} {
+		if _, err := parseProfileCreateArguments(args, &bytes.Buffer{}); err == nil {
+			t.Fatalf("invalid arguments accepted: %v", args)
+		}
 	}
 }

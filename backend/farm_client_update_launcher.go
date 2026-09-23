@@ -16,6 +16,10 @@ import (
 
 const farmClientUpdateHealthNonceEnvironment = "ANT_FARM_CLIENT_UPDATE_HEALTH_NONCE"
 
+// FarmClientInternalControlledStopExitCode is private launcher/child evidence.
+// It is not a command surface and carries no caller-controlled material.
+const FarmClientInternalControlledStopExitCode = 23
+
 const (
 	farmClientControlStop     byte = 'S'
 	farmClientControlPreserve byte = 'P'
@@ -65,6 +69,10 @@ func RunFarmClientUpdateSupervisor(ctx context.Context, host *FarmClientHost, _ 
 // exit is never allowed to terminate the immutable launcher: it may be the
 // hand-off boundary for this or a later update.
 func RunFarmClientLauncher(ctx context.Context, configPath, launcherPath string, stdout, stderr io.Writer) error {
+	return runFarmClientLauncherWithValidation(ctx, configPath, launcherPath, stdout, stderr, nil)
+}
+
+func runFarmClientLauncherWithValidation(ctx context.Context, configPath, launcherPath string, stdout, stderr io.Writer, validate suiteLauncherValidator) error {
 	config, err := LoadFarmClientConfig(configPath)
 	if err != nil || config.ValidateFarmClientConfig() != nil {
 		return ErrFarmClientUpdateApply
@@ -86,6 +94,13 @@ func RunFarmClientLauncher(ctx context.Context, configPath, launcherPath string,
 		if ctx.Err() != nil {
 			return nil
 		}
+		if validate != nil {
+			// This fence runs before every activation read that could lead to a
+			// rollback/commit mutation or a child spawn.
+			if err := validate(configPath, launcherPath); err != nil {
+				return err
+			}
+		}
 		activation, err := LoadFarmClientUpdateActivation(config.StateRoot)
 		if err != nil {
 			return err
@@ -98,20 +113,16 @@ func RunFarmClientLauncher(ctx context.Context, configPath, launcherPath string,
 		}
 		if activation.Phase == farmClientUpdatePhaseProbation && activation.Pending != nil {
 			pending := *activation.Pending
-			runErr := runFarmClientPendingActivation(ctx, config, configPath, stdout, stderr, pending)
+			runErr := runFarmClientPendingActivation(ctx, config, configPath, launcherPath, stdout, stderr, pending, validate)
 			if ctx.Err() != nil {
 				return nil
 			}
-			current, loadErr := LoadFarmClientUpdateActivation(config.StateRoot)
-			if loadErr != nil {
-				return loadErr
+			controlledStop, reconcileErr := reconcileFarmClientPendingExit(config, configPath, launcherPath, pending, runErr, validate)
+			if reconcileErr != nil {
+				return reconcileErr
 			}
-			// Roll back only the same uncommitted candidate. Once probation was
-			// committed, a later child exit is a restart boundary, not failure.
-			if runErr != nil && current.Phase == farmClientUpdatePhaseProbation && current.Pending != nil && current.Pending.SHA256 == pending.SHA256 {
-				if rollbackErr := RollbackFarmClientUpdateActivation(config); rollbackErr != nil {
-					return rollbackErr
-				}
+			if controlledStop {
+				return nil
 			}
 			continue
 		}
@@ -130,29 +141,52 @@ func RunFarmClientLauncher(ctx context.Context, configPath, launcherPath string,
 					activation.Pending = nil
 					activation.Phase = farmClientUpdatePhaseStable
 					executableSlot = activation.Active
+					if validate != nil {
+						if err := validate(configPath, launcherPath); err != nil {
+							return err
+						}
+					}
 					if err := writeFarmClientUpdateActivation(updateRoot, activation); err != nil {
 						return err
 					}
 				} else {
 					activation.Active = nil
 					activation.Previous = nil
+					if validate != nil {
+						if err := validate(configPath, launcherPath); err != nil {
+							return err
+						}
+					}
 					if err := writeFarmClientUpdateActivation(updateRoot, activation); err != nil {
 						return err
 					}
 				}
 			} else {
 				activation.Active = nil
+				if validate != nil {
+					if err := validate(configPath, launcherPath); err != nil {
+						return err
+					}
+				}
 				if err := writeFarmClientUpdateActivation(updateRoot, activation); err != nil {
 					return err
 				}
+			}
+		}
+		if validate != nil {
+			if err := validate(configPath, launcherPath); err != nil {
+				return err
 			}
 		}
 		process, startErr := startFarmClientAgent(config, configPath, executablePath, executableSlot, "", "", stdout, stderr)
 		if startErr != nil {
 			return startErr
 		}
-		_ = waitFarmClientAgent(ctx, process)
+		runErr := waitFarmClientAgent(ctx, process)
 		if ctx.Err() != nil {
+			return nil
+		}
+		if farmClientAgentControlledStop(runErr) {
 			return nil
 		}
 		// Give unexpected crashes a bounded backoff, but skip it when an
@@ -171,7 +205,38 @@ func RunFarmClientLauncher(ctx context.Context, configPath, launcherPath string,
 	}
 }
 
-func runFarmClientPendingActivation(ctx context.Context, config FarmClientConfig, configPath string, stdout, stderr io.Writer, slot FarmClientUpdateSlot) error {
+func reconcileFarmClientPendingExit(config FarmClientConfig, configPath, launcherPath string, pending FarmClientUpdateSlot, runErr error, validate suiteLauncherValidator) (bool, error) {
+	if farmClientAgentControlledStop(runErr) {
+		return true, nil
+	}
+	current, loadErr := LoadFarmClientUpdateActivation(config.StateRoot)
+	if loadErr != nil {
+		return false, loadErr
+	}
+	// Roll back only the same uncommitted candidate. Once probation was
+	// committed, a later child exit is a restart boundary, not failure.
+	if runErr != nil && current.Phase == farmClientUpdatePhaseProbation && current.Pending != nil && current.Pending.SHA256 == pending.SHA256 {
+		if validate != nil {
+			if err := validate(configPath, launcherPath); err != nil {
+				return false, err
+			}
+		}
+		if rollbackErr := RollbackFarmClientUpdateActivation(config); rollbackErr != nil {
+			return false, rollbackErr
+		}
+	}
+	return false, nil
+}
+
+func farmClientAgentControlledStop(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ProcessState == nil {
+		return false
+	}
+	return exitErr.ProcessState.ExitCode() == FarmClientInternalControlledStopExitCode
+}
+
+func runFarmClientPendingActivation(ctx context.Context, config FarmClientConfig, configPath, launcherPath string, stdout, stderr io.Writer, slot FarmClientUpdateSlot, validate suiteLauncherValidator) error {
 	executablePath, err := verifyFarmClientPendingUpdateSlot(config, slot, time.Now())
 	if err != nil {
 		return err
@@ -181,6 +246,11 @@ func runFarmClientPendingActivation(ctx context.Context, config FarmClientConfig
 		return err
 	}
 	healthPath := filepath.Join(updateRoot, "health-"+slot.SHA256[:16])
+	if validate != nil {
+		if err := validate(configPath, launcherPath); err != nil {
+			return err
+		}
+	}
 	_ = os.Remove(healthPath)
 	nonceRaw := make([]byte, 32)
 	if _, err := rand.Read(nonceRaw); err != nil {
@@ -192,7 +262,13 @@ func runFarmClientPendingActivation(ctx context.Context, config FarmClientConfig
 		return err
 	}
 	if err := waitFarmClientUpdateProbation(ctx, process, healthPath, nonce, config.updateHealthTimeout(), config.updateProbation()); err != nil {
+		if validationErr := revalidateFarmClientLauncherProcess(process, ctx.Err() == nil, configPath, launcherPath, validate); validationErr != nil {
+			return validationErr
+		}
 		_ = stopFarmClientAgent(process, ctx.Err() == nil)
+		return err
+	}
+	if err := revalidateFarmClientLauncherProcess(process, true, configPath, launcherPath, validate); err != nil {
 		return err
 	}
 	if err := CommitFarmClientUpdateActivation(config); err != nil {
@@ -200,6 +276,16 @@ func runFarmClientPendingActivation(ctx context.Context, config FarmClientConfig
 		return err
 	}
 	return waitFarmClientAgent(ctx, process)
+}
+
+func revalidateFarmClientLauncherProcess(process *farmClientLauncherProcess, preserve bool, configPath, launcherPath string, validate suiteLauncherValidator) error {
+	if validate == nil {
+		return nil
+	}
+	if err := validate(configPath, launcherPath); err != nil {
+		return errors.Join(err, stopFarmClientAgent(process, preserve))
+	}
+	return nil
 }
 
 func startFarmClientAgent(config FarmClientConfig, configPath, executablePath string, slot *FarmClientUpdateSlot, healthPath, nonce string, stdout, stderr io.Writer) (*farmClientLauncherProcess, error) {

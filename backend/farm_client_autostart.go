@@ -47,7 +47,73 @@ func InstallFarmClientAutostart(executablePath, configPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := rejectRawAutostartForSuiteFootprint(configPath); err != nil {
+		return err
+	}
 	return newFarmClientAutostartManager().Install(executablePath, configPath)
+}
+
+func rejectRawAutostartForSuiteFootprint(configPath string) error {
+	roots, err := ResolveSuiteUserRoots()
+	if err != nil {
+		return fmt.Errorf("%w: resolve Suite roots", ErrFarmClientAutostart)
+	}
+	return rejectRawAutostartForSuiteFootprintAtRoots(configPath, roots)
+}
+
+func rejectRawAutostartForSuiteFootprintAtRoots(configPath string, roots SuiteUserRoots) error {
+	configPath = filepath.Clean(configPath)
+	suitePath := suitePathWithin(configPath, roots.Config) || suitePathWithin(configPath, roots.AgentState) || suitePathWithin(configPath, roots.BrowserData)
+	config, err := LoadFarmClientConfig(configPath)
+	if err != nil {
+		if suitePath {
+			return fmt.Errorf("%w: suspicious Suite config", ErrFarmClientAutostart)
+		}
+		return nil
+	}
+	isSuite := suitePath || sameSuiteHandoffPath(config.StateRoot, roots.AgentState) || suitePathWithin(config.ApplicationRoot, roots.BrowserData) || suitePathWithin(config.AntConfigPath, roots.BrowserData)
+	if isSuite {
+		return fmt.Errorf("%w: Suite activation requires the durable coordinator", ErrFarmClientAutostart)
+	}
+	return nil
+}
+
+func suitePathWithin(path, root string) bool {
+	if !filepath.IsAbs(path) || !filepath.IsAbs(root) {
+		return false
+	}
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func RemoveFarmClientAutostartForConfig(configPath string) error {
+	roots, err := ResolveSuiteUserRoots()
+	if err != nil {
+		return fmt.Errorf("%w: resolve Suite roots", ErrFarmClientAutostart)
+	}
+	return removeFarmClientAutostartForConfigAtRoots(configPath, roots, newFarmClientAutostartManager())
+}
+
+func FarmClientAutostartStatusForConfig(configPath string) (FarmClientAutostartStatus, error) {
+	roots, err := ResolveSuiteUserRoots()
+	if err != nil {
+		return FarmClientAutostartStatus{}, fmt.Errorf("%w: resolve Suite roots", ErrFarmClientAutostart)
+	}
+	return farmClientAutostartStatusForConfigAtRoots(configPath, roots, newFarmClientAutostartManager())
+}
+
+func removeFarmClientAutostartForConfigAtRoots(configPath string, roots SuiteUserRoots, manager farmClientAutostartManager) error {
+	if err := rejectRawAutostartForSuiteFootprintAtRoots(configPath, roots); err != nil {
+		return err
+	}
+	return manager.Remove()
+}
+
+func farmClientAutostartStatusForConfigAtRoots(configPath string, roots SuiteUserRoots, manager farmClientAutostartManager) (FarmClientAutostartStatus, error) {
+	if err := rejectRawAutostartForSuiteFootprintAtRoots(configPath, roots); err != nil {
+		return FarmClientAutostartStatus{}, err
+	}
+	return manager.Status()
 }
 
 func RemoveFarmClientAutostart() error {

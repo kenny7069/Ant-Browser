@@ -61,9 +61,10 @@ type FarmControlWSSClientConfig struct {
 }
 
 type FarmControlWSSClient struct {
-	config  FarmControlWSSClientConfig
-	adapter *FarmRuntimeControlAdapter
-	private ed25519.PrivateKey
+	config         FarmControlWSSClientConfig
+	adapter        *FarmRuntimeControlAdapter
+	profileAdapter *FarmProfileControlAdapter
+	private        ed25519.PrivateKey
 
 	mu                 sync.Mutex
 	conn               *websocket.Conn
@@ -87,6 +88,21 @@ type FarmControlWSSClient struct {
 	heartbeatSeq       uint64
 	connectionCancel   context.CancelFunc
 	connectionFence    uint64
+}
+
+// SetProfileControlAdapter installs the independent profile-management seam
+// before Connect. Runtime command dispatch remains on the existing adapter.
+func (c *FarmControlWSSClient) SetProfileControlAdapter(adapter *FarmProfileControlAdapter) error {
+	if c == nil || adapter == nil {
+		return ErrFarmControlWSSProtocol
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil || c.connecting {
+		return ErrFarmControlWSSProtocol
+	}
+	c.profileAdapter = adapter
+	return nil
 }
 
 // NewFarmControlWSSClient constructs the production agent transport without
@@ -181,6 +197,27 @@ type farmControlAuthenticated struct {
 	NodeUID              string `json:"node_uid"`
 	ControllerID         string `json:"controller_id"`
 	ControllerGeneration uint64 `json:"controller_generation"`
+}
+
+type farmControlCapabilities struct {
+	Type         string   `json:"type"`
+	Capabilities []string `json:"capabilities"`
+}
+
+type farmControlCapabilitiesAck struct {
+	Type string `json:"type"`
+}
+
+func validFarmControlCapabilities(message farmControlCapabilities) bool {
+	if message.Type != "capabilities" || len(message.Capabilities) != 1 || message.Capabilities[0] != FarmClientCapabilityProfileCreate {
+		return false
+	}
+	for index := 1; index < len(message.Capabilities); index++ {
+		if message.Capabilities[index-1] >= message.Capabilities[index] {
+			return false
+		}
+	}
+	return true
 }
 
 type farmControlHeartbeat struct {
@@ -374,12 +411,34 @@ func (c *FarmControlWSSClient) connectOnce(ctx context.Context) error {
 		c.fail(err)
 		return err
 	}
+	if c.profileAdapter != nil {
+		if err := c.profileAdapter.BeginAuthenticatedControlConnection(authenticated.ControllerID, authenticated.ControllerGeneration, connectionFence); err != nil {
+			c.adapter.EndControlConnection(connectionFence)
+			_ = conn.Close()
+			c.fail(err)
+			return err
+		}
+	}
+	if c.profileAdapter != nil {
+		capabilities := FarmClientProfileCreateCapabilities()
+		message := farmControlCapabilities{Type: "capabilities", Capabilities: capabilities}
+		if !validFarmControlCapabilities(message) || c.writeJSON(conn, message) != nil {
+			c.profileAdapter.EndControlConnection(connectionFence)
+			c.adapter.EndControlConnection(connectionFence)
+			_ = conn.Close()
+			c.fail(ErrFarmControlWSSProtocol)
+			return ErrFarmControlWSSProtocol
+		}
+	}
 	connectionCtx, cancelConnection := context.WithCancel(c.ctx)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		cancelConnection()
 		c.adapter.EndControlConnection(connectionFence)
+		if c.profileAdapter != nil {
+			c.profileAdapter.EndControlConnection(connectionFence)
+		}
 		_ = conn.Close()
 		return ErrFarmControlWSSClosed
 	}
@@ -485,6 +544,9 @@ func (c *FarmControlWSSClient) transportFailure(conn *websocket.Conn, err error)
 		cancelConnection()
 	}
 	c.adapter.EndControlConnection(connectionFence)
+	if c.profileAdapter != nil {
+		c.profileAdapter.EndControlConnection(connectionFence)
+	}
 	c.closeCDPSessions()
 	if active != nil {
 		_ = active.Close()
@@ -510,6 +572,9 @@ func (c *FarmControlWSSClient) shutdown(err error) {
 			cancelConnection()
 		}
 		c.adapter.EndControlConnection(connectionFence)
+		if c.profileAdapter != nil {
+			c.profileAdapter.EndControlConnection(connectionFence)
+		}
 		c.closeCDPSessions()
 		c.cancel()
 		if conn != nil {
@@ -555,6 +620,21 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn, connectionCtx cont
 			return
 		}
 		switch envelope.Type {
+		case "capabilities_ack":
+			if c.profileAdapter == nil {
+				c.shutdown(ErrFarmControlWSSProtocol)
+				return
+			}
+			var ack farmControlCapabilitiesAck
+			if err := strictFarmControlDecode(raw, &ack, c.config.MaxMessageBytes); err != nil || ack.Type != "capabilities_ack" {
+				c.shutdown(ErrFarmControlWSSProtocol)
+				return
+			}
+			if err := c.profileAdapter.AcknowledgeCapabilities(connectionFence); err != nil {
+				c.shutdown(err)
+				return
+			}
+			continue
 		case "heartbeat_ack":
 			var ack farmControlHeartbeatAck
 			if strictFarmControlDecode(raw, &ack, c.config.MaxMessageBytes) != nil {
@@ -608,6 +688,10 @@ func (c *FarmControlWSSClient) readLoop(conn *websocket.Conn, connectionCtx cont
 				result := make(chan FarmRuntimeCommandResponse, 1)
 				go func() {
 					if connectionCtx.Err() != nil {
+						return
+					}
+					if c.profileAdapter != nil && c.profileAdapter.Handles(command.Command) {
+						result <- c.profileAdapter.DispatchCommandForConnection(command, connectionFence)
 						return
 					}
 					result <- c.adapter.DispatchCommandForConnection(command, connectionFence)
