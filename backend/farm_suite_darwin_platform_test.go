@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -29,7 +30,8 @@ func TestSuiteDarwinSigningPolicyArguments(t *testing.T) {
 	}
 	// A pinned team wins over the ad-hoc test switch.
 	team, err := (suiteDarwinSigningPolicy{TeamID: "ABCDE12345", AllowAdhoc: true}).codesignArguments("/x")
-	if err != nil || len(team) != 6 || team[3] != `-R=anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345"` {
+	if err != nil || len(team) != 6 || team[3] != `-R=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists`+
+		` and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ABCDE12345"` {
 		t.Fatalf("team arguments = %v, %v", team, err)
 	}
 	if current := currentSuiteDarwinSigningPolicy(); current.TeamID != "" || current.AllowAdhoc {
@@ -118,6 +120,7 @@ func newSuiteDarwinTreeFixture(t *testing.T) *suiteDarwinTreeFixture {
 	fixture.validator = suiteDarwinInstallValidator{
 		base: base, chainTop: base, euid: func() int { return 501 }, owner: uint32(os.Getuid()),
 		policy: suiteDarwinSigningPolicy{AllowAdhoc: true},
+		hasACL: func(string) (bool, error) { return false, nil },
 		codesign: func(_ context.Context, arguments ...string) error {
 			fixture.verified = append(fixture.verified, arguments[len(arguments)-1])
 			return nil
@@ -224,6 +227,13 @@ func TestSuiteDarwinInstallValidatorRejectsEveryDrift(t *testing.T) {
 		"signature rejected": func(t *testing.T, f *suiteDarwinTreeFixture) {
 			f.validator.codesign = func(context.Context, ...string) error { return ErrSuiteDarwinCodeSignature }
 		},
+		"extended ACL": func(t *testing.T, f *suiteDarwinTreeFixture) {
+			aclPath := filepath.Join(f.root, "runtime")
+			f.validator.hasACL = func(path string) (bool, error) { return path == aclPath, nil }
+		},
+		"ACL unreadable": func(t *testing.T, f *suiteDarwinTreeFixture) {
+			f.validator.hasACL = func(string) (bool, error) { return false, ErrSuiteServiceActivation }
+		},
 		"no signing policy": func(t *testing.T, f *suiteDarwinTreeFixture) {
 			f.validator.policy = suiteDarwinSigningPolicy{}
 		},
@@ -282,7 +292,13 @@ func (f *suiteDarwinFakeLaunchd) run(arguments ...string) suiteDarwinLaunchctlRe
 		}
 	case "bootstrap":
 		label := strings.TrimSuffix(filepath.Base(arguments[2]), ".plist")
+		if f.loaded[label] {
+			return suiteDarwinLaunchctlResult{Err: errors.New("already loaded")}
+		}
 		f.loaded[label] = true
+	case "bootout":
+		label := arguments[1][strings.LastIndex(arguments[1], "/")+1:]
+		delete(f.loaded, label)
 	}
 	return suiteDarwinLaunchctlResult{}
 }
@@ -333,8 +349,29 @@ func TestSuiteDarwinLaunchAgentRegistrationChain(t *testing.T) {
 	if err := platform.Start(handoff, label); err != nil || !fake.loaded[label] {
 		t.Fatalf("start bootstrap = %v", err)
 	}
-	if err := platform.Start(handoff, label); err != nil || fake.calls[len(fake.calls)-1][0] != "kickstart" {
-		t.Fatalf("second start must kickstart the loaded service: %v %v", err, fake.calls)
+	calls := len(fake.calls)
+	if err := platform.Start(handoff, label); err != nil || !fake.loaded[label] {
+		t.Fatalf("second start = %v", err)
+	}
+	var sequence []string
+	for _, call := range fake.calls[calls:] {
+		if call[0] == "bootout" || call[0] == "bootstrap" || call[0] == "kickstart" {
+			sequence = append(sequence, call[0])
+		}
+	}
+	if !reflect.DeepEqual(sequence, []string{"bootout", "bootstrap"}) {
+		t.Fatalf("a loaded job must be replaced by the audited plist, got %v", sequence)
+	}
+	// A drifted plist is never started, even if a job is loaded.
+	raw2, _ := os.ReadFile(fake.plist)
+	if err := os.WriteFile(fake.plist, append(raw2, ' '), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := platform.Start(handoff, label); !errors.Is(err, ErrSuiteServiceActivation) {
+		t.Fatalf("drifted plist started: %v", err)
+	}
+	if err := os.WriteFile(fake.plist, raw2, 0o644); err != nil {
+		t.Fatal(err)
 	}
 	if rootChecks == 0 {
 		t.Fatal("install root was never revalidated")
@@ -374,4 +411,25 @@ func TestSuiteDarwinLaunchAgentRegistrationChain(t *testing.T) {
 	if _, err := os.Stat(fake.plist); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("plist written although it could not be disabled first")
 	}
+}
+
+func TestSuiteDarwinExtendedACLDetectionNative(t *testing.T) {
+	directory := t.TempDir()
+	plain := filepath.Join(directory, "plain")
+	granted := filepath.Join(directory, "granted")
+	for _, path := range []string{plain, granted} {
+		if err := os.WriteFile(path, []byte("x"), 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if output, err := exec.Command("/bin/chmod", "+a", "everyone allow writesecurity", granted).CombinedOutput(); err != nil {
+		t.Fatalf("chmod +a: %v %s", err, output)
+	}
+	if found, err := suiteDarwinHasExtendedACL(plain); err != nil || found {
+		t.Fatalf("plain file ACL = %v, %v", found, err)
+	}
+	if found, err := suiteDarwinHasExtendedACL(granted); err != nil || !found {
+		t.Fatalf("writesecurity grant not detected: %v, %v", found, err)
+	}
+	// A missing path reads as ACL-free; immutable() Lstats it first.
 }

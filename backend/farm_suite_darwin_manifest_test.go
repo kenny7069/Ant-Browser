@@ -54,7 +54,12 @@ func TestSuiteReleaseManifestDarwinBundleRules(t *testing.T) {
 		{Path: "runtime/trailing ", Role: SuiteReleaseEntryAsset, Size: 1, SHA256: bundleBinary.SHA256},
 		{Path: "runtime/tab\tname", Role: SuiteReleaseEntryAsset, Size: 1, SHA256: bundleBinary.SHA256},
 		func() SuiteReleaseEntry { entry := link; entry.Path = "runtime/sized"; entry.Size = 1; return entry }(),
-		func() SuiteReleaseEntry { entry := link; entry.Path = "runtime/exec"; entry.Executable = true; return entry }(),
+		func() SuiteReleaseEntry {
+			entry := link
+			entry.Path = "runtime/exec"
+			entry.Executable = true
+			return entry
+		}(),
 	} {
 		manifest := suiteReleaseManifestFixture()
 		manifest.Target = darwin.Target
@@ -82,6 +87,9 @@ func TestSuiteManifestLinkResolutionStaysInsideRoot(t *testing.T) {
 		"loop/b":                       "a",
 		"escape":                       "../outside",
 		"deep/escape":                  "../../x",
+		// Reviewer case: ".." after a link must apply to the link's target.
+		"a/b/c/d/e/L": "../../../../../z",
+		"a/b/c/d/e/X": "L/../../../../../Users/Shared",
 	}
 	for link, want := range map[string]string{
 		"F.framework/Versions/Current": "F.framework/Versions/131.0",
@@ -93,7 +101,10 @@ func TestSuiteManifestLinkResolutionStaysInsideRoot(t *testing.T) {
 			t.Fatalf("%s resolved to %q, %v; want %q", link, got, err, want)
 		}
 	}
-	for _, link := range []string{"loop/a", "escape", "deep/escape"} {
+	if got, err := resolveSuiteManifestLink("a/b/c/d/e/L", links); err != nil || got != "z" {
+		t.Fatalf("L resolved to %q, %v", got, err)
+	}
+	for _, link := range []string{"loop/a", "escape", "deep/escape", "a/b/c/d/e/X"} {
 		if _, err := resolveSuiteManifestLink(link, links); !errors.Is(err, ErrSuiteOwnershipHandoff) {
 			t.Fatalf("%s resolution was accepted: %v", link, err)
 		}

@@ -87,6 +87,8 @@ for directory, dirs, files in os.walk(root):
         if info.st_mode & 0o022:
             sys.exit("group/other writable payload path: %s" % rel)
         if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            if not any(p.startswith(rel + "/") for p in entries):
+                sys.exit("uncovered empty directory: %s" % rel)
             continue
         if rel in ("release-manifest.json", "release-manifest.envelope.json"):
             continue

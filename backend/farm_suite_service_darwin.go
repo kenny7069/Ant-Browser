@@ -275,12 +275,21 @@ func (p darwinSuiteServicePlatform) Start(h SuiteOwnershipHandoff, label string)
 	if err != nil {
 		return err
 	}
+	// A job already loaded under this label may be an older, unaudited
+	// definition: unload it and load only the plist just audited.
 	target := p.domain() + "/" + label
 	if p.run("print", target).Err == nil {
-		if result := p.run("kickstart", target); result.Err != nil {
+		if result := p.run("bootout", target); result.Err != nil {
 			return ErrSuiteServiceActivation
 		}
-	} else if result := p.run("bootstrap", p.domain(), path); result.Err != nil {
+		if p.run("print", target).Err == nil {
+			return ErrSuiteServiceActivation
+		}
+	}
+	if state, err := p.InspectRegistration(h, label); err != nil || state != suiteServiceRegistrationExactEnabled {
+		return ErrSuiteServiceActivation
+	}
+	if result := p.run("bootstrap", p.domain(), path); result.Err != nil {
 		return ErrSuiteServiceActivation
 	}
 	return p.validateRoot(h)

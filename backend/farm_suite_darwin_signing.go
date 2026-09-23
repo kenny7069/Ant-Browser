@@ -49,8 +49,12 @@ func (p suiteDarwinSigningPolicy) codesignArguments(object string) ([]string, er
 		if !suiteDarwinTeamIDPattern.MatchString(p.TeamID) {
 			return nil, fmt.Errorf("%w: pinned team identifier is malformed", ErrSuiteDarwinCodeSignature)
 		}
+		// Developer ID Application only: same-team Development or
+		// Distribution certificates must not satisfy a release build.
 		arguments = append(arguments,
-			`-R=anchor apple generic and certificate leaf[subject.OU] = "`+p.TeamID+`"`)
+			`-R=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists`+
+				` and certificate leaf[field.1.2.840.113635.100.6.1.13] exists`+
+				` and certificate leaf[subject.OU] = "`+p.TeamID+`"`)
 	case p.AllowAdhoc:
 	default:
 		return nil, fmt.Errorf("%w: no signing policy compiled into this build", ErrSuiteDarwinCodeSignature)

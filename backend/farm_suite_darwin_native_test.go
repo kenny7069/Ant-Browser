@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
@@ -131,6 +133,9 @@ func TestSuiteDarwinInstalledRootNativeOptIn(t *testing.T) {
 		t.Fatalf("installed root rejected: %v", err)
 	}
 	t.Logf("installed root validated in %s (%d entries)", time.Since(started).Round(time.Millisecond), len(manifest.Entries))
+	previousAdhoc := suiteDarwinAllowAdhocCodeSigning
+	suiteDarwinAllowAdhocCodeSigning = "1" // as linked into a test-built client
+	t.Cleanup(func() { suiteDarwinAllowAdhocCodeSigning = previousAdhoc })
 	if _, err := validateSuiteStagePlatformInstall(root, SuiteSetupPlan{ManifestSHA256: handoff.ManifestSHA256, Target: manifest.Target}, manifest.Version); err != nil {
 		t.Fatalf("stage install evidence rejected: %v", err)
 	}
@@ -146,14 +151,43 @@ func TestSuiteDarwinInstalledRootNativeOptIn(t *testing.T) {
 	if err := pinned.validate(handoff); err == nil {
 		t.Fatal("ad-hoc payload passed a Developer ID team policy")
 	}
-	// Installed Chromium runs from the immutable root with a throwaway profile.
+	// Installed Chromium runs from the immutable root and answers CDP.
 	profile := t.TempDir()
 	chromium := filepath.Join(root, filepath.FromSlash(suiteDarwinReleaseLayout.Chromium))
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, chromium, "--headless=new", "--no-first-run",
-		"--user-data-dir="+profile, "--dump-dom", "data:text/html,<title>suite-native-ok</title>").Output()
-	if err != nil || !strings.Contains(string(output), "<title>suite-native-ok</title>") {
-		t.Fatalf("installed Chromium smoke failed: %v %q", err, output)
+	command := exec.CommandContext(ctx, chromium, "--headless=new", "--no-first-run", "--use-mock-keychain",
+		"--remote-debugging-port=0", "--user-data-dir="+profile, "about:blank")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = command.Process.Kill(); _ = command.Wait() }()
+	var port string
+	for port == "" && ctx.Err() == nil {
+		if raw, err := os.ReadFile(filepath.Join(profile, "DevToolsActivePort")); err == nil {
+			port = strings.SplitN(string(raw), "\n", 2)[0]
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	request, _ := http.NewRequestWithContext(ctx, http.MethodPut,
+		"http://127.0.0.1:"+port+"/json/new?data:text/html,<title>suite-native-ok</title>", nil)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("installed Chromium CDP unavailable: %v", err)
+	}
+	response.Body.Close()
+	for {
+		list, err := http.Get("http://127.0.0.1:" + port + "/json/list")
+		if err == nil {
+			body, _ := io.ReadAll(list.Body)
+			list.Body.Close()
+			if strings.Contains(string(body), `"title": "suite-native-ok"`) {
+				break
+			}
+		}
+		if ctx.Err() != nil {
+			t.Fatal("installed Chromium never rendered the CDP page")
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }

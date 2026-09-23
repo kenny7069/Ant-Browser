@@ -138,7 +138,7 @@ func isMachO(path string) bool {
 
 // role classifies one payload file.  Executable Mach-O files are binaries
 // (codesign-verified), other Mach-O images are libraries, notices are legal.
-func role(relative, path string, info fs.FileInfo) (string, bool) {
+func role(relative, path string, info fs.FileInfo, goos string) (string, bool) {
 	if relative == "LICENSES.json" || strings.HasPrefix(relative, "licenses/") {
 		return backend.SuiteReleaseEntryLegal, false
 	}
@@ -149,8 +149,10 @@ func role(relative, path string, info fs.FileInfo) (string, bool) {
 		}
 		return backend.SuiteReleaseEntryLibrary, false
 	}
-	if executable && !strings.Contains(relative, ".app/") && !strings.Contains(relative, ".framework/") {
+	if goos != "darwin" && executable && !strings.Contains(relative, ".app/") && !strings.Contains(relative, ".framework/") {
 		// Windows PE payloads carry no Mach-O magic but still ship executables.
+		// On macOS only Mach-O is code: a script's signature lives in xattrs
+		// that pkgbuild drops, so it is covered by its digest as an asset.
 		return backend.SuiteReleaseEntryBinary, true
 	}
 	return backend.SuiteReleaseEntryAsset, false
@@ -247,7 +249,7 @@ func runManifest(args []string) error {
 			return err
 		}
 		digest := sha256.Sum256(content)
-		entryRole, executable := role(relative, path, info)
+		entryRole, executable := role(relative, path, info, *goos)
 		manifest.Entries = append(manifest.Entries, backend.SuiteReleaseEntry{Path: relative, Role: entryRole, Size: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), Executable: executable})
 		return nil
 	})

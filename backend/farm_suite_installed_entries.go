@@ -74,30 +74,44 @@ func validateInstalledSuiteEntries(root string, manifest SuiteReleaseManifest) e
 	return nil
 }
 
-// resolveSuiteManifestLink resolves a covered link lexically, substituting
-// only other covered links, and refuses any escape from the Suite root.
+// resolveSuiteManifestLink resolves a covered link one path segment at a
+// time, exactly like the kernel: a covered link met on the way is expanded
+// before any following "..", and no step may leave the Suite root.  Only
+// covered links are expanded; on-disk links outside the manifest never are.
 func resolveSuiteManifestLink(link string, links map[string]string) (string, error) {
-	current := path.Clean(path.Join(path.Dir(link), links[link]))
-	for depth := 0; depth < maxSuiteSymlinkResolutionDepth; depth++ {
-		if current == ".." || strings.HasPrefix(current, "../") || path.IsAbs(current) {
-			return "", fmt.Errorf("%w: symlink escapes Suite root", ErrSuiteOwnershipHandoff)
-		}
-		segments := strings.Split(current, "/")
-		substituted := false
-		for index := 1; index <= len(segments); index++ {
-			prefix := strings.Join(segments[:index], "/")
-			target, ok := links[prefix]
-			if !ok {
-				continue
-			}
-			rest := strings.Join(segments[index:], "/")
-			current = path.Clean(path.Join(path.Dir(prefix), target, rest))
-			substituted = true
-			break
-		}
-		if !substituted {
-			return current, nil
-		}
+	stack := []string{}
+	if parent := path.Dir(link); parent != "." {
+		stack = strings.Split(parent, "/")
 	}
-	return "", fmt.Errorf("%w: symlink resolution too deep", ErrSuiteOwnershipHandoff)
+	pending := strings.Split(links[link], "/")
+	expansions := 0
+	for len(pending) > 0 {
+		segment := pending[0]
+		pending = pending[1:]
+		switch segment {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) == 0 {
+				return "", fmt.Errorf("%w: symlink escapes Suite root", ErrSuiteOwnershipHandoff)
+			}
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		stack = append(stack, segment)
+		target, ok := links[strings.Join(stack, "/")]
+		if !ok {
+			continue
+		}
+		expansions++
+		if expansions > maxSuiteSymlinkResolutionDepth || path.IsAbs(target) {
+			return "", fmt.Errorf("%w: symlink resolution invalid", ErrSuiteOwnershipHandoff)
+		}
+		stack = stack[:len(stack)-1]
+		pending = append(strings.Split(target, "/"), pending...)
+	}
+	if len(stack) == 0 {
+		return ".", nil
+	}
+	return strings.Join(stack, "/"), nil
 }

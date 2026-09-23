@@ -29,12 +29,14 @@ type suiteDarwinInstallValidator struct {
 	owner    uint32
 	policy   suiteDarwinSigningPolicy
 	codesign suiteDarwinCodesignRunner
+	hasACL   func(string) (bool, error)
 }
 
 func productionSuiteDarwinInstallValidator() suiteDarwinInstallValidator {
 	return suiteDarwinInstallValidator{
 		base: suiteDarwinInstallBase, chainTop: "/", euid: os.Geteuid, owner: 0,
 		policy: currentSuiteDarwinSigningPolicy(), codesign: runSuiteDarwinCodesign,
+		hasACL: suiteDarwinHasExtendedACL,
 	}
 }
 
@@ -43,6 +45,9 @@ func validateCanonicalSuiteInstallRoot(h SuiteOwnershipHandoff) error {
 }
 
 func (v suiteDarwinInstallValidator) validate(h SuiteOwnershipHandoff) error {
+	if v.hasACL == nil {
+		return ErrSuiteServiceActivation
+	}
 	if v.euid == nil || v.euid() == 0 {
 		return fmt.Errorf("%w: activation must run as the Agent user, not root", ErrSuiteServiceActivation)
 	}
@@ -97,8 +102,8 @@ func (v suiteDarwinInstallValidator) validate(h SuiteOwnershipHandoff) error {
 	return nil
 }
 
-// immutable requires root ownership, no group/other write bit, and that the
-// running user cannot write the object through any ACL.
+// immutable requires root ownership, no extended ACL, no group/other write
+// bit, and that the running user cannot write the object.
 func (v suiteDarwinInstallValidator) immutable(path string, symlink bool) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -110,6 +115,11 @@ func (v suiteDarwinInstallValidator) immutable(path string, symlink bool) error 
 	}
 	if (info.Mode()&os.ModeSymlink != 0) != symlink {
 		return fmt.Errorf("%w: unexpected macOS install path type", ErrSuiteServiceActivation)
+	}
+	// access(2) cannot see ACL grants such as writesecurity, delete or
+	// chown, which let a user later give itself write access: no ACL at all.
+	if hasACL, err := v.hasACL(path); err != nil || hasACL {
+		return fmt.Errorf("%w: macOS install path carries an extended ACL", ErrSuiteServiceActivation)
 	}
 	if symlink {
 		// A link cannot be rewritten in place; replacing it needs write
