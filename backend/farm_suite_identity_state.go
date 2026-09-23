@@ -9,13 +9,28 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 )
 
 const (
 	SuiteIdentityReceiptName     = "setup-identity-receipt.json"
 	suiteIdentityReceiptMaxBytes = 16 << 10
-	suiteIdentityStoreKind       = "WINDOWS_CURRENT_USER_DPAPI"
 )
+
+// suiteIdentityStoreKind records the native store that actually holds the
+// device key on this platform (NewFarmClientIdentityStore).
+var suiteIdentityStoreKind = suiteIdentityStoreKindFor(runtime.GOOS)
+
+func suiteIdentityStoreKindFor(goos string) string {
+	switch goos {
+	case "darwin":
+		return "MACOS_LOGIN_KEYCHAIN"
+	case "linux":
+		return "LINUX_SECRET_SERVICE"
+	default:
+		return "WINDOWS_CURRENT_USER_DPAPI"
+	}
+}
 
 var (
 	ErrSuiteIdentityReceipt         = errors.New("invalid suite identity receipt")
