@@ -247,13 +247,13 @@ func TestSuiteCanonicalEnrollmentFinalizeRejectsProofChainAndKeyDrift(t *testing
 	})
 }
 
-func TestSuiteCanonicalEnrollmentFinalizeProductionIsWindowsOnly(t *testing.T) {
+func TestSuiteCanonicalEnrollmentFinalizeRefusesPlatformsWithoutInstallRoot(t *testing.T) {
 	fixture := newSuiteEnrollmentFinalizeFixture(t, "node-platform")
 	deps := suiteEnrollmentFinalizeTestDependencies(fixture)
 	deps.CurrentGOOS = "linux"
 	_, err := runSuiteCanonicalEnrollmentFinalizeWithDependencies(context.Background(), fixture.bootstrap, fixture.roots, fixture.release, fixture.source, deps)
 	if !errors.Is(err, ErrSuiteCanonicalEnrollmentFinalize) {
-		t.Fatalf("non-Windows error=%v", err)
+		t.Fatalf("Linux error=%v", err)
 	}
 	assertSuiteEnrollmentFinalizeNoArtifacts(t, fixture)
 }

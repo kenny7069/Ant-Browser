@@ -196,7 +196,7 @@ func SuiteDoctorExitCode(report SuiteDoctorReport) int {
 }
 
 func SuiteServiceStatus(ctx context.Context, roots SuiteUserRoots) SuiteDoctorReport {
-	if runtime.GOOS != "windows" {
+	if !suiteCanonicalInstallPlatform(runtime.GOOS) {
 		return SuiteDoctorReport{SchemaVersion: 1, Overall: "UNKNOWN", ExitClass: "DEFERRED", DominantCode: "PLATFORM_ADAPTER_DEFERRED", Layers: []SuiteDoctorLayer{{Name: "registration", Status: "UNKNOWN", Code: "PLATFORM_ADAPTER_DEFERRED", SafeMessage: "PLATFORM_ADAPTER_DEFERRED", Remediation: "USE_SUPPORTED_PLATFORM", Retryable: false}, {Name: "resident_ipc", Status: "BLOCKED", Code: "PREREQUISITE_BLOCKED", SafeMessage: "PREREQUISITE_BLOCKED", Remediation: "USE_SUPPORTED_PLATFORM", Retryable: false}}}
 	}
 	full := doctorSuiteWithPlatform(ctx, roots, newSuiteServicePlatform())

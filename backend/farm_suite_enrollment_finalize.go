@@ -86,7 +86,7 @@ func RunSuiteCanonicalEnrollmentFinalize(ctx context.Context, bootstrap Bootstra
 }
 
 func runSuiteCanonicalEnrollmentFinalizeWithDependencies(ctx context.Context, bootstrap BootstrapConfig, roots SuiteUserRoots, release VerifiedSuiteRelease, installedSuiteRoot string, deps suiteCanonicalEnrollmentFinalizeDependencies) (SuiteCanonicalEnrollmentFinalizeResult, error) {
-	if ctx == nil || deps.CurrentGOOS != "windows" || deps.NewStore == nil || deps.ValidateInstall == nil || deps.AcquireInstance == nil || deps.SecureInstance == nil || deps.EnsureApplication == nil || deps.Readback == nil || deps.SaveCheckpoint == nil || deps.FinalizeHandoff == nil || deps.LoadHandoff == nil ||
+	if ctx == nil || !suiteCanonicalInstallPlatform(deps.CurrentGOOS) || deps.NewStore == nil || deps.ValidateInstall == nil || deps.AcquireInstance == nil || deps.SecureInstance == nil || deps.EnsureApplication == nil || deps.Readback == nil || deps.SaveCheckpoint == nil || deps.FinalizeHandoff == nil || deps.LoadHandoff == nil ||
 		validateSuiteSetupInputs(&bootstrap, roots) != nil || bootstrap.StatePath != filepath.Join(roots.AgentState, "setup.json") || installedSuiteRoot == "" || strings.TrimSpace(installedSuiteRoot) != installedSuiteRoot || !filepath.IsAbs(installedSuiteRoot) || filepath.Clean(installedSuiteRoot) != installedSuiteRoot {
 		return SuiteCanonicalEnrollmentFinalizeResult{}, ErrSuiteCanonicalEnrollmentFinalize
 	}

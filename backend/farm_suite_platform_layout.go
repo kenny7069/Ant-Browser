@@ -45,3 +45,9 @@ func suiteCurrentReleaseLayout() suiteReleaseLayout {
 func (layout suiteReleaseLayout) required() []string {
 	return []string{layout.GUI, layout.Client, layout.Xray, layout.SingBox, layout.Chromium, "LICENSES.json"}
 }
+
+// suiteCanonicalInstallPlatform names the platforms with an immutable
+// canonical install root, stage evidence and service adapter.
+func suiteCanonicalInstallPlatform(goos string) bool {
+	return goos == "windows" || goos == "darwin"
+}
